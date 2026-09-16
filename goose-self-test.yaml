@@ -17,6 +17,7 @@ activities:
   - Validate native task steering, parent reports, and specialist capability policies
   - Test multi-turn thinking preservation for providers that reject replayed reasoning_content
   - Validate ACP thinking-effort discovery, forwarding, and provider switching
+  - Validate opt-in ACP conversation workspace creation, reuse, and rejection of traversal or symlink paths
   - Validate GDK observability hook lifecycle events and payload opt-in
   - Test error boundaries including nested delegation prevention
   - Generate comprehensive test report

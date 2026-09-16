@@ -107,6 +107,14 @@ directory is a path **inside the container**. ACP authentication grants access
 to this harness and its mounted workspace; application tenant authorization and
 workspace isolation belong in the calling service/deployment.
 
+For a backend that assigns a persistent working directory to each conversation,
+set `GOOSE_ACP_WORKSPACE_ROOT=/workspace/cortex`. With this opt-in setting,
+`session/new` creates missing directories beneath that root and reuses their
+files on later sessions. The requested `cwd` must be a strict descendant of the
+root; traversal and symlink components are rejected. Without the setting, ACP
+continues to require an existing directory. This provisions directories; it
+does not sandbox the agent's shell or replace application authorization.
+
 The `harness-state` volume backs the absolute `GOOSE_PATH_ROOT` and retains
 configuration, sessions, mailbox records, agents, and skills. The separate
 `harness-workspace` volume is the agent's working directory; replace it with a

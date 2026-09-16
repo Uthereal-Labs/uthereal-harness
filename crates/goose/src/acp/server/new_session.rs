@@ -11,7 +11,7 @@ use agent_client_protocol::{Client, ConnectionTo};
 use goose_providers::model::ModelConfig;
 use goose_providers::thinking::ThinkingEffortSupport;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use tracing::warn;
 
 struct InitialSessionConfig {
@@ -44,8 +44,13 @@ impl GooseAcpAgent {
         if let Some(host_cwd) = &self.session_cwd {
             args.cwd = host_cwd.clone();
         }
-        validate_absolute_cwd(&args.cwd)?;
         let config = Config::global();
+        if self.session_cwd.is_none() {
+            if let Ok(root) = config.get_goose_acp_workspace_root() {
+                provision_workspace(Path::new(&root), &args.cwd).await?;
+            }
+        }
+        validate_absolute_cwd(&args.cwd)?;
         let session_type = session_type_from_meta(args.meta.as_ref())?;
         let current_mode: GooseMode = config.get_goose_mode().unwrap_or_default();
         let recipe = self.resolve_recipe_from_meta(args.meta.as_ref()).await?;
@@ -279,6 +284,56 @@ impl GooseAcpAgent {
     }
 }
 
+/// Opt-in server workspaces remain under a trusted root, including on reconnect.
+async fn provision_workspace(root: &Path, cwd: &Path) -> Result<(), agent_client_protocol::Error> {
+    let invalid = || {
+        agent_client_protocol::Error::invalid_params()
+        .data("cwd must be a directory beneath GOOSE_ACP_WORKSPACE_ROOT without symlinks or traversal")
+    };
+    if !root.is_absolute() || !cwd.is_absolute() {
+        return Err(invalid());
+    }
+    let relative = cwd.strip_prefix(root).map_err(|_| invalid())?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(invalid());
+    }
+    tokio::fs::create_dir_all(root)
+        .await
+        .internal_err_ctx("Failed to create workspace root")?;
+    let canonical_root = tokio::fs::canonicalize(root)
+        .await
+        .internal_err_ctx("Failed to resolve workspace root")?;
+    let mut directory = canonical_root.clone();
+    for part in relative.components() {
+        directory.push(part);
+        match tokio::fs::create_dir(&directory).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(agent_client_protocol::Error::internal_error().data(error.to_string()))
+            }
+        }
+        let metadata = tokio::fs::symlink_metadata(&directory)
+            .await
+            .map_err(|_| invalid())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(invalid());
+        }
+        if !tokio::fs::canonicalize(&directory)
+            .await
+            .map_err(|_| invalid())?
+            .starts_with(&canonical_root)
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 fn model_config_from_recipe_settings(
     provider: &str,
     model: &str,
@@ -353,6 +408,44 @@ fn meta_goose_extensions(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn provision_workspace_creates_and_reuses_nested_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspaces");
+        let cwd = root.join("conversation").join("files");
+        provision_workspace(&root, &cwd).await.unwrap();
+        tokio::fs::write(cwd.join("context.md"), "preserved")
+            .await
+            .unwrap();
+        provision_workspace(&root, &cwd).await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(cwd.join("context.md"))
+                .await
+                .unwrap(),
+            "preserved"
+        );
+        assert!(provision_workspace(&root, &root.join("../outside"))
+            .await
+            .is_err());
+        assert!(provision_workspace(&root, temp.path()).await.is_err());
+        assert!(!temp.path().join("outside").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provision_workspace_rejects_symlink_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspaces");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert!(provision_workspace(&root, &root.join("link/created"))
+            .await
+            .is_err());
+        assert!(!outside.join("created").exists());
+    }
 
     fn meta(value: serde_json::Value) -> Meta {
         match value {
