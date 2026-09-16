@@ -1766,6 +1766,7 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
     use goose::config::paths::Paths;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
     use tracing::{info, warn};
 
     let ServeCommandArgs {
@@ -1844,7 +1845,7 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
         None
     };
     let router = create_router(
-        server,
+        server.clone(),
         secret_key,
         require_token,
         additional_allowed_origins,
@@ -1861,7 +1862,9 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
         || tls_key_path.is_some();
 
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-    if tls {
+    let graceful_shutdown = CancellationToken::new();
+    let tls_shutdown: Option<Box<dyn FnOnce() + Send>>;
+    let mut serve: futures::future::BoxFuture<'_, std::io::Result<()>> = if tls {
         #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
         {
             let tls_setup = goose::acp::transport::tls::setup_tls(
@@ -1871,33 +1874,65 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
             .await?;
             info!("Starting ACP server on https://{}", addr);
 
+            let handle = axum_server::Handle::new();
+
             #[cfg(feature = "rustls-tls")]
-            axum_server::bind_rustls(addr, tls_setup.config)
-                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await?;
+            let future = axum_server::bind_rustls(addr, tls_setup.config)
+                .handle(handle.clone())
+                .serve(router.into_make_service_with_connect_info::<SocketAddr>());
 
             #[cfg(feature = "native-tls")]
-            axum_server::bind_openssl(addr, tls_setup.config)
-                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await?;
+            let future = axum_server::bind_openssl(addr, tls_setup.config)
+                .handle(handle.clone())
+                .serve(router.into_make_service_with_connect_info::<SocketAddr>());
+
+            let shutdown_handle = handle.clone();
+            tls_shutdown = Some(Box::new(move || {
+                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(20)));
+            }));
+            Box::pin(future)
         }
 
         #[cfg(not(any(feature = "rustls-tls", feature = "native-tls")))]
         {
             let _ = (tls_cert_path, tls_key_path);
-            anyhow::bail!(
+            return Err(anyhow::anyhow!(
                 "TLS was requested but no TLS backend is enabled. \
                  Enable the `rustls-tls` or `native-tls` feature."
-            );
+            ));
         }
     } else {
         info!("Starting ACP server on http://{}", addr);
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(
+        let shutdown = graceful_shutdown.clone();
+        let future = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .await?;
+        .with_graceful_shutdown(async move { shutdown.cancelled().await });
+        tls_shutdown = None;
+        Box::pin(std::future::IntoFuture::into_future(future))
+    };
+
+    tokio::select! {
+        result = &mut serve => result?,
+        _ = crate::signal::shutdown_signal() => {
+            graceful_shutdown.cancel();
+            if let Some(shutdown) = tls_shutdown {
+                shutdown();
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                tokio::join!(serve.as_mut(), server.shutdown_active_runs())
+            }).await {
+                Ok((serve_result, errors)) => {
+                    serve_result?;
+                    for error in errors {
+                        warn!(%error, "ACP session shutdown failed");
+                    }
+                }
+                Err(_) => warn!("Timed out draining ACP connections and sessions during shutdown"),
+            }
+        }
     }
 
     #[cfg(feature = "roaming")]

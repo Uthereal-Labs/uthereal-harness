@@ -24,7 +24,7 @@ use crate::config::GooseMode;
 use crate::conversation::message::Message;
 use crate::conversation::Conversation;
 use crate::hooks::HookManager;
-use crate::session::Session;
+use crate::session::{Session, SessionType};
 
 const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
 
@@ -56,8 +56,8 @@ fn skill_tool() -> Result<Tool> {
     ))
 }
 
-fn skill_instructions(working_dir: &Path) -> Option<String> {
-    let sources = crate::skills::discover_skills(Some(working_dir));
+fn skill_instructions(working_dir: &Path, session_type: SessionType) -> Option<String> {
+    let sources = crate::skills::list_visible_skills(Some(working_dir), session_type);
     let mut skills: Vec<&SourceEntry> = sources
         .iter()
         .filter(|source| {
@@ -81,7 +81,11 @@ fn skill_instructions(working_dir: &Path) -> Option<String> {
     Some(instructions)
 }
 
-fn execute_skill(working_dir: &Path, arguments: Option<JsonObject>) -> CallToolResult {
+fn execute_skill(
+    working_dir: &Path,
+    session_type: SessionType,
+    arguments: Option<JsonObject>,
+) -> CallToolResult {
     let params = arguments
         .map(Value::Object)
         .ok_or_else(|| "Missing arguments".to_string())
@@ -95,7 +99,7 @@ fn execute_skill(working_dir: &Path, arguments: Option<JsonObject>) -> CallToolR
     };
     let skill_name = params.name.as_str();
     let args = params.args.as_deref();
-    let skills = crate::skills::discover_skills(Some(working_dir));
+    let skills = crate::skills::list_visible_skills(Some(working_dir), session_type);
 
     if let Some(skill) = skills.iter().find(|skill| skill.name == skill_name) {
         return match crate::skills::loaded_skill_context_with_args(skill, args) {
@@ -243,18 +247,20 @@ impl Operation<Session, GooseEffect> for SkillOperation {
         if command.command == "skills" {
             return Self::command_response(
                 conversation,
-                crate::slash_commands::skill_slash_command::format_installed_skills(Some(
-                    &session.working_dir,
-                )),
+                crate::slash_commands::skill_slash_command::format_installed_skills_for_session(
+                    Some(&session.working_dir),
+                    session.session_type,
+                ),
                 emit,
             )
             .await;
         }
 
-        let prompt = match crate::slash_commands::skill_slash_command::resolve_command(
+        let prompt = match crate::slash_commands::skill_slash_command::resolve_command_for_session(
             command.command,
             command.params_str,
             Some(&session.working_dir),
+            session.session_type,
         ) {
             Ok(Some(prompt)) => prompt,
             Ok(None) => return not_applicable(),
@@ -290,10 +296,12 @@ impl Operation<Session, GooseEffect> for SkillOperation {
         session: &Session,
         _conversation: &Conversation,
     ) -> Result<Vec<(String, String)>> {
-        Ok(skill_instructions(&session.working_dir)
-            .map(|instructions| ("skills".to_string(), instructions))
-            .into_iter()
-            .collect())
+        Ok(
+            skill_instructions(&session.working_dir, session.session_type)
+                .map(|instructions| ("skills".to_string(), instructions))
+                .into_iter()
+                .collect(),
+        )
     }
 
     async fn run(
@@ -356,7 +364,11 @@ impl Operation<Session, GooseEffect> for SkillOperation {
                         Ok(()) => {
                             let result = {
                                 let _entered = span.enter();
-                                execute_skill(&session.working_dir, tool_call.arguments.clone())
+                                execute_skill(
+                                    &session.working_dir,
+                                    session.session_type,
+                                    tool_call.arguments.clone(),
+                                )
                             };
                             if result.is_error == Some(true) {
                                 span.record("error.type", "tool_error");
@@ -428,5 +440,40 @@ mod tests {
         assert_eq!(result.is_error, Some(false));
         let text = result.content[0].as_text().expect("expected text");
         assert!(text.text.contains("Nested guidance."));
+    }
+
+    #[test]
+    fn delegate_only_skill_is_hidden_from_parent_and_available_to_subagent() {
+        let root = tempfile::tempdir().unwrap();
+        let skill_dir = root.path().join(".agents/skills/private-review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: private-review\ndescription: Private review\nmetadata:\n  delegate_only: true\n---\nPrivate instructions.",
+        )
+        .unwrap();
+        let arguments = serde_json::json!({"name": "private-review"})
+            .as_object()
+            .cloned();
+
+        assert!(!skill_instructions(root.path(), SessionType::User)
+            .unwrap_or_default()
+            .contains("private-review"));
+        assert!(
+            execute_skill(root.path(), SessionType::User, arguments.clone())
+                .is_error
+                .unwrap_or(false)
+        );
+
+        assert!(skill_instructions(root.path(), SessionType::SubAgent)
+            .unwrap()
+            .contains("private-review"));
+        let loaded = execute_skill(root.path(), SessionType::SubAgent, arguments);
+        assert!(!loaded.is_error.unwrap_or(false));
+        assert!(loaded.content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .contains("Private instructions."));
     }
 }

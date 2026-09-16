@@ -559,6 +559,11 @@ mod tests {
             .collect();
 
         extensions.sort_by(|a, b| a.name.cmp(&b.name));
+        #[cfg(not(feature = "code-mode"))]
+        let extension_names = extensions
+            .iter()
+            .map(|extension| extension.name.clone())
+            .collect::<Vec<_>>();
 
         let manager = PromptManager::with_timestamp(DateTime::<Utc>::from_timestamp(0, 0).unwrap());
         let system_prompt = manager
@@ -566,6 +571,17 @@ mod tests {
             .with_extensions(extensions.into_iter())
             .build();
 
+        #[cfg(feature = "code-mode")]
         assert_snapshot!(system_prompt);
+        #[cfg(not(feature = "code-mode"))]
+        {
+            assert!(!system_prompt.contains("## code_execution\n"));
+            for name in extension_names {
+                assert!(
+                    system_prompt.contains(&format!("## {name}\n")),
+                    "missing platform extension prompt for {name}"
+                );
+            }
+        }
     }
 }

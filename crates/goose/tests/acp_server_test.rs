@@ -125,6 +125,127 @@ async fn get_session_info_request(
         .map_err(Into::into)
 }
 
+#[test]
+fn prompt_integrates_pending_background_report_before_end_turn() {
+    run_test(async {
+        let expected_session_id = <AcpServerConnection as Connection>::expected_session_id();
+        let openai = OpenAiFixture::new(
+            vec![
+                (
+                    format!("start work{TURN_CONTEXT_OPEN}"),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                ),
+                (
+                    "background finished".to_string(),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                ),
+            ],
+            expected_session_id.clone(),
+        )
+        .await;
+        let mut conn =
+            <AcpServerConnection as Connection>::new(TestConnectionConfig::default(), openai).await;
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        expected_session_id.set(&session.session_id().0);
+
+        let manager = SessionManager::new(conn.data_root());
+        let child = manager
+            .create_session(
+                session.work_dir(),
+                "completed child".to_string(),
+                SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        manager
+            .update(&child.id)
+            .parent_session_id(Some(session.session_id().0.to_string()))
+            .apply()
+            .await
+            .unwrap();
+        manager
+            .enqueue_completion_to_parent(&child.id, "background finished")
+            .await
+            .unwrap();
+
+        let output = session
+            .prompt("start work", PermissionDecision::Cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(output.text, "22");
+        assert!(manager
+            .pending_session_messages(&session.session_id().0)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}
+
+#[test]
+fn failed_parent_report_response_remains_pending() {
+    run_test(async {
+        let expected_session_id = <AcpServerConnection as Connection>::expected_session_id();
+        let openai = OpenAiFixture::new(
+            vec![
+                (
+                    format!("start work{TURN_CONTEXT_OPEN}"),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                ),
+                (
+                    "background failed".to_string(),
+                    include_str!("acp_test_data/openai_max_turns.txt"),
+                ),
+            ],
+            expected_session_id.clone(),
+        )
+        .await;
+        let mut conn =
+            <AcpServerConnection as Connection>::new(TestConnectionConfig::default(), openai).await;
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        expected_session_id.set(&session.session_id().0);
+
+        let manager = SessionManager::new(conn.data_root());
+        let child = manager
+            .create_session(
+                session.work_dir(),
+                "failed child".to_string(),
+                SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        manager
+            .update(&child.id)
+            .parent_session_id(Some(session.session_id().0.to_string()))
+            .apply()
+            .await
+            .unwrap();
+        manager
+            .enqueue_completion_to_parent(&child.id, "background failed")
+            .await
+            .unwrap();
+
+        let error = session
+            .prompt("start work", PermissionDecision::Cancel)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("did not complete its background report response"));
+        assert_eq!(
+            manager
+                .pending_session_messages(&session.session_id().0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    });
+}
+
 fn assert_invalid_params(error: anyhow::Error) {
     let acp_error = error.downcast::<agent_client_protocol::Error>().unwrap();
     assert_eq!(acp_error.code, ErrorCode::InvalidParams);

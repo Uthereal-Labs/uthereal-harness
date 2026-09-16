@@ -34,11 +34,11 @@ use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
     persist_tool_confirmation_decision, run_goose, BangShellOperation, CompactionOperation,
     DoctorOperation, Emitter, EntryHookOperation, ExitOnErrorOperation, GooseEffect,
-    GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner, MaxTurnsOperation,
-    Operation, ProjectOperation, RecipeOperation, RetryOperation, SkillOperation,
-    SlashCommandOperation, StateMachine, StatusOperation, SteerOperation, SteerQueue, Step,
-    StopHookOperation, ToolApprovalOperation, ToolExecutionOperation, ToolPairCompactionOperation,
-    UnknownToolOperation, MAX_TURNS_MESSAGE,
+    GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner, MailboxOperation,
+    MaxTurnsOperation, Operation, ProjectOperation, RecipeOperation, RetryOperation,
+    SkillOperation, SlashCommandOperation, StateMachine, StatusOperation, SteerOperation,
+    SteerQueue, Step, StopHookOperation, ToolApprovalOperation, ToolExecutionOperation,
+    ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
 };
 use crate::agents::types::{
     SessionConfig, SharedProvider, DEFAULT_ON_FAILURE_TIMEOUT_SECONDS,
@@ -66,7 +66,7 @@ use crate::security::adversary_inspector::AdversaryInspector;
 use crate::security::egress_inspector::EgressInspector;
 use crate::security::security_inspector::SecurityInspector;
 use crate::session::extension_data::{EnabledExtensionsState, ExtensionState};
-use crate::session::{Session, SessionManager, SessionNameUpdate};
+use crate::session::{Session, SessionManager, SessionNameUpdate, SessionType};
 use crate::tool_inspection::ToolInspectionManager;
 use crate::tool_monitor::RepetitionInspector;
 use crate::utils::is_token_cancelled;
@@ -298,6 +298,7 @@ pub struct Agent {
     pub(super) goal: Mutex<Option<String>>,
     pub(super) grind: Mutex<Option<String>>,
     steer_queues: Mutex<HashMap<String, SteerQueue>>,
+    session_trace_roots: std::sync::Mutex<HashMap<String, tracing::Span>>,
 }
 
 fn ensure_message_event_id(event: AgentEvent) -> AgentEvent {
@@ -332,6 +333,33 @@ async fn persist_and_push_message_with_id(
     let message = persist_message_with_id(session_manager, session_id, message).await?;
     conversation.push(message.clone());
     Ok(message)
+}
+
+async fn drain_child_mailbox(
+    session_manager: &SessionManager,
+    session_id: &str,
+    conversation: &mut Conversation,
+) -> Result<Vec<Message>> {
+    let pending = session_manager.pending_session_messages(session_id).await?;
+    let mut delivered = Vec::with_capacity(pending.len());
+    for mailbox_message in pending {
+        let message = Message::user()
+            .with_text(format!(
+                "Message from parent task {}:\n\n{}",
+                mailbox_message.sender_session_id, mailbox_message.body
+            ))
+            .with_visibility(false, true)
+            .with_steer();
+        let message = message.with_generated_id_if_missing();
+        if session_manager
+            .deliver_session_message(session_id, mailbox_message.id, &message)
+            .await?
+        {
+            conversation.push(message.clone());
+            delivered.push(message);
+        }
+    }
+    Ok(delivered)
 }
 
 fn project_message_for_user_event(message: &Message) -> Message {
@@ -387,6 +415,14 @@ fn has_unique_persisted_extension(configs: &[ExtensionConfig], key: &str) -> Res
 }
 
 impl Agent {
+    pub async fn has_active_tasks(&self, session_id: &str) -> anyhow::Result<bool> {
+        self.extension_manager.has_active_tasks(session_id).await
+    }
+
+    pub async fn shutdown_session(&self, session_id: &str) -> anyhow::Result<()> {
+        self.extension_manager.shutdown_session(session_id).await
+    }
+
     pub fn new() -> Self {
         let config = Config::global();
         Self::with_config(AgentConfig::new(
@@ -466,7 +502,24 @@ impl Agent {
             goal: Mutex::new(None),
             grind: Mutex::new(None),
             steer_queues: Mutex::new(HashMap::new()),
+            session_trace_roots: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    fn session_trace_root(&self, session_id: &str) -> tracing::Span {
+        self.session_trace_roots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                tracing::info_span!(
+                    parent: None,
+                    "chat_session",
+                    session.id = %session_id,
+                    gen_ai.conversation.id = %session_id,
+                )
+            })
+            .clone()
     }
 
     /// Emit a lifecycle hook event with no extra context. Useful for events
@@ -1053,7 +1106,8 @@ impl Agent {
         fields(
             input,
             output,
-            session.id = %session.id,
+            session.id = %session.parent_session_id.as_deref().unwrap_or(&session.id),
+            goose.execution.session.id = %session.id,
             gen_ai.conversation.id = %session.id,
             gen_ai.operation.name = "execute_tool",
             gen_ai.tool.name = %tool_call.name,
@@ -1373,18 +1427,25 @@ impl Agent {
         extensions: Vec<ExtensionConfig>,
         session_id: &str,
     ) -> anyhow::Result<Vec<ExtensionLoadResult>> {
-        let working_dir = match self
+        let session = self
             .config
             .session_manager
             .get_session(session_id, false)
-            .await
-        {
-            Ok(session) => Some(session.working_dir),
+            .await;
+        let working_dir = match &session {
+            Ok(session) => Some(session.working_dir.clone()),
             Err(e) => {
                 warn!("Failed to get session for bulk load: {}", e);
                 None
             }
         };
+        let allow_delegate_only = session
+            .as_ref()
+            .is_ok_and(|session| session.session_type == crate::session::SessionType::SubAgent);
+        let (extensions, skipped_configs): (Vec<_>, Vec<_>) =
+            extensions.into_iter().partition(|extension| {
+                allow_delegate_only || !crate::config::is_delegate_only_extension(&extension.name())
+            });
         let container = self.container.lock().await.clone();
 
         let extension_futures = extensions
@@ -1420,7 +1481,16 @@ impl Agent {
             })
             .collect::<Vec<_>>();
 
-        let results = futures::future::join_all(extension_futures).await;
+        let mut results = futures::future::join_all(extension_futures).await;
+        results.extend(
+            skipped_configs
+                .into_iter()
+                .map(|extension| ExtensionLoadResult {
+                    name: extension.name(),
+                    success: false,
+                    error: Some("extension is only available to delegated agents".to_string()),
+                }),
+        );
 
         self.persist_extension_state(session_id).await?;
 
@@ -1443,6 +1513,16 @@ impl Agent {
                     session_id, e
                 ))
             })?;
+        if session.session_type != crate::session::SessionType::SubAgent
+            && crate::config::is_delegate_only_extension(&extension.name())
+        {
+            return Err(crate::agents::extension::ExtensionError::ConfigError(
+                format!(
+                    "extension '{}' is only available to delegated agents",
+                    extension.name()
+                ),
+            ));
+        }
         let working_dir = Some(session.working_dir);
 
         let container = self.container.lock().await;
@@ -1683,6 +1763,7 @@ impl Agent {
             crate::context_mgmt::tool_pair_summarization_enabled() && !manages_own_context;
 
         let mut operations: Vec<Arc<dyn Operation<Session, GooseEffect> + '_>> = vec![
+            Arc::new(MailboxOperation::new(&self.config.session_manager)),
             Arc::new(SteerOperation::new(steer_queue, self.hook_manager.clone())),
             Arc::new(MaxTurnsOperation::new(max_turns)),
             Arc::new(BangShellOperation::new()),
@@ -2013,21 +2094,6 @@ impl Agent {
         ))
     }
 
-    #[instrument(
-        skip(self, user_message, session_config, use_state_machine, cancel_token),
-        fields(
-            user_message,
-            trace_input,
-            trace_output = tracing::field::Empty,
-            session.id = %session_config.id,
-            gen_ai.operation.name = "invoke_agent",
-            gen_ai.agent.name = tracing::field::Empty,
-            gen_ai.input.messages = tracing::field::Empty,
-            gen_ai.output.messages = tracing::field::Empty,
-            gen_ai.usage.input_tokens = tracing::field::Empty,
-            gen_ai.usage.output_tokens = tracing::field::Empty,
-        )
-    )]
     pub async fn reply(
         &self,
         user_message: Message,
@@ -2035,7 +2101,39 @@ impl Agent {
         use_state_machine: bool,
         cancel_token: Option<CancellationToken>,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
-        let reply_span = tracing::Span::current();
+        let execution_session_id = session_config.id.clone();
+        let session = self
+            .config
+            .session_manager
+            .get_session(&execution_session_id, false)
+            .await?;
+        let telemetry_session_id = session
+            .parent_session_id
+            .as_deref()
+            .unwrap_or(&execution_session_id);
+        let current_span = tracing::Span::current();
+        let parent_span = if self.config.is_subagent && current_span.id().is_some() {
+            current_span
+        } else {
+            self.session_trace_root(telemetry_session_id)
+        };
+        let reply_span = tracing::info_span!(
+            parent: &parent_span,
+            "reply",
+            user_message = tracing::field::Empty,
+            trace_input = tracing::field::Empty,
+            trace_output = tracing::field::Empty,
+            session.id = %telemetry_session_id,
+            goose.execution.session.id = %execution_session_id,
+            gen_ai.conversation.id = %execution_session_id,
+            gen_ai.operation.name = "invoke_agent",
+            gen_ai.agent.name = tracing::field::Empty,
+            gen_ai.input.messages = tracing::field::Empty,
+            gen_ai.system_instructions = tracing::field::Empty,
+            gen_ai.output.messages = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+        );
         let events = self
             .reply_impl(
                 user_message,
@@ -2043,6 +2141,7 @@ impl Agent {
                 use_state_machine,
                 cancel_token,
             )
+            .instrument(reply_span.clone())
             .await?;
 
         // This is the single live-event identity boundary. Callers that intentionally stream
@@ -2492,7 +2591,8 @@ impl Agent {
             parent: &reply_span,
             "reply_stream",
             trace_output = tracing::field::Empty,
-            session.id = %session_config.id,
+            session.id = %session.parent_session_id.as_deref().unwrap_or(&session_config.id),
+            goose.execution.session.id = %session_config.id,
             session.user = %crate::session_context::session_user(),
             session.host = %crate::session_context::session_host(),
             session.agent_type = "goose",
@@ -2504,6 +2604,7 @@ impl Agent {
             gen_ai.request.max_tokens = tracing::field::Empty,
             gen_ai.provider.name = %provider_name,
             gen_ai.input.messages = tracing::field::Empty,
+            gen_ai.system_instructions = tracing::field::Empty,
             gen_ai.output.messages = tracing::field::Empty,
             gen_ai.response.finish_reasons = tracing::field::Empty,
             gen_ai.response.id = tracing::field::Empty,
@@ -2513,16 +2614,19 @@ impl Agent {
         gen_ai_telemetry::record_request_params(&reply_stream_span, &model_config);
         reply_stream_span.record("gen_ai.agent.name", gen_ai_telemetry::agent_name(&session));
         if gen_ai_telemetry::capture_message_content() {
+            let system_instructions = gen_ai_telemetry::system_instructions_json(&system_prompt);
+            reply_stream_span.record("gen_ai.system_instructions", system_instructions.as_str());
             if let Some(last_user_msg) = conversation
                 .messages()
                 .iter()
                 .rev()
                 .find(|m| m.role == rmcp::model::Role::User)
             {
-                reply_stream_span.record(
-                    "gen_ai.input.messages",
-                    gen_ai_telemetry::simple_input_json(&last_user_msg.as_concat_text()).as_str(),
+                let input_messages = gen_ai_telemetry::input_messages_with_system_json(
+                    &system_prompt,
+                    std::slice::from_ref(last_user_msg),
                 );
+                reply_stream_span.record("gen_ai.input.messages", input_messages.as_str());
             }
         }
         let inner = Box::pin(async_stream::try_stream! {
@@ -2567,6 +2671,17 @@ impl Agent {
                 )
                 .await?;
             }
+            if session.session_type == SessionType::SubAgent {
+                for message in drain_child_mailbox(
+                    &session_manager,
+                    &session_config.id,
+                    &mut conversation,
+                )
+                .await?
+                {
+                    yield AgentEvent::Message(message);
+                }
+            }
             // Snapshot after the turn-context append so a retry keeps the sent prefix.
             let initial_messages = conversation.messages().clone();
 
@@ -2576,6 +2691,17 @@ impl Agent {
                 }
 
                 if can_drain_pending_steers {
+                    if session.session_type == SessionType::SubAgent {
+                        for message in drain_child_mailbox(
+                            &session_manager,
+                            &session_config.id,
+                            &mut conversation,
+                        )
+                        .await?
+                        {
+                            yield AgentEvent::Message(message);
+                        }
+                    }
                     for message in self.drain_pending_steers(&session_config.id).await {
                         let message_text = agent_visible_message_text(&message);
                         if self
@@ -3296,6 +3422,11 @@ impl Agent {
                         let mut guard = self.final_output_tool.lock().await;
                         guard.as_mut().map(|fot| fot.final_output.take())
                     };
+                    let has_pending_mailbox = session.session_type == SessionType::SubAgent
+                        && !session_manager
+                            .pending_session_messages(&session_config.id)
+                            .await?
+                            .is_empty();
 
                     match final_output {
                         Some(None) => {
@@ -3313,7 +3444,9 @@ impl Agent {
                         None if did_recovery_compact_this_iteration => {
                             // continue from last user message after recovery compact
                         }
-                        None if self.has_pending_steers(&session_config.id).await => {}
+                        None
+                            if self.has_pending_steers(&session_config.id).await
+                                || has_pending_mailbox => {}
                         None if self.goal.lock().await.is_some() && !goal_check_pending => {
                             goal_check_pending = true;
                             let goal = self.goal.lock().await.clone().unwrap();
@@ -4019,6 +4152,266 @@ mod tests {
             .await
             .unwrap();
         (agent, session, data_dir)
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn exported_traces_separate_sessions_and_parent_detached_subagents() -> Result<()> {
+        // Other tests install process-wide tracing subscribers. Keep this export
+        // contract isolated from their global callsite and subscriber state.
+        const CHILD_ENV: &str = "GOOSE_TEST_SESSION_TRACE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "agents::agent::tests::exported_traces_separate_sessions_and_parent_detached_subagents",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "isolated trace contract failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return Ok(());
+        }
+
+        use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+        use opentelemetry::Key;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_futures::{Instrument, WithSubscriber};
+        use tracing_subscriber::prelude::*;
+
+        let _otel_env = goose_test_support::otel::clear_otel_env(&[]);
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("goose-trace-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        let (
+            main_one_id,
+            main_two_id,
+            child_id,
+            (main_one_trace_id, main_one_span_id),
+            (main_two_trace_id, main_two_span_id),
+        ) = async {
+            let temp_dir = tempfile::tempdir()?;
+            let data_path = temp_dir.path().join("data");
+            let session_manager = Arc::new(SessionManager::new(data_path.clone()));
+            let permission_manager = Arc::new(PermissionManager::new(data_path));
+            let mut config = AgentConfig::new(
+                Arc::clone(&session_manager),
+                Arc::clone(&permission_manager),
+                None,
+                GooseMode::Auto,
+                true,
+                GoosePlatform::GooseCli,
+            );
+            let main_agent = Arc::new(Agent::with_config(config.clone()));
+            let main_one = session_manager
+                .create_session(
+                    PathBuf::default(),
+                    "main-one".to_string(),
+                    SessionType::User,
+                    GooseMode::Auto,
+                )
+                .await?;
+            let main_two = session_manager
+                .create_session(
+                    PathBuf::default(),
+                    "main-two".to_string(),
+                    SessionType::User,
+                    GooseMode::Auto,
+                )
+                .await?;
+            main_agent
+                .update_provider(
+                    Arc::new(TraceContentProvider),
+                    goose_providers::model::ModelConfig::new("mock-model"),
+                    &main_one.id,
+                )
+                .await?;
+            main_agent
+                .update_provider(
+                    Arc::new(TraceContentProvider),
+                    goose_providers::model::ModelConfig::new("mock-model"),
+                    &main_two.id,
+                )
+                .await?;
+
+            for session_id in [&main_one.id, &main_two.id] {
+                let stream = main_agent
+                    .reply(
+                        Message::user().with_text("hello"),
+                        SessionConfig {
+                            id: session_id.clone(),
+                            schedule_id: None,
+                            max_turns: Some(1),
+                            retry_config: None,
+                        },
+                        false,
+                        None,
+                    )
+                    .await?;
+                tokio::pin!(stream);
+                while let Some(event) = stream.next().await {
+                    event?;
+                }
+            }
+
+            let child = session_manager
+                .create_session(
+                    PathBuf::default(),
+                    "child".to_string(),
+                    SessionType::SubAgent,
+                    GooseMode::Auto,
+                )
+                .await?;
+            session_manager
+                .update(&child.id)
+                .parent_session_id(Some(main_one.id.clone()))
+                .apply()
+                .await?;
+            config.is_subagent = true;
+            let child_agent = Arc::new(Agent::with_config(config));
+            child_agent
+                .update_provider(
+                    Arc::new(TraceContentProvider),
+                    goose_providers::model::ModelConfig::new("mock-model"),
+                    &child.id,
+                )
+                .await?;
+            let main_root = main_agent.session_trace_root(&main_one.id);
+            let main_two_root = main_agent.session_trace_root(&main_two.id);
+            let root_ids = |root: &tracing::Span| {
+                use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+                let context = root.context();
+                let span = context.span();
+                let span_context = span.span_context();
+                assert!(span_context.is_valid());
+                assert!(span_context.is_sampled());
+                (span_context.trace_id(), span_context.span_id())
+            };
+            let main_one_root_ids = root_ids(&main_root);
+            let main_two_root_ids = root_ids(&main_two_root);
+            assert_ne!(main_one_root_ids.0, main_two_root_ids.0);
+            let summon_span = tracing::info_span!(parent: &main_root, "summon_delegate");
+            let child_id = child.id.clone();
+            let parent_id = main_one.id.clone();
+            let mut child_task = tokio::spawn(
+                crate::session_context::with_telemetry_session_id(Some(parent_id), async move {
+                    let stream = child_agent
+                        .reply(
+                            Message::user().with_text("delegated"),
+                            SessionConfig {
+                                id: child_id,
+                                schedule_id: None,
+                                max_turns: Some(1),
+                                retry_config: None,
+                            },
+                            false,
+                            None,
+                        )
+                        .await?;
+                    tokio::pin!(stream);
+                    while let Some(event) = stream.next().await {
+                        event?;
+                    }
+                    Result::<()>::Ok(())
+                })
+                .instrument(summon_span)
+                .with_current_subscriber(),
+            );
+            (&mut child_task).await??;
+            drop(child_task);
+
+            drop(main_root);
+            drop(main_two_root);
+            drop(main_agent);
+            Ok::<_, anyhow::Error>((
+                main_one.id,
+                main_two.id,
+                child.id,
+                main_one_root_ids,
+                main_two_root_ids,
+            ))
+        }
+        .with_subscriber(subscriber)
+        .await?;
+
+        provider.force_flush()?;
+        let spans = exporter.get_finished_spans()?;
+        let attribute = |span: &opentelemetry_sdk::trace::SpanData, name: &'static str| {
+            span.attributes
+                .iter()
+                .find(|attribute| attribute.key == Key::new(name))
+                .map(|attribute| attribute.value.to_string())
+        };
+        let main_one_reply = spans
+            .iter()
+            .find(|span| {
+                span.name == "reply"
+                    && attribute(span, "goose.execution.session.id").as_deref()
+                        == Some(main_one_id.as_str())
+            })
+            .unwrap();
+        let main_two_reply = spans
+            .iter()
+            .find(|span| {
+                span.name == "reply"
+                    && attribute(span, "goose.execution.session.id").as_deref()
+                        == Some(main_two_id.as_str())
+            })
+            .unwrap();
+        assert_eq!(main_one_reply.span_context.trace_id(), main_one_trace_id);
+        assert_eq!(main_one_reply.parent_span_id, main_one_span_id);
+        assert_eq!(main_two_reply.span_context.trace_id(), main_two_trace_id);
+        assert_eq!(main_two_reply.parent_span_id, main_two_span_id);
+
+        let summon = spans
+            .iter()
+            .find(|span| span.name == "summon_delegate")
+            .unwrap();
+        assert_eq!(summon.span_context.trace_id(), main_one_trace_id);
+        assert_eq!(summon.parent_span_id, main_one_span_id);
+        let child_reply = spans
+            .iter()
+            .find(|span| {
+                span.name == "reply"
+                    && attribute(span, "goose.execution.session.id").as_deref()
+                        == Some(child_id.as_str())
+            })
+            .unwrap();
+        assert_eq!(child_reply.span_context.trace_id(), main_one_trace_id);
+        assert_eq!(child_reply.parent_span_id, summon.span_context.span_id());
+        assert_eq!(
+            attribute(child_reply, "session.id").as_deref(),
+            Some(main_one_id.as_str())
+        );
+        let child_generation = spans
+            .iter()
+            .find(|span| {
+                span.name == "stream_response_from_provider"
+                    && attribute(span, "gen_ai.conversation.id").as_deref()
+                        == Some(child_id.as_str())
+            })
+            .unwrap();
+        assert_eq!(child_generation.span_context.trace_id(), main_one_trace_id);
+        assert_eq!(
+            attribute(child_generation, "session.id").as_deref(),
+            Some(main_one_id.as_str())
+        );
+        assert_eq!(
+            attribute(child_generation, "gen_ai.conversation.id").as_deref(),
+            Some(child_id.as_str())
+        );
+        Ok(())
     }
 
     async fn capture_tool_dispatch_fields(
@@ -4804,6 +5197,154 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         call_count: AtomicUsize,
     }
 
+    struct MailboxCheckpointProvider {
+        call_count: AtomicUsize,
+        session_manager: Arc<SessionManager>,
+        parent_session_id: String,
+        child_session_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for MailboxCheckpointProvider {
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system_prompt: &str,
+            messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let expected = if call == 0 {
+                "startup guidance"
+            } else {
+                "after-tool guidance"
+            };
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.as_concat_text().contains(expected)),
+                "inference {call} did not receive {expected}"
+            );
+            if call == 0 {
+                self.session_manager
+                    .send_to_child(
+                        &self.parent_session_id,
+                        &self.child_session_id,
+                        "after-tool guidance",
+                    )
+                    .await
+                    .unwrap();
+            }
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            if call == 0 {
+                return Ok(stream_from_single_message(
+                    Message::assistant().with_tool_request(
+                        "mailbox-checkpoint-tool",
+                        Ok(CallToolRequestParams::new(
+                            "missing_mailbox_checkpoint_tool",
+                        )),
+                    ),
+                    usage,
+                ));
+            }
+            assert!(
+                messages.iter().any(|message| {
+                    message.content.iter().any(|content| {
+                        matches!(
+                            content,
+                            MessageContent::ToolResponse(response)
+                                if response.id == "mailbox-checkpoint-tool"
+                        )
+                    })
+                }),
+                "inference after tool execution did not receive the tool response"
+            );
+            Ok(stream_from_single_message(
+                Message::assistant().with_text(format!("mailbox response {call}")),
+                usage,
+            ))
+        }
+
+        fn get_name(&self) -> &str {
+            "mailbox-checkpoint"
+        }
+    }
+
+    #[tokio::test]
+    async fn both_agent_loops_deliver_mailbox_guidance_at_safe_checkpoints() -> Result<()> {
+        for use_state_machine in [false, true] {
+            let temp_dir = tempfile::tempdir()?;
+            let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+            let parent = session_manager
+                .create_session(
+                    temp_dir.path().to_path_buf(),
+                    "parent".to_string(),
+                    SessionType::User,
+                    GooseMode::Auto,
+                )
+                .await?;
+            let child = session_manager
+                .create_session(
+                    temp_dir.path().to_path_buf(),
+                    "child".to_string(),
+                    SessionType::SubAgent,
+                    GooseMode::Auto,
+                )
+                .await?;
+            session_manager
+                .update(&child.id)
+                .parent_session_id(Some(parent.id.clone()))
+                .apply()
+                .await?;
+            session_manager
+                .send_to_child(&parent.id, &child.id, "startup guidance")
+                .await?;
+
+            let provider = Arc::new(MailboxCheckpointProvider {
+                call_count: AtomicUsize::new(0),
+                session_manager: Arc::clone(&session_manager),
+                parent_session_id: parent.id,
+                child_session_id: child.id.clone(),
+            });
+            let mut config = AgentConfig::new(
+                Arc::clone(&session_manager),
+                Arc::new(PermissionManager::new(temp_dir.path().to_path_buf())),
+                None,
+                GooseMode::Auto,
+                true,
+                GoosePlatform::GooseCli,
+            );
+            config.is_subagent = true;
+            let agent = Agent::with_config(config);
+            agent
+                .update_provider(
+                    provider.clone(),
+                    goose_providers::model::ModelConfig::new("mock-model"),
+                    &child.id,
+                )
+                .await?;
+            let stream = agent
+                .reply(
+                    Message::user().with_text("initial task"),
+                    SessionConfig {
+                        id: child.id,
+                        schedule_id: None,
+                        max_turns: Some(3),
+                        retry_config: None,
+                    },
+                    use_state_machine,
+                    None,
+                )
+                .await?;
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                event?;
+            }
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+        }
+        Ok(())
+    }
+
     impl CountingTextProvider {
         fn new() -> Self {
             Self {
@@ -5142,6 +5683,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             assert!(!reply_fields.contains_key("user_message"));
             assert!(!reply_fields.contains_key("trace_input"));
             assert!(!reply_fields.contains_key("gen_ai.input.messages"));
+            assert!(!reply_fields.contains_key("gen_ai.system_instructions"));
             assert!(!reply_fields.contains_key("gen_ai.output.messages"));
 
             let stream_fields =
@@ -5150,6 +5692,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             assert!(!stream_json.contains("super-secret-token"));
             assert!(!stream_fields.contains_key("trace_output"));
             assert!(!stream_fields.contains_key("gen_ai.input.messages"));
+            assert!(!stream_fields.contains_key("gen_ai.system_instructions"));
             assert!(!stream_fields.contains_key("gen_ai.output.messages"));
         }
         Ok(())
@@ -5175,6 +5718,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .as_str()
             .unwrap()
             .contains("input-super-secret-token"));
+        assert!(stream_fields.contains_key("gen_ai.system_instructions"));
         assert!(stream_fields["gen_ai.output.messages"]
             .as_str()
             .unwrap()

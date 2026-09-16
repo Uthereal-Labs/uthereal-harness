@@ -11,6 +11,7 @@ pub const DEFAULT_EXTENSION_TIMEOUT: u64 = 300;
 pub const DEFAULT_EXTENSION_DESCRIPTION: &str = "";
 pub const DEFAULT_DISPLAY_NAME: &str = "Developer";
 const EXTENSIONS_CONFIG_KEY: &str = "extensions";
+const DELEGATE_ONLY_EXTENSIONS_CONFIG_KEY: &str = "delegate_only_extensions";
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ExtensionEntry {
@@ -142,7 +143,10 @@ pub fn get_extension_by_name(name: &str) -> Option<ExtensionConfig> {
     get_extension_by_name_with_config(Config::global(), name)
 }
 
-fn get_extension_by_name_with_config(config: &Config, name: &str) -> Option<ExtensionConfig> {
+pub(crate) fn get_extension_by_name_with_config(
+    config: &Config,
+    name: &str,
+) -> Option<ExtensionConfig> {
     let extensions = get_extensions_map_with_config(config);
     let key = name_to_key(name);
 
@@ -223,19 +227,29 @@ pub fn configured_enabled_state(config: &Config, name: &str) -> Option<bool> {
 }
 
 pub fn get_enabled_extensions() -> Vec<ExtensionConfig> {
-    get_all_extensions()
-        .into_iter()
-        .filter(|ext| ext.enabled)
-        .map(|ext| ext.config)
-        .collect()
+    get_enabled_extensions_with_config(Config::global())
 }
 
 pub fn get_enabled_extensions_with_config(config: &Config) -> Vec<ExtensionConfig> {
     get_extensions_map_with_config(config)
         .into_values()
-        .filter(|ext| ext.enabled)
+        .filter(|ext| {
+            ext.enabled && !is_delegate_only_extension_with_config(config, &ext.config.name())
+        })
         .map(|ext| ext.config)
         .collect()
+}
+
+pub fn is_delegate_only_extension(name: &str) -> bool {
+    is_delegate_only_extension_with_config(Config::global(), name)
+}
+
+pub(crate) fn is_delegate_only_extension_with_config(config: &Config, name: &str) -> bool {
+    config
+        .get_param::<Vec<String>>(DELEGATE_ONLY_EXTENSIONS_CONFIG_KEY)
+        .unwrap_or_default()
+        .iter()
+        .any(|configured| configured == name || name_to_key(configured) == name_to_key(name))
 }
 
 pub fn get_available_extensions() -> Vec<ExtensionConfig> {
@@ -313,6 +327,7 @@ pub fn resolve_extensions_for_new_session(
     extensions
         .into_iter()
         .filter(is_extension_available)
+        .filter(|extension| !is_delegate_only_extension(extension.name().as_str()))
         .collect()
 }
 
@@ -496,6 +511,37 @@ extensions:
             extension,
             ExtensionConfig::Builtin { ref name, .. } if name == "memory"
         ));
+    }
+
+    #[test]
+    fn delegate_only_extensions_are_excluded_from_parent_defaults() {
+        let (config, _config_file, _secrets_file) = test_config(
+            r#"
+delegate_only_extensions: [specialist]
+extensions:
+  specialist:
+    enabled: true
+    type: builtin
+    name: specialist
+    description: specialist tools
+    display_name: Specialist
+  ordinary:
+    enabled: true
+    type: builtin
+    name: ordinary
+    description: ordinary tools
+    display_name: Ordinary
+"#,
+        );
+
+        let enabled = get_enabled_extensions_with_config(&config);
+        assert!(!enabled
+            .iter()
+            .any(|extension| extension.name() == "specialist"));
+        assert!(enabled
+            .iter()
+            .any(|extension| extension.name() == "ordinary"));
+        assert!(get_extension_by_name_with_config(&config, "specialist").is_some());
     }
 
     #[test]

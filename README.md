@@ -1,5 +1,7 @@
 <div align="center">
 
+Uthereal fork: see [CLI, Docker API, and native orchestration setup](HARNESS.md).
+
 # goose
 
 _your native open source AI agent — desktop app, CLI, and API — for code, workflows, and everything in between_

@@ -16,6 +16,7 @@ use crate::sources::parse_frontmatter;
 use crate::utils::safe_truncate;
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::FutureExt;
 use goose_agent::operation::messages_since_kickoff;
 use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
 use rmcp::model::{
@@ -91,8 +92,22 @@ pub struct DelegateParams {
     pub r#async: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct SendParams {
+    task_id: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageParentParams {
+    message: String,
+}
+
 pub struct BackgroundTask {
     pub id: String,
+    pub parent_session_id: String,
+    pub non_blocking: bool,
+    pub completion_delivery_error: Arc<Mutex<Option<String>>>,
     pub description: String,
     pub started_at: Instant,
     pub turns: Arc<AtomicU32>,
@@ -118,6 +133,8 @@ where
 
 pub struct CompletedTask {
     pub id: String,
+    pub parent_session_id: String,
+    pub completion_delivery_error: Option<String>,
     pub description: String,
     pub result: Result<String, String>,
     pub turns_taken: u32,
@@ -211,6 +228,16 @@ struct AgentMetadata {
     description: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    required_extensions: Vec<String>,
+    #[serde(default)]
+    required_skills: Vec<String>,
+    #[serde(default)]
+    always_async: bool,
+    #[serde(default)]
+    non_blocking: bool,
+    #[serde(default)]
+    delegate_only: bool,
 }
 
 fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
@@ -241,6 +268,26 @@ fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
     if let Some(model) = metadata.model {
         properties.insert("model".to_string(), serde_json::Value::String(model));
     }
+    properties.insert(
+        "required_extensions".to_string(),
+        serde_json::json!(metadata.required_extensions),
+    );
+    properties.insert(
+        "required_skills".to_string(),
+        serde_json::json!(metadata.required_skills),
+    );
+    properties.insert(
+        "always_async".to_string(),
+        serde_json::json!(metadata.always_async),
+    );
+    properties.insert(
+        "non_blocking".to_string(),
+        serde_json::json!(metadata.non_blocking),
+    );
+    properties.insert(
+        "delegate_only".to_string(),
+        serde_json::json!(metadata.delegate_only),
+    );
 
     Some(SourceEntry {
         source_type: SourceType::Agent,
@@ -785,13 +832,48 @@ impl SummonClient {
              3. Combined: Pair a source with a task (e.g., source: \"deploy\", instructions: \"deploy to staging\")\n\n\
              Effective Delegation:\n\
              - Delegates know only instructions + source content\n\
-             - Delegates cannot coordinate. Same-file work = conflicts.\n\
-             - Parallel: async: true, then load(taskId) to wait and get results. Single: sync.\n\n\
+             - Delegates exchange progress with the parent through native task messages; sibling delegates do not communicate directly. Same-file work can still conflict.\n\
+             - Parallel: async: true. Results report back automatically; use send(task_id: task_id, message: \"...\") for follow-up guidance. load(source: task_id) can wait or inspect status. Agents marked non_blocking always return status immediately from load while running. Single: sync.\n\n\
              Research (read-only): parallelize freely - delegates explore and report back.\n\
              Work (writes): partition files strictly - no two delegates touch the same file.\n\n\
-             Decompose → async delegates → load(taskId) for each → synthesize."
+             Decompose → start async delegates → continue useful work → incorporate automatic reports."
                 .to_string(),
             schema.as_object().unwrap().clone(),
+        )
+    }
+
+    fn create_send_tool(&self) -> Tool {
+        Tool::new(
+            "send",
+            "Send updated instructions or context to a running delegated task. The message is delivered at the task's next safe turn checkpoint.".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "required": ["task_id", "message"],
+                "properties": {
+                    "task_id": {"type": "string", "description": "Delegated task/session ID."},
+                    "message": {"type": "string", "description": "Guidance to send to the task."}
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+    }
+
+    fn create_message_parent_tool(&self) -> Tool {
+        Tool::new(
+            "message_parent",
+            "Send an interim progress update or finding to the parent task without ending this task. Final results are delivered automatically.".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "required": ["message"],
+                "properties": {
+                    "message": {"type": "string", "description": "Update for the parent task."}
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
         )
     }
 
@@ -1012,6 +1094,24 @@ impl SummonClient {
         let name = source_name.unwrap();
 
         if is_session_id(name) {
+            let running_owner = self
+                .background_tasks
+                .lock()
+                .await
+                .get(name)
+                .map(|task| task.parent_session_id.clone());
+            let completed_owner = self
+                .completed_tasks
+                .lock()
+                .await
+                .get(name)
+                .map(|task| task.parent_session_id.clone());
+            if running_owner
+                .or(completed_owner)
+                .is_some_and(|owner| !owner.is_empty() && owner != session_id)
+            {
+                return Err(format!("Task '{name}' does not belong to this session"));
+            }
             let task_result = self
                 .handle_load_task_result(name, cancel, peek, notification_emitter)
                 .await?;
@@ -1056,6 +1156,7 @@ impl SummonClient {
         let completed_entry = completed.get(task_id).map(|task| {
             (
                 task.result.clone(),
+                task.completion_delivery_error.clone(),
                 task.description.clone(),
                 task.duration,
                 task.turns_taken,
@@ -1063,9 +1164,21 @@ impl SummonClient {
             )
         });
 
-        if let Some((result, description, duration, turns_taken, notification_sink)) =
-            completed_entry
+        if let Some((
+            result,
+            completion_delivery_error,
+            description,
+            duration,
+            turns_taken,
+            notification_sink,
+        )) = completed_entry
         {
+            if let Some(error) = completion_delivery_error {
+                Self::attach_notification_emitter(&notification_sink, notification_emitter).await;
+                return Err(format!(
+                    "Task '{task_id}' completed, but its parent report could not be delivered: {error}"
+                ));
+            }
             if !peek {
                 Self::attach_notification_emitter(&notification_sink, notification_emitter).await;
                 completed.remove(task_id);
@@ -1107,7 +1220,7 @@ impl SummonClient {
         let mut running = self.background_tasks.lock().await;
         drop(completed);
         if running.contains_key(task_id) {
-            if peek {
+            if peek || (running.get(task_id).unwrap().non_blocking && !cancel) {
                 let task = running.get(task_id).unwrap();
                 let elapsed = task.started_at.elapsed();
                 let turns = Arc::clone(&task.turns);
@@ -1150,6 +1263,17 @@ impl SummonClient {
             }
 
             if cancel {
+                if running.get(task_id).unwrap().handle.is_finished() {
+                    drop(running);
+                    self.cleanup_completed_tasks().await;
+                    return Box::pin(self.handle_load_task_result(
+                        task_id,
+                        false,
+                        peek,
+                        notification_emitter,
+                    ))
+                    .await;
+                }
                 let notification_sink =
                     Arc::clone(&running.get(task_id).unwrap().notification_sink);
                 Self::attach_notification_emitter(&notification_sink, notification_emitter).await;
@@ -1168,18 +1292,55 @@ impl SummonClient {
                     }
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {
                         handle.abort();
+                        let _ = handle.await;
                         "Task did not stop in time (aborted)".to_string()
                     }
                 };
                 let duration = task.started_at.elapsed();
                 let turns_taken = self.refresh_task_turns(task_id, &task.turns).await;
+                if !task.parent_session_id.is_empty() {
+                    if let Err(error) = self
+                        .context
+                        .session_manager
+                        .enqueue_completion_to_parent(
+                            task_id,
+                            &format!("Task {task_id} was cancelled.\n\n{output}"),
+                        )
+                        .await
+                    {
+                        let error = error.to_string();
+                        *task.completion_delivery_error.lock().await = Some(error.clone());
+                        warn!(
+                            "Failed to enqueue cancellation for background task {}: {}",
+                            task_id, error
+                        );
+                        self.completed_tasks.lock().await.insert(
+                            task_id.to_string(),
+                            CompletedTask {
+                                id: task_id.to_string(),
+                                parent_session_id: task.parent_session_id.clone(),
+                                completion_delivery_error: Some(error.clone()),
+                                description: task.description.clone(),
+                                result: Err(format!("Task was cancelled: {output}")),
+                                turns_taken,
+                                duration,
+                                completed_at: Instant::now(),
+                                notification_sink: Arc::clone(&task.notification_sink),
+                            },
+                        );
+                        return Err(format!(
+                            "Task '{task_id}' was cancelled, but its parent report could not be delivered: {error}"
+                        ));
+                    }
+                }
 
                 return Ok(TaskLoadResult {
                     content: vec![ContentBlock::text(format!(
                         "# Background Task Result: {}\n\n\
                          **Task:** {}\n\
-                         **Status:** ⊘ Cancelled\n\
-                         **Duration:** {} ({} turns)\n\n\
+                         **Status:** ⊘ Cancellation requested\n\
+                         **Duration:** {} ({} turns)\n\
+                         Cancellation was requested and the task stopped. If the task finished concurrently, its automatic completion report is authoritative.\n\n\
                          ## Output\n\n{}",
                         task_id,
                         task.description,
@@ -1187,7 +1348,7 @@ impl SummonClient {
                         turns_taken,
                         output
                     ))],
-                    status: "cancelled",
+                    status: "cancellation_requested",
                     turns: Some(turns_taken),
                     duration_secs: Some(duration.as_secs()),
                 });
@@ -1297,6 +1458,18 @@ impl SummonClient {
 
         match source {
             Some(mut source) => {
+                if source.source_type == SourceType::Agent
+                    && source
+                        .properties
+                        .get("delegate_only")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    return Err(format!(
+                        "Agent '{}' is delegate-only and cannot be loaded as context",
+                        source.name
+                    ));
+                }
                 if source.source_type == SourceType::Subrecipe && source.content.is_empty() {
                     source.content = self
                         .load_subrecipe_content(session_id, &source.name)
@@ -1370,7 +1543,27 @@ impl SummonClient {
             return Err("Delegated tasks cannot spawn further delegations".to_string());
         }
 
-        if params.r#async {
+        let agent_source = if let Some(source_name) = params.source.as_deref() {
+            self.resolve_source(session_id, source_name, &session.working_dir)
+                .await?
+                .filter(|source| source.source_type == SourceType::Agent)
+        } else {
+            None
+        };
+        let force_async = agent_source.as_ref().is_some_and(|source| {
+            source
+                .properties
+                .get("always_async")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || source
+                    .properties
+                    .get("non_blocking")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+        });
+
+        if params.r#async || force_async {
             let (content, task_id) = self.handle_async_delegate(session_id, params).await?;
             let mut meta = MetaObject::new();
             meta.0.insert(
@@ -1419,6 +1612,7 @@ impl SummonClient {
             cancellation_token: Some(cancellation_token),
             on_message: None,
             notification_tx: None,
+            parent_span: tracing::Span::current(),
         };
         let result = Self::run_subagent_with_notifications(
             Self::notification_sink(notification_emitter),
@@ -1519,7 +1713,7 @@ impl SummonClient {
                 self.build_recipe_from_source(&source, params, session_id)
                     .await?
             }
-            SourceType::Agent => self.build_recipe_from_agent(&source, params)?,
+            SourceType::Agent => self.build_recipe_from_agent(&source, params, working_dir)?,
             _ => {
                 return Err(format!(
                     "Source '{}' has kind '{}' which cannot be delegated from summon",
@@ -1609,6 +1803,7 @@ impl SummonClient {
         &self,
         source: &SourceEntry,
         params: &DelegateParams,
+        working_dir: &Path,
     ) -> Result<Recipe, String> {
         if source.path.is_empty() {
             return Err("Agent source has no path".to_string());
@@ -1630,11 +1825,35 @@ impl SummonClient {
             max_turns: None,
         });
 
+        let mut instructions = source.content.clone();
+        let required_skills = source
+            .properties
+            .get("required_skills")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        if !required_skills.is_empty() {
+            let skills = crate::skills::discover_skills(Some(working_dir));
+            for required in required_skills {
+                let skill = skills
+                    .iter()
+                    .find(|skill| skill.name == required)
+                    .ok_or_else(|| format!("Required skill '{}' was not found", required))?;
+                let content = crate::skills::loaded_skill_context_with_args(skill, None).map_err(
+                    |error| format!("Failed to load required skill '{}': {}", required, error),
+                )?;
+                instructions.push_str("\n\n");
+                instructions.push_str(&content);
+            }
+        }
+
         let mut builder = Recipe::builder()
             .version("1.0.0")
             .title(format!("Agent: {}", source.name))
             .description(source.description.clone())
-            .instructions(&source.content);
+            .instructions(instructions);
 
         if let Some(settings) = settings {
             builder = builder.settings(settings);
@@ -1655,28 +1874,64 @@ impl SummonClient {
         recipe: &Recipe,
         session: &crate::session::Session,
     ) -> Result<TaskConfig, anyhow::Error> {
-        let mut extensions = EnabledExtensionsState::extensions_or_default(
-            Some(&session.extension_data),
-            Config::global(),
-        );
+        let required_extensions = if let Some(source_name) = params.source.as_deref() {
+            self.resolve_source(&session.id, source_name, &session.working_dir)
+                .await
+                .map_err(anyhow::Error::msg)?
+                .filter(|source| source.source_type == SourceType::Agent)
+                .and_then(|source| source.properties.get("required_extensions").cloned())
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
-        if let Some(filter) = &params.extensions {
-            if filter.is_empty() {
-                extensions = Vec::new();
-            } else {
-                let available_names: Vec<String> =
-                    extensions.iter().map(|ext| ext.name()).collect();
-                extensions.retain(|ext| filter.contains(&ext.name()));
-                let unmatched: Vec<&str> = filter
-                    .iter()
-                    .filter(|name| !available_names.iter().any(|n| n == *name))
-                    .map(String::as_str)
-                    .collect();
-                if !unmatched.is_empty() {
-                    warn!(
-                        "Delegate requested extensions not available in session: {:?}. Available: {:?}",
-                        unmatched, available_names
-                    );
+        let mut extensions = if required_extensions.is_empty() {
+            EnabledExtensionsState::extensions_or_default(
+                Some(&session.extension_data),
+                Config::global(),
+            )
+        } else {
+            required_extensions
+                .iter()
+                .map(|name| {
+                    crate::config::get_extension_by_name(name).ok_or_else(|| {
+                        anyhow::anyhow!("Required extension '{}' is not configured", name)
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, anyhow::Error>>()?
+        };
+        let required_extension_names = if required_extensions.is_empty() {
+            Vec::new()
+        } else {
+            extensions
+                .iter()
+                .map(|extension| extension.name())
+                .collect()
+        };
+
+        if required_extensions.is_empty() {
+            if let Some(filter) = &params.extensions {
+                if filter.is_empty() {
+                    extensions = Vec::new();
+                } else {
+                    let available_names: Vec<String> =
+                        extensions.iter().map(|ext| ext.name()).collect();
+                    extensions.retain(|ext| filter.contains(&ext.name()));
+                    let unmatched: Vec<&str> = filter
+                        .iter()
+                        .filter(|name| !available_names.iter().any(|n| n == *name))
+                        .map(String::as_str)
+                        .collect();
+                    if !unmatched.is_empty() {
+                        warn!(
+                            "Delegate requested extensions not available in session: {:?}. Available: {:?}",
+                            unmatched, available_names
+                        );
+                    }
                 }
             }
         }
@@ -1710,7 +1965,8 @@ impl SummonClient {
             &effective_working_dir,
             extensions,
         )
-        .with_max_turns(Some(max_turns));
+        .with_max_turns(Some(max_turns))
+        .with_required_extension_names(required_extension_names);
 
         Ok(task_config)
     }
@@ -2009,6 +2265,8 @@ impl SummonClient {
                 id.clone(),
                 CompletedTask {
                     id,
+                    parent_session_id: task.parent_session_id,
+                    completion_delivery_error: task.completion_delivery_error.lock().await.clone(),
                     description: task.description,
                     result,
                     turns_taken,
@@ -2020,7 +2278,9 @@ impl SummonClient {
         }
 
         let ttl = completed_task_ttl();
-        completed.retain(|_id, task| task.completed_at.elapsed() <= ttl);
+        completed.retain(|_id, task| {
+            task.completion_delivery_error.is_some() || task.completed_at.elapsed() <= ttl
+        });
     }
 
     fn get_task_description(params: &DelegateParams) -> String {
@@ -2054,6 +2314,15 @@ impl SummonClient {
             .map_err(|e| format!("Failed to get session: {}", e))?;
 
         let working_dir = session.working_dir.clone();
+        let non_blocking = if let Some(source_name) = params.source.as_deref() {
+            self.resolve_source(session_id, source_name, &working_dir)
+                .await?
+                .and_then(|source| source.properties.get("non_blocking").cloned())
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        } else {
+            false
+        };
         let recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
             .await?;
@@ -2084,6 +2353,9 @@ impl SummonClient {
             .await?;
 
         let task_id = subagent_session.id.clone();
+        let completion_session_manager = Arc::clone(&self.context.session_manager);
+        let completion_delivery_error = Arc::new(Mutex::new(None));
+        let task_completion_delivery_error = Arc::clone(&completion_delivery_error);
 
         let turns = Arc::new(AtomicU32::new(0));
         let last_activity = Arc::new(AtomicU64::new(0));
@@ -2096,10 +2368,13 @@ impl SummonClient {
 
         let task_token = CancellationToken::new();
         let task_token_clone = task_token.clone();
+        let completion_cancellation_token = task_token.clone();
+        let parent_span = tracing::Span::current();
 
         let notification_sink = Self::notification_sink(None);
         let task_notification_sink = Arc::clone(&notification_sink);
 
+        let completion_task_id = task_id.clone();
         let (handle, completion_token) = spawn_background_task(async move {
             let params = SubagentRunParams {
                 config: agent_config,
@@ -2110,17 +2385,54 @@ impl SummonClient {
                 cancellation_token: Some(task_token_clone),
                 on_message: Some(on_message),
                 notification_tx: None,
+                parent_span,
             };
-            Self::run_subagent_with_notifications(task_notification_sink, move |notification_tx| {
-                let mut params = params;
-                params.notification_tx = Some(notification_tx);
-                run_subagent_task(params)
-            })
+            let result = std::panic::AssertUnwindSafe(Self::run_subagent_with_notifications(
+                task_notification_sink,
+                move |notification_tx| {
+                    let mut params = params;
+                    params.notification_tx = Some(notification_tx);
+                    run_subagent_task(params)
+                },
+            ))
+            .catch_unwind()
             .await
+            .unwrap_or_else(|panic| {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown panic");
+                Err(anyhow::anyhow!("Task panicked: {detail}"))
+            });
+            let completion = if completion_cancellation_token.is_cancelled() {
+                format!("Task {completion_task_id} was cancelled.")
+            } else {
+                match &result {
+                    Ok(output) => {
+                        format!("Task {completion_task_id} completed successfully.\n\n{output}")
+                    }
+                    Err(error) => format!("Task {completion_task_id} failed.\n\n{error}"),
+                }
+            };
+            if let Err(error) = completion_session_manager
+                .enqueue_completion_to_parent(&completion_task_id, &completion)
+                .await
+            {
+                *task_completion_delivery_error.lock().await = Some(error.to_string());
+                warn!(
+                    "Failed to enqueue completion for background task {}: {}",
+                    completion_task_id, error
+                );
+            }
+            result
         });
 
         let task = BackgroundTask {
             id: task_id.clone(),
+            parent_session_id: session_id.to_string(),
+            non_blocking,
+            completion_delivery_error,
             description: description.clone(),
             started_at: Instant::now(),
             turns,
@@ -2136,10 +2448,18 @@ impl SummonClient {
             .await
             .insert(task_id.clone(), task);
 
+        let retrieval = if non_blocking {
+            format!(
+                "It will report back automatically. load(source: \"{task_id}\") returns current status without waiting."
+            )
+        } else {
+            format!(
+                "It will report back automatically. load(source: \"{task_id}\") waits for the result when needed."
+            )
+        };
         let content = vec![ContentBlock::text(format!(
-            "Task {} started in background: \"{}\"\n\
-             Continue with other work. When you need the result, use load(source: \"{}\").",
-            task_id, description, task_id
+            "Task {task_id} started in background: \"{description}\"\n\
+             Continue with other work. {retrieval} Use send(task_id: \"{task_id}\", message: \"...\") to provide new guidance."
         ))];
         Ok((content, task_id))
     }
@@ -2165,8 +2485,11 @@ impl McpClientTrait for SummonClient {
 
         let mut tools = vec![self.create_load_tool()];
 
-        if !is_subagent {
+        if is_subagent {
+            tools.push(self.create_message_parent_tool());
+        } else {
             tools.push(self.create_delegate_tool());
+            tools.push(self.create_send_tool());
         }
 
         Ok(ListToolsResult {
@@ -2213,10 +2536,110 @@ impl McpClientTrait for SummonClient {
                     ))])),
                 }
             }
+            "send" => {
+                let params: std::result::Result<SendParams, _> = arguments
+                    .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
+                    .transpose()
+                    .map(|params| {
+                        params.unwrap_or(SendParams {
+                            task_id: String::new(),
+                            message: String::new(),
+                        })
+                    });
+                match params {
+                    Ok(params) => match async {
+                        let tasks = self.background_tasks.lock().await;
+                        let Some(task) = tasks.get(&params.task_id) else {
+                            return Err(anyhow::anyhow!(
+                                "Task '{}' is not running",
+                                params.task_id
+                            ));
+                        };
+                        if task.handle.is_finished() {
+                            return Err(anyhow::anyhow!(
+                                "Task '{}' has already finished",
+                                params.task_id
+                            ));
+                        }
+                        self.context
+                            .session_manager
+                            .send_to_child(session_id, &params.task_id, &params.message)
+                            .await
+                    }
+                    .await
+                    {
+                        Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                            "Message queued for task {}.",
+                            params.task_id
+                        ))])),
+                        Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                            "Error: {error}"
+                        ))])),
+                    },
+                    Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Error: Invalid parameters: {error}"
+                    ))])),
+                }
+            }
+            "message_parent" => {
+                let params: std::result::Result<MessageParentParams, _> = arguments
+                    .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
+                    .transpose()
+                    .map(|params| {
+                        params.unwrap_or(MessageParentParams {
+                            message: String::new(),
+                        })
+                    });
+                match params {
+                    Ok(params) => match self
+                        .context
+                        .session_manager
+                        .send_to_parent(session_id, &params.message)
+                        .await
+                    {
+                        Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                            "Update queued for the parent task.",
+                        )])),
+                        Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                            "Error: {error}"
+                        ))])),
+                    },
+                    Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Error: Invalid parameters: {error}"
+                    ))])),
+                }
+            }
             _ => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Error: Unknown tool: {}",
                 name
             ))])),
+        }
+    }
+
+    async fn shutdown_session(&self, session_id: &str) -> anyhow::Result<()> {
+        let task_ids = {
+            let tasks = self.background_tasks.lock().await;
+            tasks
+                .values()
+                .filter(|task| task.parent_session_id == session_id)
+                .map(|task| {
+                    task.cancellation_token.cancel();
+                    task.id.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut first_error = None;
+        for task_id in task_ids {
+            if let Err(error) = self
+                .handle_load_task_result(&task_id, true, false, None)
+                .await
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => anyhow::bail!(error),
+            None => self.has_active_tasks(session_id).await.map(|_| ()),
         }
     }
 
@@ -2300,6 +2723,39 @@ impl McpClientTrait for SummonClient {
         }
 
         Some(lines.join("\n"))
+    }
+
+    async fn has_active_tasks(&self, session_id: &str) -> anyhow::Result<bool> {
+        let running = self
+            .background_tasks
+            .lock()
+            .await
+            .values()
+            .filter(|task| task.parent_session_id == session_id)
+            .map(|task| {
+                (
+                    task.handle.is_finished(),
+                    Arc::clone(&task.completion_delivery_error),
+                )
+            })
+            .collect::<Vec<_>>();
+        let completed = self
+            .completed_tasks
+            .lock()
+            .await
+            .values()
+            .filter(|task| task.parent_session_id == session_id)
+            .filter_map(|task| task.completion_delivery_error.clone())
+            .collect::<Vec<_>>();
+        for (_, error) in &running {
+            if let Some(error) = error.lock().await.clone() {
+                anyhow::bail!("Failed to deliver background task completion: {error}");
+            }
+        }
+        if let Some(error) = completed.first() {
+            anyhow::bail!("Failed to deliver background task completion: {error}");
+        }
+        Ok(running.iter().any(|(finished, _)| !finished))
     }
 }
 
@@ -2487,6 +2943,27 @@ You review code."#;
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].name, "reviewer");
+    }
+
+    #[test]
+    fn agent_frontmatter_preserves_specialist_policy() {
+        let source = parse_agent_content(
+            "---\nname: reviewer\nrequired_extensions: [review-tools]\nrequired_skills: [code-review]\nalways_async: true\nnon_blocking: true\ndelegate_only: true\n---\nReview code.",
+            Path::new("reviewer.md"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            source.properties["required_extensions"],
+            serde_json::json!(["review-tools"])
+        );
+        assert_eq!(
+            source.properties["required_skills"],
+            serde_json::json!(["code-review"])
+        );
+        assert_eq!(source.properties["always_async"], serde_json::json!(true));
+        assert_eq!(source.properties["non_blocking"], serde_json::json!(true));
+        assert_eq!(source.properties["delegate_only"], serde_json::json!(true));
     }
 
     #[cfg(unix)]
@@ -3614,6 +4091,8 @@ You review code."#;
             task_id.to_string(),
             CompletedTask {
                 id: task_id.to_string(),
+                parent_session_id: String::new(),
+                completion_delivery_error: None,
                 description: "Completed task".to_string(),
                 result: Ok("done".to_string()),
                 turns_taken: 1,
@@ -3663,6 +4142,8 @@ You review code."#;
             task_id.to_string(),
             CompletedTask {
                 id: task_id.to_string(),
+                parent_session_id: String::new(),
+                completion_delivery_error: None,
                 description: "Completed task".to_string(),
                 result: Ok("done".to_string()),
                 turns_taken: 1,
@@ -3735,6 +4216,8 @@ You review code."#;
             task_id.to_string(),
             CompletedTask {
                 id: task_id.to_string(),
+                parent_session_id: String::new(),
+                completion_delivery_error: None,
                 description: "Completed task".to_string(),
                 result: Ok("done".to_string()),
                 turns_taken: 1,
@@ -3784,6 +4267,9 @@ You review code."#;
                 "20260204_1".to_string(),
                 BackgroundTask {
                     id: "20260204_1".to_string(),
+                    parent_session_id: String::new(),
+                    non_blocking: false,
+                    completion_delivery_error: Arc::new(Mutex::new(None)),
                     description: "Running task".to_string(),
                     started_at: Instant::now(),
                     turns: Arc::new(AtomicU32::new(2)),
@@ -3824,6 +4310,8 @@ You review code."#;
                 "20260204_2".to_string(),
                 CompletedTask {
                     id: "20260204_2".to_string(),
+                    parent_session_id: String::new(),
+                    completion_delivery_error: None,
                     description: "Successful task".to_string(),
                     result: Ok("Task completed successfully with output".to_string()),
                     turns_taken: 5,
@@ -3836,6 +4324,8 @@ You review code."#;
                 "20260204_3".to_string(),
                 CompletedTask {
                     id: "20260204_3".to_string(),
+                    parent_session_id: String::new(),
+                    completion_delivery_error: None,
                     description: "Failed task".to_string(),
                     result: Err("Something went wrong".to_string()),
                     turns_taken: 3,
@@ -3934,6 +4424,9 @@ You review code."#;
             task_id.clone(),
             BackgroundTask {
                 id: task_id.clone(),
+                parent_session_id: String::new(),
+                non_blocking: false,
+                completion_delivery_error: Arc::new(Mutex::new(None)),
                 description: "Inspect the project".to_string(),
                 started_at: Instant::now(),
                 // Simulate hundreds of streamed message events for two durable turns.
@@ -4052,6 +4545,9 @@ You review code."#;
                 task_id.clone(),
                 BackgroundTask {
                     id: task_id.clone(),
+                    parent_session_id: String::new(),
+                    non_blocking: false,
+                    completion_delivery_error: Arc::new(Mutex::new(None)),
                     description: "Cancellable task".to_string(),
                     started_at: Instant::now(),
                     // This stale event count must be replaced after cancellation.
@@ -4086,11 +4582,12 @@ You review code."#;
         );
         let result = result.unwrap();
         let text = extract_text(&result.content[0]);
-        assert!(text.contains("Cancelled"));
+        assert!(text.contains("Cancellation requested"));
         assert!(text.contains(&task_id));
         assert!(text.contains("Cancellable task"));
         assert!(text.contains("cancelled gracefully"));
-        assert_eq!(result.status, "cancelled");
+        assert_eq!(result.status, "cancellation_requested");
+        assert!(text.contains("automatic completion report is authoritative"));
         assert_eq!(result.turns, Some(1));
         assert_eq!(
             notification_subagent_id(&notification.unwrap()).as_deref(),
@@ -4098,6 +4595,94 @@ You review code."#;
         );
         assert!(token.is_cancelled());
         assert!(!client.background_tasks.lock().await.contains_key(&task_id));
+    }
+
+    #[tokio::test]
+    async fn cancel_of_already_finished_task_returns_completion() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let task_id = "20260204_1";
+        client.background_tasks.lock().await.insert(
+            task_id.to_string(),
+            BackgroundTask {
+                id: task_id.to_string(),
+                parent_session_id: String::new(),
+                non_blocking: false,
+                completion_delivery_error: Arc::new(Mutex::new(None)),
+                description: "Finished task".to_string(),
+                started_at: Instant::now(),
+                turns: Arc::new(AtomicU32::new(1)),
+                last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                handle: tokio::spawn(async { Ok("finished output".to_string()) }),
+                cancellation_token: CancellationToken::new(),
+                completion_token: CancellationToken::new(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+        while !client
+            .background_tasks
+            .lock()
+            .await
+            .get(task_id)
+            .unwrap()
+            .handle
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let result = client
+            .handle_load_task_result(task_id, true, false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, "completed");
+        assert!(extract_text(&result.content[0]).contains("finished output"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_delivery_failure_remains_visible_to_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_manager = Arc::new(crate::session::SessionManager::new(
+            temp_dir.path().join("sessions"),
+        ));
+        let task_id = create_test_subagent_session(
+            &session_manager,
+            temp_dir.path(),
+            &[Message::user().with_text("Analyse the project")],
+        )
+        .await;
+        let client =
+            SummonClient::new(create_test_context_with_session_manager(session_manager)).unwrap();
+        let cancellation_token = CancellationToken::new();
+        let wait_token = cancellation_token.clone();
+        client.background_tasks.lock().await.insert(
+            task_id.clone(),
+            BackgroundTask {
+                id: task_id.clone(),
+                parent_session_id: "parent".to_string(),
+                non_blocking: false,
+                completion_delivery_error: Arc::new(Mutex::new(None)),
+                description: "Cancellable task".to_string(),
+                started_at: Instant::now(),
+                turns: Arc::new(AtomicU32::new(0)),
+                last_activity: Arc::new(AtomicU64::new(0)),
+                handle: tokio::spawn(async move {
+                    wait_token.cancelled().await;
+                    Ok("stopped".to_string())
+                }),
+                cancellation_token,
+                completion_token: CancellationToken::new(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+
+        let error = client
+            .handle_load_task_result(&task_id, true, false, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("parent report could not be delivered"));
+        assert!(client.completed_tasks.lock().await.contains_key(&task_id));
+        assert!(client.has_active_tasks("parent").await.is_err());
     }
 
     #[tokio::test]
@@ -4111,6 +4696,9 @@ You review code."#;
             task_id.to_string(),
             BackgroundTask {
                 id: task_id.to_string(),
+                parent_session_id: String::new(),
+                non_blocking: false,
+                completion_delivery_error: Arc::new(Mutex::new(None)),
                 description: "Cancellable task".to_string(),
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
@@ -4149,7 +4737,7 @@ You review code."#;
             .await
             .unwrap();
 
-        assert_eq!(result.status, "cancelled");
+        assert_eq!(result.status, "cancellation_requested");
         assert!(token.is_cancelled());
         assert!(!client.background_tasks.lock().await.contains_key(task_id));
 
@@ -4176,6 +4764,9 @@ You review code."#;
             task_id.to_string(),
             BackgroundTask {
                 id: task_id.to_string(),
+                parent_session_id: String::new(),
+                non_blocking: false,
+                completion_delivery_error: Arc::new(Mutex::new(None)),
                 description: "Running task".to_string(),
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
@@ -4251,6 +4842,9 @@ You review code."#;
             task_id.clone(),
             BackgroundTask {
                 id: task_id.clone(),
+                parent_session_id: String::new(),
+                non_blocking: false,
+                completion_delivery_error: Arc::new(Mutex::new(None)),
                 description: "Finished task".to_string(),
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
@@ -4319,6 +4913,9 @@ You review code."#;
                 task_id.clone(),
                 BackgroundTask {
                     id: task_id.clone(),
+                    parent_session_id: String::new(),
+                    non_blocking: false,
+                    completion_delivery_error: Arc::new(Mutex::new(None)),
                     description: "Long running analysis".to_string(),
                     started_at: Instant::now(),
                     // Simulate the old stream-event counter after seven fragments.
@@ -4391,6 +4988,44 @@ You review code."#;
     }
 
     #[tokio::test]
+    async fn non_blocking_task_load_returns_running_status_without_waiting() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let task_id = "20260204_1";
+        let cancellation_token = CancellationToken::new();
+        let wait_token = cancellation_token.clone();
+        client.background_tasks.lock().await.insert(
+            task_id.to_string(),
+            BackgroundTask {
+                id: task_id.to_string(),
+                parent_session_id: String::new(),
+                non_blocking: true,
+                completion_delivery_error: Arc::new(Mutex::new(None)),
+                description: "Non-blocking task".to_string(),
+                started_at: Instant::now(),
+                turns: Arc::new(AtomicU32::new(0)),
+                last_activity: Arc::new(AtomicU64::new(0)),
+                handle: tokio::spawn(async move {
+                    wait_token.cancelled().await;
+                    Ok("done".to_string())
+                }),
+                cancellation_token,
+                completion_token: CancellationToken::new(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.handle_load_task_result(task_id, false, false, None),
+        )
+        .await
+        .expect("non-blocking load should return immediately")
+        .unwrap();
+        assert_eq!(result.status, "running");
+        assert!(client.background_tasks.lock().await.contains_key(task_id));
+    }
+
+    #[tokio::test]
     async fn test_peek_completed_task_returns_result() {
         let client = SummonClient::new(create_test_context()).unwrap();
 
@@ -4400,6 +5035,8 @@ You review code."#;
                 "20260204_1".to_string(),
                 CompletedTask {
                     id: "20260204_1".to_string(),
+                    parent_session_id: String::new(),
+                    completion_delivery_error: None,
                     description: "Finished task".to_string(),
                     result: Ok("final output".to_string()),
                     turns_taken: 4,
@@ -4430,5 +5067,39 @@ You review code."#;
             .await
             .unwrap();
         assert!(extract_text(&result.content[0]).contains("final output"));
+    }
+
+    #[tokio::test]
+    async fn completion_delivery_failure_prevents_successful_idle_state() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        client.completed_tasks.lock().await.insert(
+            "20260204_1".to_string(),
+            CompletedTask {
+                id: "20260204_1".to_string(),
+                parent_session_id: "parent".to_string(),
+                completion_delivery_error: Some("database unavailable".to_string()),
+                description: "Finished task".to_string(),
+                result: Ok("final output".to_string()),
+                turns_taken: 1,
+                duration: Duration::from_secs(1),
+                completed_at: Instant::now(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+
+        let error = client.has_active_tasks("parent").await.unwrap_err();
+        assert!(error.to_string().contains("database unavailable"));
+        let load_error = client
+            .handle_load_task_result("20260204_1", false, false, None)
+            .await
+            .unwrap_err();
+        assert!(load_error.contains("parent report could not be delivered"));
+        assert!(client
+            .completed_tasks
+            .lock()
+            .await
+            .contains_key("20260204_1"));
+        assert!(client.has_active_tasks("parent").await.is_err());
+        assert!(!client.has_active_tasks("other-parent").await.unwrap());
     }
 }

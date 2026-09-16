@@ -70,6 +70,7 @@ fn platform_notification(result: &CallToolResult) -> Option<rmcp::model::ServerN
 }
 
 pub(super) fn tool_span(tool_name: &str, tool_call_id: &str, session_id: &str) -> tracing::Span {
+    let telemetry_session_id = crate::session_context::telemetry_session_id(session_id);
     tracing::info_span!(
         target: "goose::state_machine",
         "execute_tool",
@@ -79,7 +80,8 @@ pub(super) fn tool_span(tool_name: &str, tool_call_id: &str, session_id: &str) -
         "gen_ai.tool.call.arguments" = tracing::field::Empty,
         "gen_ai.tool.call.result" = tracing::field::Empty,
         "error.type" = tracing::field::Empty,
-        session.id = %session_id,
+        session.id = %telemetry_session_id,
+        goose.execution.session.id = %session_id,
     )
 }
 

@@ -249,6 +249,7 @@ pub struct ActivePromptRun {
 struct AgentStreamOutcome {
     was_cancelled: bool,
     output_token_limit_reached: bool,
+    completed_visible_response: bool,
 }
 
 /// Per-session active-run registry, shared by every `GooseAcpAgent` created
@@ -258,6 +259,35 @@ struct AgentStreamOutcome {
 /// fire between connections instead of letting two loops interleave writes on
 /// one session.
 pub type ActiveRunRegistry = Arc<Mutex<HashMap<String, ActivePromptRun>>>;
+#[derive(Default)]
+pub struct SessionAdmissionFenceState {
+    pub(crate) shutting_down: bool,
+    session_ids: HashSet<String>,
+}
+pub type SessionAdmissionFence = Arc<Mutex<SessionAdmissionFenceState>>;
+
+const SESSION_RUN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub(crate) async fn shutdown_active_runs(registry: &ActiveRunRegistry) -> Vec<anyhow::Error> {
+    let runs = {
+        let runs = registry.lock().await;
+        runs.iter()
+            .map(|(session_id, run)| {
+                run.cancel_token.cancel();
+                (session_id.clone(), run.agent.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut errors = Vec::new();
+    for (session_id, agent) in runs {
+        if let Err(error) = agent.shutdown_session(&session_id).await {
+            errors.push(anyhow::anyhow!(
+                "Failed to shut down background tasks for session {session_id}: {error}"
+            ));
+        }
+    }
+    errors
+}
 
 /// Releases a registry entry if the task consuming an agent stream is dropped
 /// without reaching its explicit `clear_active_run` — e.g. a roaming
@@ -283,16 +313,24 @@ impl Drop for ActiveRunDropGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let agent = {
-                    let mut runs = registry.lock().await;
+                    let runs = registry.lock().await;
                     match runs.get(&session_id) {
-                        Some(run) if run.run_id == run_id => {
-                            runs.remove(&session_id).map(|run| run.agent)
-                        }
+                        Some(run) if run.run_id == run_id => Some(run.agent.clone()),
                         _ => None,
                     }
                 };
                 if let Some(agent) = agent {
+                    if let Err(error) = agent.shutdown_session(&session_id).await {
+                        warn!(session_id, %error, "Failed to shut down dropped ACP run");
+                    }
                     agent.discard_pending_steers(&session_id).await;
+                    let mut runs = registry.lock().await;
+                    if runs
+                        .get(&session_id)
+                        .is_some_and(|run| run.run_id == run_id)
+                    {
+                        runs.remove(&session_id);
+                    }
                 }
             });
         }
@@ -337,12 +375,14 @@ pub struct GooseAcpAgentOptions {
     /// active-run guard holds across roaming connections that each get a fresh
     /// agent for the same session.
     pub active_prompt_runs: ActiveRunRegistry,
+    pub session_admission_fence: SessionAdmissionFence,
 }
 
 pub struct GooseAcpAgent {
     sessions: Arc<Mutex<HashMap<String, GooseAcpSession>>>,
     active_prompt_runs: Arc<Mutex<HashMap<String, ActivePromptRun>>>,
     closed_session_ids: Arc<Mutex<HashSet<String>>>,
+    session_admission_fence: SessionAdmissionFence,
     agent_manager: Arc<AgentManager>,
     provider_factory: AcpProviderFactory,
     builtin_selection: AcpBuiltinSelection,
@@ -985,6 +1025,7 @@ impl GooseAcpAgent {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             active_prompt_runs: options.active_prompt_runs,
             closed_session_ids: Arc::new(Mutex::new(HashSet::new())),
+            session_admission_fence: options.session_admission_fence,
             agent_manager,
             provider_factory: options.provider_factory,
             builtin_selection: options.builtin_selection,
@@ -1873,7 +1914,11 @@ impl GooseAcpAgent {
         &self,
         session_id: &str,
     ) -> Result<Arc<Agent>, agent_client_protocol::Error> {
-        if self.closed_session_ids.lock().await.contains(session_id) {
+        let fenced = {
+            let fence = self.session_admission_fence.lock().await;
+            fence.shutting_down || fence.session_ids.contains(session_id)
+        };
+        if self.closed_session_ids.lock().await.contains(session_id) || fenced {
             return Err(agent_client_protocol::Error::resource_not_found(Some(
                 session_id.to_string(),
             ))
@@ -1918,6 +1963,14 @@ impl GooseAcpAgent {
         }
 
         let mut active_prompt_runs = self.active_prompt_runs.lock().await;
+        let fence = self.session_admission_fence.lock().await;
+        if fence.shutting_down || fence.session_ids.contains(session_id) {
+            return Err(agent_client_protocol::Error::resource_not_found(Some(
+                session_id.to_string(),
+            ))
+            .data(format!("Session not found: {}", session_id)));
+        }
+        drop(fence);
         if let Some(active_run) = active_prompt_runs.get(session_id) {
             return Err(agent_client_protocol::Error::invalid_params().data(format!(
                 "session already has active run `{}`; use _goose/unstable/session/steer",
@@ -1934,6 +1987,68 @@ impl GooseAcpAgent {
             },
         );
         Ok(())
+    }
+
+    async fn cancel_and_drain_session(&self, session_id: &str) -> (bool, Vec<anyhow::Error>) {
+        self.closed_session_ids
+            .lock()
+            .await
+            .insert(session_id.to_string());
+        self.session_admission_fence
+            .lock()
+            .await
+            .session_ids
+            .insert(session_id.to_string());
+
+        let active_run = self
+            .active_prompt_runs
+            .lock()
+            .await
+            .get(session_id)
+            .map(|run| (run.cancel_token.clone(), run.agent.clone()));
+        if let Some((token, _)) = &active_run {
+            token.cancel();
+        }
+
+        let agent = match active_run {
+            Some((_, agent)) => Some(agent),
+            None => self
+                .sessions
+                .lock()
+                .await
+                .get(session_id)
+                .map(|session| session.agent.clone()),
+        };
+        let mut errors = Vec::new();
+        if let Some(agent) = agent {
+            if let Err(error) = agent.shutdown_session(session_id).await {
+                errors.push(anyhow::anyhow!(
+                    "Failed to shut down session background tasks: {error}"
+                ));
+            }
+        }
+
+        let drained = tokio::time::timeout(SESSION_RUN_DRAIN_TIMEOUT, async {
+            loop {
+                if !self
+                    .active_prompt_runs
+                    .lock()
+                    .await
+                    .contains_key(session_id)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !drained {
+            errors.push(anyhow::anyhow!(
+                "Timed out waiting for active prompt run to stop"
+            ));
+        }
+        (drained, errors)
     }
 
     async fn clear_active_run(&self, session_id: &str, run_id: &str) {
@@ -2158,6 +2273,7 @@ impl GooseAcpAgent {
     ) -> Result<AgentStreamOutcome, agent_client_protocol::Error> {
         let mut was_cancelled = false;
         let mut output_token_limit_reached = false;
+        let mut completed_visible_response = false;
         let mut tool_requests = HashMap::new();
         let mut chain_tracker = ToolChainTracker::default();
         let mut context_limit = None;
@@ -2176,6 +2292,19 @@ impl GooseAcpAgent {
             match event {
                 Ok(crate::agents::AgentEvent::Message(mut message)) => {
                     update_output_token_limit_reached(&mut output_token_limit_reached, &message);
+
+                    if !message.is_user_visible() {
+                        continue;
+                    }
+                    if message.role == Role::Assistant {
+                        completed_visible_response = !message.is_tool_call()
+                            && !message
+                                .content
+                                .iter()
+                                .any(|content| content.as_error().is_some())
+                            && message.as_concat_text()
+                                != crate::agents::state_machine::MAX_TURNS_MESSAGE;
+                    }
 
                     let sessions = self.sessions.lock().await;
                     if !sessions.contains_key(session_id) {
@@ -2279,7 +2408,39 @@ impl GooseAcpAgent {
         Ok(AgentStreamOutcome {
             was_cancelled,
             output_token_limit_reached,
+            completed_visible_response,
         })
+    }
+
+    async fn run_agent_reply(
+        &self,
+        cx: &ConnectionTo<Client>,
+        acp_session_id: &SessionId,
+        agent: &Arc<Agent>,
+        message: Message,
+        use_state_machine: bool,
+        cancel_token: &CancellationToken,
+    ) -> Result<AgentStreamOutcome, agent_client_protocol::Error> {
+        let session_id = acp_session_id.0.as_ref();
+        let stream = agent
+            .reply(
+                message,
+                SessionConfig {
+                    id: session_id.to_string(),
+                    schedule_id: None,
+                    max_turns: None,
+                    retry_config: None,
+                },
+                use_state_machine,
+                Some(cancel_token.clone()),
+            )
+            .await
+            .map_err(|error| {
+                agent_client_protocol::Error::internal_error()
+                    .data(format!("Error getting agent reply: {error}"))
+            })?;
+        self.forward_agent_stream(cx, acp_session_id, session_id, agent, cancel_token, stream)
+            .await
     }
 
     async fn on_load_session(
@@ -2351,40 +2512,102 @@ impl GooseAcpAgent {
             .and_then(|goose| goose.get("unrolledAgentLoop"))
             .and_then(|value| value.as_bool())
             .unwrap_or_else(crate::agents::state_machine::enabled);
-        let session_config = SessionConfig {
-            id: session_id.clone(),
-            schedule_id: None,
-            max_turns: None,
-            retry_config: None,
-        };
-
-        let stream = match agent
-            .reply(
-                user_message,
-                session_config,
-                use_state_machine,
-                Some(cancel_token.clone()),
-            )
-            .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                self.clear_active_run(&session_id, &run_id).await;
-                let _ = Self::send_active_run_update(cx, &args.session_id, None);
-                return Err(agent_client_protocol::Error::internal_error()
-                    .data(format!("Error getting agent reply: {error}")));
+        let stream_result = async {
+            let mut outcome = self
+                .run_agent_reply(
+                    cx,
+                    &args.session_id,
+                    &agent,
+                    user_message,
+                    use_state_machine,
+                    &cancel_token,
+                )
+                .await?;
+            if outcome.was_cancelled || outcome.output_token_limit_reached {
+                return Ok(outcome);
             }
-        };
-        let stream_result = self
-            .forward_agent_stream(
-                cx,
-                &args.session_id,
-                &session_id,
-                &agent,
-                &cancel_token,
-                stream,
-            )
-            .await;
+            loop {
+                if cancel_token.is_cancelled() {
+                    outcome.was_cancelled = true;
+                    break;
+                }
+
+                let reports = self
+                    .session_manager
+                    .pending_session_messages(&session_id)
+                    .await
+                    .internal_err_ctx("Failed to load background task reports")?;
+                if let Some(last) = reports.last() {
+                    let through_id = last.id;
+                    let envelope = crate::session::MailboxMessage::parent_envelope(&reports)
+                        .expect("nonempty reports have an envelope");
+                    let report_outcome = self
+                        .run_agent_reply(
+                            cx,
+                            &args.session_id,
+                            &agent,
+                            envelope,
+                            use_state_machine,
+                            &cancel_token,
+                        )
+                        .await?;
+                    outcome.was_cancelled |= report_outcome.was_cancelled;
+                    outcome.output_token_limit_reached |= report_outcome.output_token_limit_reached;
+                    if report_outcome.was_cancelled {
+                        outcome.was_cancelled = true;
+                        break;
+                    }
+                    if report_outcome.output_token_limit_reached {
+                        outcome.output_token_limit_reached = true;
+                        break;
+                    }
+                    if !report_outcome.completed_visible_response {
+                        return Err(agent_client_protocol::Error::internal_error()
+                            .data("Parent agent did not complete its background report response"));
+                    }
+                    self.session_manager
+                        .acknowledge_session_messages(&session_id, through_id)
+                        .await
+                        .internal_err_ctx("Failed to acknowledge background task reports")?;
+                    continue;
+                }
+
+                if !agent
+                    .has_active_tasks(&session_id)
+                    .await
+                    .internal_err_ctx("Failed to inspect background tasks")?
+                {
+                    if self
+                        .session_manager
+                        .pending_session_messages(&session_id)
+                        .await
+                        .internal_err_ctx("Failed to recheck background task reports")?
+                        .is_empty()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        outcome.was_cancelled = true;
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            }
+            Ok(outcome)
+        }
+        .await;
+        let should_shutdown = stream_result.as_ref().map_or(true, |outcome| {
+            outcome.was_cancelled || outcome.output_token_limit_reached
+        });
+        if should_shutdown || cancel_token.is_cancelled() {
+            if let Err(error) = agent.shutdown_session(&session_id).await {
+                warn!(session_id, %error, "Failed to shut down background tasks after ACP prompt");
+            }
+        }
         self.clear_active_run(&session_id, &run_id).await;
         Self::send_active_run_update(cx, &args.session_id, None)?;
         let outcome = stream_result?;
@@ -2664,30 +2887,28 @@ impl GooseAcpAgent {
         &self,
         session_id: &str,
     ) -> Result<CloseSessionResponse, agent_client_protocol::Error> {
-        self.closed_session_ids
-            .lock()
-            .await
-            .insert(session_id.to_string());
-
-        let active_run_token = {
-            let active_prompt_runs = self.active_prompt_runs.lock().await;
-            active_prompt_runs
-                .get(session_id)
-                .map(|active_run| active_run.cancel_token.clone())
-        };
-
-        if let Some(token) = active_run_token {
-            token.cancel();
-        }
+        let (_, mut errors) = self.cancel_and_drain_session(session_id).await;
 
         let mut sessions = self.sessions.lock().await;
         sessions.remove(session_id);
         drop(sessions);
 
-        self.agent_manager
+        if let Err(error) = self
+            .agent_manager
             .remove_session_if_loaded(session_id)
             .await
-            .internal_err_ctx("Failed to remove in-memory agent")?;
+        {
+            errors.push(error.context("Failed to remove in-memory agent"));
+        }
+        self.session_admission_fence
+            .lock()
+            .await
+            .session_ids
+            .remove(session_id);
+
+        if let Some(error) = errors.into_iter().next() {
+            return Err(agent_client_protocol::Error::internal_error().data(error.to_string()));
+        }
 
         info!(session_id = %session_id, "ACP session closed");
         Ok(CloseSessionResponse::new())
@@ -3680,6 +3901,7 @@ print(\"hello, world\")
                 scheduler: None,
                 session_cwd: None,
                 active_prompt_runs: Default::default(),
+                session_admission_fence: Default::default(),
             })
             .await
             .unwrap(),

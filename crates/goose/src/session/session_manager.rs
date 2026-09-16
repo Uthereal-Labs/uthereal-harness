@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 16;
+pub const CURRENT_SCHEMA_VERSION: i32 = 17;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
@@ -1089,6 +1089,24 @@ impl SessionStorage {
         .execute(&mut *tx)
         .await?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS session_mailbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                recipient_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                body TEXT NOT NULL,
+                dedupe_key TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                delivered_at TIMESTAMP,
+                UNIQUE (recipient_session_id, dedupe_key)
+            )
+        "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
             .execute(&mut *tx)
             .await?;
@@ -1116,6 +1134,11 @@ impl SessionStorage {
         .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_usage_ledger_session ON usage_ledger(session_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_session_mailbox_pending ON session_mailbox(recipient_session_id, delivered_at, id)",
         )
         .execute(&mut *tx)
         .await?;
@@ -1592,6 +1615,30 @@ impl SessionStorage {
             16 => {
                 sqlx::query(
                     "CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_timestamp, id)",
+                )
+                .execute(&mut **tx)
+                .await?;
+            }
+            17 => {
+                sqlx::query(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS session_mailbox (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        sender_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        recipient_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                        kind TEXT NOT NULL,
+                        body TEXT NOT NULL,
+                        dedupe_key TEXT,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        delivered_at TIMESTAMP,
+                        UNIQUE (recipient_session_id, dedupe_key)
+                    )
+                    "#,
+                )
+                .execute(&mut **tx)
+                .await?;
+                sqlx::query(
+                    "CREATE INDEX IF NOT EXISTS idx_session_mailbox_pending ON session_mailbox(recipient_session_id, delivered_at, id)",
                 )
                 .execute(&mut **tx)
                 .await?;

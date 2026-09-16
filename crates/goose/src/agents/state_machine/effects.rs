@@ -14,6 +14,10 @@ pub enum GooseEffect {
     SetRecipe(Box<Option<Recipe>>),
     SetExtensionData(ExtensionData),
     RecordUsage(ProviderUsage),
+    DeliverMailboxMessage {
+        mailbox_id: i64,
+        message: Message,
+    },
 }
 
 impl MachineEffect for GooseEffect {
@@ -26,6 +30,9 @@ impl MachineEffect for GooseEffect {
                         message.id = Some(format!("msg_{}", uuid::Uuid::new_v4()));
                     }
                 }
+            }
+            GooseEffect::DeliverMailboxMessage { message, .. } if message.id.is_none() => {
+                message.id = Some(format!("msg_{}", uuid::Uuid::new_v4()));
             }
             _ => {}
         }

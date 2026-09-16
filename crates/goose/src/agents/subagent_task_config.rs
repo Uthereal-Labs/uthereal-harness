@@ -16,6 +16,7 @@ pub struct TaskConfig {
     pub parent_session_id: String,
     pub parent_working_dir: PathBuf,
     pub extensions: Vec<ExtensionConfig>,
+    pub required_extension_names: Vec<String>,
     pub max_turns: Option<usize>,
 }
 
@@ -27,6 +28,7 @@ impl fmt::Debug for TaskConfig {
             .field("parent_working_dir", &self.parent_working_dir)
             .field("max_turns", &self.max_turns)
             .field("extensions", &self.extensions)
+            .field("required_extension_names", &self.required_extension_names)
             .finish()
     }
 }
@@ -45,6 +47,7 @@ impl TaskConfig {
             parent_session_id: parent_session_id.to_owned(),
             parent_working_dir: parent_working_dir.to_owned(),
             extensions,
+            required_extension_names: Vec::new(),
             max_turns: Some(
                 Config::global()
                     .get_param::<usize>("GOOSE_SUBAGENT_MAX_TURNS")
@@ -57,6 +60,11 @@ impl TaskConfig {
         if let Some(turns) = max_turns {
             self.max_turns = Some(turns);
         }
+        self
+    }
+
+    pub fn with_required_extension_names(mut self, names: Vec<String>) -> Self {
+        self.required_extension_names = names;
         self
     }
 }

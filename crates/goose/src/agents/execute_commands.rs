@@ -241,14 +241,21 @@ impl Agent {
     }
 
     async fn handle_skills_command(&self, session_id: &str) -> Result<Option<Message>> {
-        let working_dir = self
+        let session = self
             .config
             .session_manager
             .get_session(session_id, false)
             .await
-            .ok()
-            .map(|s| s.working_dir);
-        let output = skill_slash_command::format_installed_skills(working_dir.as_deref());
+            .ok();
+        let output = skill_slash_command::format_installed_skills_for_session(
+            session
+                .as_ref()
+                .map(|session| session.working_dir.as_path()),
+            session
+                .as_ref()
+                .map(|session| session.session_type)
+                .unwrap_or(crate::session::SessionType::User),
+        );
         Ok(Some(Message::assistant().with_text(output)))
     }
 
@@ -503,15 +510,24 @@ impl Agent {
         params_str: &str,
         session_id: &str,
     ) -> Result<Option<Message>> {
-        let working_dir = self
+        let session = self
             .config
             .session_manager
             .get_session(session_id, false)
             .await
-            .ok()
-            .map(|session| session.working_dir);
+            .ok();
 
-        match skill_slash_command::resolve_command(command, params_str, working_dir.as_deref()) {
+        match skill_slash_command::resolve_command_for_session(
+            command,
+            params_str,
+            session
+                .as_ref()
+                .map(|session| session.working_dir.as_path()),
+            session
+                .as_ref()
+                .map(|session| session.session_type)
+                .unwrap_or(crate::session::SessionType::User),
+        ) {
             Ok(None) => Ok(None),
             Ok(Some(prompt)) => Ok(Some(Message::user().with_text(prompt))),
             Err(text) => Ok(Some(Message::assistant().with_text(text))),

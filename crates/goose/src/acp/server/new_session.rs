@@ -60,6 +60,15 @@ impl GooseAcpAgent {
             .create_session(args.cwd.clone(), session_name, session_type, current_mode)
             .await
             .internal_err_ctx("Failed to create session")?;
+        // Session identifiers describe the current persisted lifetime, not a
+        // permanent tombstone. A store may legitimately reuse an identifier
+        // after deletion.
+        self.closed_session_ids.lock().await.remove(&session.id);
+        self.session_admission_fence
+            .lock()
+            .await
+            .session_ids
+            .remove(&session.id);
         match self
             .finish_new_session_setup(cx, config, &session, args, recipe, meta)
             .await

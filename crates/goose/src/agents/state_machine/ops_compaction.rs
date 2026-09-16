@@ -157,6 +157,7 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
         let span = chat_span(
             self.provider.as_ref(),
             &self.model_config,
+            &crate::session_context::telemetry_session_id(&session.id),
             &session.id,
             "compaction",
         );
@@ -284,6 +285,7 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
         let span = chat_span(
             self.provider.as_ref(),
             &self.model_config,
+            &crate::session_context::telemetry_session_id(&session.id),
             &session.id,
             "compaction",
         );

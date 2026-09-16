@@ -21,6 +21,7 @@ pub struct SkillsClient {
     info: InitializeResult,
     working_dir: RwLock<PathBuf>,
     exclude_builtin_skills: bool,
+    session_type: crate::session::SessionType,
     config: &'static Config,
 }
 
@@ -39,6 +40,11 @@ impl SkillsClient {
             info,
             working_dir: RwLock::new(working_dir),
             exclude_builtin_skills: false,
+            session_type: context
+                .session
+                .as_ref()
+                .map(|session| session.session_type)
+                .unwrap_or(crate::session::SessionType::User),
             config: Config::global(),
         })
     }
@@ -63,6 +69,7 @@ impl SkillsClient {
             .filter(|skill| {
                 !self.exclude_builtin_skills || skill.source_type != SourceType::BuiltinSkill
             })
+            .filter(|skill| super::is_skill_visible_to_session(skill, self.session_type))
             .collect()
     }
 }
