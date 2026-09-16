@@ -2,6 +2,8 @@ mod builder;
 mod completion;
 pub mod editor;
 mod elicitation;
+#[cfg(unix)]
+mod idle;
 mod input;
 mod output;
 mod paste;
@@ -249,6 +251,7 @@ pub struct CliSession {
     /// gate.
     extension_loading: Option<AbortOnDropHandle<Result<Vec<ExtensionFailure>>>>,
     loading_announced: bool,
+    defer_final_output: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +336,7 @@ impl CliSession {
             retry_config,
             output_format,
             stats,
+            defer_final_output: false,
             extension_loading,
             loading_announced: false,
         }
@@ -552,8 +556,12 @@ impl CliSession {
         self.ensure_extensions_loaded(interactive).await?;
         let cancel_token = cancel_token.clone();
         self.push_message(message);
-        self.process_agent_response(interactive, cancel_token)
+        let succeeded = self
+            .process_agent_response(interactive, cancel_token)
             .await?;
+        if !interactive && !succeeded {
+            anyhow::bail!("The agent did not complete its response");
+        }
         Ok(())
     }
 
@@ -568,6 +576,16 @@ impl CliSession {
         }
 
         let result = self.run_interactive(prompt).await;
+
+        let shutdown_result = self.agent.shutdown_session(&self.session_id).await;
+        let result = match (result, shutdown_result) {
+            (Err(error), Err(shutdown_error)) => {
+                warn!(%shutdown_error, "Session task shutdown also failed");
+                Err(error)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), shutdown_result) => shutdown_result,
+        };
 
         self.agent
             .emit_hook(goose::hooks::HookEvent::SessionEnd, &self.session_id)
@@ -605,6 +623,7 @@ impl CliSession {
         let mut editor = self.create_editor()?;
         let history_manager = HistoryManager::new();
         history_manager.load(&mut editor);
+        let mut mailbox_paused = false;
 
         loop {
             if self
@@ -613,6 +632,19 @@ impl CliSession {
                 .is_some_and(|h| h.is_finished())
             {
                 self.ensure_extensions_loaded(true).await?;
+            }
+
+            if !mailbox_paused {
+                match self.process_pending_reports(true).await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        output::render_error(&format!(
+                            "Background report remains queued: {error}. Send a message to retry."
+                        ));
+                        mailbox_paused = true;
+                    }
+                }
             }
 
             self.display_context_usage().await?;
@@ -631,15 +663,99 @@ impl CliSession {
                 .collect();
 
             output::run_status_hook("waiting");
+            if !mailbox_paused && self.wait_for_input_or_report().await? {
+                continue;
+            }
             let input = input::get_input(&mut editor, Some(&conversation_strings))?;
             if matches!(input, InputResult::Exit) {
                 break;
             }
             self.handle_input(input, &history_manager, &mut editor, &conversation_strings)
                 .await?;
+            mailbox_paused = false;
         }
 
         Ok(())
+    }
+
+    async fn wait_for_input_or_report(&self) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd;
+
+            let stdin = std::io::stdin();
+            let config = Config::global();
+            let external_editor = config.get_goose_prompt_editor().ok().flatten();
+            if !stdin.is_terminal()
+                || !std::io::stdout().is_terminal()
+                || console::is_dumb()
+                || (external_editor.is_some_and(|editor| !editor.is_empty())
+                    && config
+                        .get_goose_prompt_editor_always()
+                        .ok()
+                        .flatten()
+                        .unwrap_or(true))
+            {
+                return Ok(false);
+            }
+            let input = idle::IdleInput::new(stdin.as_fd())?;
+            print!("\x1b[?2004h> ");
+            std::io::stdout().flush()?;
+            let result = async {
+                loop {
+                    // Typed input takes priority; readline consumes every byte.
+                    if input.ready()? {
+                        return Ok(false);
+                    }
+                    if !self
+                        .agent
+                        .config
+                        .session_manager
+                        .pending_session_messages(&self.session_id)
+                        .await?
+                        .is_empty()
+                    {
+                        return Ok(!input.ready()?);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            .await;
+            drop(input);
+            print!("\r\x1b[2K\x1b[?2004l");
+            std::io::stdout().flush()?;
+            result
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+    }
+
+    async fn process_pending_reports(&mut self, interactive: bool) -> Result<bool> {
+        let manager = self.agent.config.session_manager.clone();
+        let reports = manager.pending_session_messages(&self.session_id).await?;
+        let Some(last) = reports.last() else {
+            return Ok(false);
+        };
+        let through_id = last.id;
+        self.ensure_extensions_loaded(interactive).await?;
+        self.push_message(
+            goose::session::MailboxMessage::parent_envelope(&reports)
+                .expect("nonempty reports have an envelope"),
+        );
+        if !self
+            .process_agent_response(interactive, CancellationToken::new())
+            .await?
+        {
+            anyhow::bail!(
+                "The main-agent response was interrupted, failed, or reached its action limit"
+            );
+        }
+        manager
+            .acknowledge_session_messages(&self.session_id, through_id)
+            .await?;
+        Ok(true)
     }
 
     fn create_editor(
@@ -1287,22 +1403,60 @@ impl CliSession {
 
     /// Process a single message and exit
     pub async fn headless(&mut self, prompt: String) -> Result<()> {
-        let message = Message::user().with_text(&prompt);
-        let result = self
-            .process_message(message, CancellationToken::default(), false)
-            .await;
+        self.defer_final_output = true;
+        let result = async {
+            let message = Message::user().with_text(&prompt);
+            self.process_message(message, CancellationToken::default(), false)
+                .await?;
+            loop {
+                if self.process_pending_reports(false).await? {
+                    continue;
+                }
+                if !self.agent.has_active_tasks(&self.session_id).await? {
+                    // Completion is persisted before a task leaves the active set.
+                    // Check again in case it finished between the two reads.
+                    if !self.process_pending_reports(false).await? {
+                        break;
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    _ = ctrl_c() => anyhow::bail!("Headless run interrupted"),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+            Ok(())
+        }
+        .await;
+        self.defer_final_output = false;
+        let shutdown_result = self.agent.shutdown_session(&self.session_id).await;
+        let result = match (result, shutdown_result) {
+            (Err(error), Err(shutdown_error)) => {
+                warn!(%shutdown_error, "Session task shutdown also failed");
+                Err(error)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), shutdown_result) => shutdown_result,
+        };
+        if self.output_format == "stream-json" {
+            if let Err(error) = &result {
+                emit_stream_event(&StreamEvent::Error {
+                    error: error.to_string(),
+                });
+            }
+        }
+        self.emit_final_output(result.is_ok()).await?;
         self.agent
             .emit_hook(goose::hooks::HookEvent::SessionEnd, &self.session_id)
             .await;
-        result?;
-        Ok(())
+        result
     }
 
     async fn process_agent_response(
         &mut self,
         interactive: bool,
         cancel_token: CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let is_json_mode = self.output_format == "json";
         let is_stream_json_mode = self.output_format == "stream-json";
 
@@ -1343,6 +1497,7 @@ impl CliSession {
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
         let mut stream_error = None;
+        let mut completed_visible_response = false;
 
         use futures::StreamExt;
         loop {
@@ -1350,6 +1505,18 @@ impl CliSession {
                 result = stream.next() => {
                     match result {
                         Some(Ok(AgentEvent::Message(message))) => {
+                            if !message.is_user_visible() {
+                                self.messages.push(message);
+                                continue;
+                            }
+                            if message.role == rmcp::model::Role::Assistant {
+                                completed_visible_response = !message.is_tool_call() && !message
+                                    .content
+                                    .iter()
+                                    .any(|content| content.as_error().is_some())
+                                    && message.as_concat_text()
+                                        != goose::agents::state_machine::MAX_TURNS_MESSAGE;
+                            }
                             if first_token_at.is_none() && message_has_text(&message) {
                                 first_token_at = Some(Instant::now());
                             }
@@ -1536,13 +1703,16 @@ impl CliSession {
             }
         }
 
+        let succeeded = !cancel_token_clone.is_cancelled()
+            && stream_error.is_none()
+            && completed_visible_response;
         let terminal_error = headless_run_error(
             interactive,
             cancel_token_clone.is_cancelled(),
             stream_error,
             &self.messages,
         );
-        if is_stream_json_mode {
+        if is_stream_json_mode && !self.defer_final_output {
             if let Some(error) = &terminal_error {
                 emit_stream_event(&StreamEvent::Error {
                     error: error.to_string(),
@@ -1554,78 +1724,10 @@ impl CliSession {
             output::flush_markdown_buffer_current_theme(&mut markdown_buffer);
         }
 
-        if is_json_mode {
-            let status = if terminal_error.is_some() {
-                "error"
-            } else {
-                "completed"
-            };
-            let metadata = match self
-                .agent
-                .config
-                .session_manager
-                .get_session_usage_totals(&self.session_id)
-                .await
-            {
-                Ok(totals) => JsonMetadata {
-                    total_tokens: totals.accumulated_usage.total_tokens,
-                    input_tokens: totals.accumulated_usage.input_tokens,
-                    output_tokens: totals.accumulated_usage.output_tokens,
-                    cache_read_input_tokens: totals.accumulated_usage.cache_read_input_tokens,
-                    cache_write_input_tokens: totals.accumulated_usage.cache_write_input_tokens,
-                    cost_usd: totals.accumulated_cost,
-                    status: status.to_string(),
-                },
-                Err(_) => JsonMetadata {
-                    total_tokens: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                    cache_read_input_tokens: None,
-                    cache_write_input_tokens: None,
-                    cost_usd: None,
-                    status: status.to_string(),
-                },
-            };
-            let json_output = JsonOutput {
-                messages: self.messages.user_visible_messages(),
-                metadata,
-            };
-            println!("{}", serde_json::to_string_pretty(&json_output)?);
-        } else if is_stream_json_mode && terminal_error.is_none() {
-            let totals = self
-                .agent
-                .config
-                .session_manager
-                .get_session_usage_totals(&self.session_id)
-                .await
-                .ok();
-            let (
-                total_tokens,
-                input_tokens,
-                output_tokens,
-                cache_read_input_tokens,
-                cache_write_input_tokens,
-                cost_usd,
-            ) = match totals {
-                Some(totals) => (
-                    totals.accumulated_usage.total_tokens,
-                    totals.accumulated_usage.input_tokens,
-                    totals.accumulated_usage.output_tokens,
-                    totals.accumulated_usage.cache_read_input_tokens,
-                    totals.accumulated_usage.cache_write_input_tokens,
-                    totals.accumulated_cost,
-                ),
-                None => (None, None, None, None, None, None),
-            };
-            emit_stream_event(&StreamEvent::Complete {
-                total_tokens,
-                input_tokens,
-                output_tokens,
-                cache_read_input_tokens,
-                cache_write_input_tokens,
-                cost_usd,
-            });
-        } else if !is_stream_json_mode {
+        if !self.defer_final_output {
+            self.emit_final_output(terminal_error.is_none()).await?;
+        }
+        if !is_json_mode && !is_stream_json_mode {
             println!();
             if self.stats {
                 print_run_stats(run_started, first_token_at, last_usage.as_ref());
@@ -1640,6 +1742,48 @@ impl CliSession {
             return Err(error);
         }
 
+        Ok(succeeded)
+    }
+
+    async fn emit_final_output(&self, succeeded: bool) -> Result<()> {
+        if self.output_format != "json" && self.output_format != "stream-json" {
+            return Ok(());
+        }
+        let totals = self
+            .agent
+            .config
+            .session_manager
+            .get_session_usage_totals(&self.session_id)
+            .await
+            .ok();
+        let usage = totals.as_ref().map(|totals| &totals.accumulated_usage);
+        let metadata = JsonMetadata {
+            total_tokens: usage.and_then(|usage| usage.total_tokens),
+            input_tokens: usage.and_then(|usage| usage.input_tokens),
+            output_tokens: usage.and_then(|usage| usage.output_tokens),
+            cache_read_input_tokens: usage.and_then(|usage| usage.cache_read_input_tokens),
+            cache_write_input_tokens: usage.and_then(|usage| usage.cache_write_input_tokens),
+            cost_usd: totals.and_then(|totals| totals.accumulated_cost),
+            status: if succeeded { "completed" } else { "error" }.to_string(),
+        };
+        if self.output_format == "json" {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&JsonOutput {
+                    messages: self.messages.user_visible_messages(),
+                    metadata,
+                })?
+            );
+        } else if succeeded {
+            emit_stream_event(&StreamEvent::Complete {
+                total_tokens: metadata.total_tokens,
+                input_tokens: metadata.input_tokens,
+                output_tokens: metadata.output_tokens,
+                cache_read_input_tokens: metadata.cache_read_input_tokens,
+                cache_write_input_tokens: metadata.cache_write_input_tokens,
+                cost_usd: metadata.cost_usd,
+            });
+        }
         Ok(())
     }
 
@@ -3308,5 +3452,205 @@ mod tests {
             .unwrap()
             .current_session_provider
             .is_empty());
+    }
+
+    struct ReportProvider {
+        response: Message,
+        enqueue_during_response: Option<(Arc<SessionManager>, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ReportProvider {
+        fn get_name(&self) -> &str {
+            "report-test"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[rmcp::model::Tool],
+        ) -> std::result::Result<
+            goose::providers::base::MessageStream,
+            goose_providers::errors::ProviderError,
+        > {
+            if let Some((manager, child_id)) = &self.enqueue_during_response {
+                manager
+                    .send_to_parent(child_id, "arrived during parent response")
+                    .await
+                    .unwrap();
+            }
+            Ok(goose::providers::base::stream_from_single_message(
+                self.response.clone(),
+                ProviderUsage::new(
+                    "report-test".to_string(),
+                    goose_providers::conversation::token_usage::Usage::default(),
+                ),
+            ))
+        }
+    }
+
+    async fn session_with_pending_report(
+        response: Message,
+        enqueue_during_response: bool,
+    ) -> (CliSession, Arc<SessionManager>, String, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+        let parent = manager
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "Parent".to_string(),
+                goose::session::SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let child = manager
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "Child".to_string(),
+                goose::session::SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        manager
+            .update(&child.id)
+            .parent_session_id(Some(parent.id.clone()))
+            .apply()
+            .await
+            .unwrap();
+        manager
+            .send_to_parent(&child.id, "initial report")
+            .await
+            .unwrap();
+
+        let agent = Agent::with_config(goose::agents::AgentConfig::new(
+            Arc::clone(&manager),
+            Arc::new(goose::config::PermissionManager::new(
+                temp_dir.path().to_path_buf(),
+            )),
+            None,
+            GooseMode::Auto,
+            true,
+            goose::agents::GoosePlatform::GooseCli,
+        ));
+        agent
+            .update_provider(
+                Arc::new(ReportProvider {
+                    response,
+                    enqueue_during_response: enqueue_during_response
+                        .then(|| (Arc::clone(&manager), child.id.clone())),
+                }),
+                goose_providers::model::ModelConfig::new("report-test-model"),
+                &parent.id,
+            )
+            .await
+            .unwrap();
+        let session = CliSession::new(
+            Arc::new(agent),
+            parent.id,
+            false,
+            None,
+            None,
+            None,
+            None,
+            "text".to_string(),
+            false,
+            false,
+            None,
+        )
+        .await;
+
+        (session, manager, child.id, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn pending_reports_acknowledge_only_the_processed_batch() {
+        let (mut session, manager, _child_id, _temp_dir) =
+            session_with_pending_report(Message::assistant().with_text("parent summary"), true)
+                .await;
+
+        assert!(session.process_pending_reports(false).await.unwrap());
+
+        let pending = manager
+            .pending_session_messages(&session.session_id)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].body, "arrived during parent response");
+        let envelope = session
+            .messages
+            .iter()
+            .find(|message| message.as_concat_text().contains("initial report"))
+            .unwrap();
+        assert!(envelope.is_agent_visible());
+        assert!(!envelope.is_user_visible());
+    }
+
+    #[tokio::test]
+    async fn pending_reports_remain_queued_when_parent_response_fails() {
+        let (mut session, manager, _child_id, _temp_dir) = session_with_pending_report(
+            Message::assistant().with_error(MessageErrorKind::Other, "provider failed"),
+            false,
+        )
+        .await;
+
+        assert!(session.process_pending_reports(false).await.is_err());
+        let pending = manager
+            .pending_session_messages(&session.session_id)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].body, "initial report");
+    }
+
+    #[tokio::test]
+    async fn pending_reports_remain_queued_when_parent_hits_turn_limit() {
+        let (mut session, manager, _child_id, _temp_dir) = session_with_pending_report(
+            Message::assistant().with_text(goose::agents::state_machine::MAX_TURNS_MESSAGE),
+            false,
+        )
+        .await;
+
+        assert!(session.process_pending_reports(false).await.is_err());
+        assert_eq!(
+            manager
+                .pending_session_messages(&session.session_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_drains_pending_reports_before_returning() {
+        let (mut session, manager, _child_id, _temp_dir) =
+            session_with_pending_report(Message::assistant().with_text("parent summary"), false)
+                .await;
+
+        session
+            .headless("initial request".to_string())
+            .await
+            .unwrap();
+
+        assert!(manager
+            .pending_session_messages(&session.session_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!session.defer_final_output);
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == rmcp::model::Role::Assistant && message.is_user_visible()
+                })
+                .count(),
+            2
+        );
     }
 }

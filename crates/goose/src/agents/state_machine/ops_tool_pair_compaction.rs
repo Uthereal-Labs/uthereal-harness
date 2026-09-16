@@ -120,6 +120,7 @@ impl Operation<Session, GooseEffect> for ToolPairCompactionOperation {
             let span = chat_span(
                 self.provider.as_ref(),
                 &self.model_config,
+                &crate::session_context::telemetry_session_id(&session.id),
                 &session.id,
                 "tool_pair_compaction",
             );

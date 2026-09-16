@@ -25,6 +25,7 @@ pub struct PreparedInferenceRequest {
     pub system_prompt: String,
     pub tools: Vec<rmcp::model::Tool>,
     pub additional_messages: Vec<Message>,
+    pub capture_message_content: bool,
 }
 
 #[async_trait]
@@ -56,6 +57,7 @@ impl<S: Sync> InferenceRequestPreparer<S> for IdentityInferenceRequestPreparer {
                 .join("\n\n"),
             tools: input.tools,
             additional_messages: Vec::new(),
+            capture_message_content: false,
         })
     }
 }
@@ -97,7 +99,8 @@ fn drop_repeated_tool_call_thinking(accumulator: &Conversation, chunk: &mut Mess
 pub fn chat_span(
     provider: &dyn Provider,
     model_config: &ModelConfig,
-    session_id: &str,
+    telemetry_session_id: &str,
+    execution_session_id: &str,
     purpose: &'static str,
 ) -> tracing::Span {
     let span = tracing::info_span!(
@@ -108,6 +111,8 @@ pub fn chat_span(
         "gen_ai.request.model" = %model_config.model_name,
         "gen_ai.request.temperature" = tracing::field::Empty,
         "gen_ai.request.max_tokens" = tracing::field::Empty,
+        "gen_ai.system_instructions" = tracing::field::Empty,
+        "gen_ai.input.messages" = tracing::field::Empty,
         "gen_ai.response.model" = tracing::field::Empty,
         "gen_ai.response.finish_reasons" = tracing::field::Empty,
         "gen_ai.response.id" = tracing::field::Empty,
@@ -115,7 +120,9 @@ pub fn chat_span(
         "gen_ai.usage.output_tokens" = tracing::field::Empty,
         "goose.chat.purpose" = purpose,
         "error.type" = tracing::field::Empty,
-        session.id = %session_id,
+        session.id = %telemetry_session_id,
+        goose.execution.session.id = %execution_session_id,
+        gen_ai.conversation.id = %execution_session_id,
     );
     record_request_params(&span, model_config);
     span
@@ -256,12 +263,17 @@ fn inference_span(provider: &dyn Provider, model_config: &ModelConfig) -> tracin
         "gen_ai.request.model" = %model_config.model_name,
         "gen_ai.request.temperature" = tracing::field::Empty,
         "gen_ai.request.max_tokens" = tracing::field::Empty,
+        "gen_ai.system_instructions" = tracing::field::Empty,
+        "gen_ai.input.messages" = tracing::field::Empty,
+        "gen_ai.conversation.id" = tracing::field::Empty,
         "gen_ai.response.model" = tracing::field::Empty,
         "gen_ai.response.finish_reasons" = tracing::field::Empty,
         "gen_ai.response.id" = tracing::field::Empty,
         "gen_ai.usage.input_tokens" = tracing::field::Empty,
         "gen_ai.usage.output_tokens" = tracing::field::Empty,
         "error.type" = tracing::field::Empty,
+        session.id = tracing::field::Empty,
+        goose.execution.session.id = tracing::field::Empty,
     );
     record_request_params(&span, model_config);
     span
@@ -353,6 +365,7 @@ impl<S: Sync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> 
                 system_prompt,
                 tools,
                 additional_messages,
+                capture_message_content,
             } = self
                 .request_preparer
                 .prepare(session, conversation, input)
@@ -380,6 +393,19 @@ impl<S: Sync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> 
             let conversation_for_provider = Conversation::new_unvalidated(
                 merge_consecutive_messages_for_request(fixed.messages().clone()),
             );
+            if capture_message_content {
+                let mut input_messages = vec![serde_json::json!({
+                    "role": "system",
+                    "content": system_prompt,
+                })];
+                input_messages.extend(
+                    conversation_for_provider.messages().iter().map(|message| {
+                        serde_json::to_value(message).expect("message must serialize")
+                    }),
+                );
+                let input_messages = serde_json::Value::Array(input_messages).to_string();
+                tracing::Span::current().record("gen_ai.input.messages", input_messages.as_str());
+            }
             let stream = self
                 .provider
                 .stream(

@@ -175,6 +175,14 @@ pub trait McpClientTrait: Send + Sync {
         None
     }
 
+    async fn has_active_tasks(&self, _session_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn shutdown_session(&self, _session_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn update_working_dir(&self, _new_dir: PathBuf) -> Result<(), Error> {
         Ok(())
     }

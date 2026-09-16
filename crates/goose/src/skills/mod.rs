@@ -18,6 +18,7 @@ use crate::plugins::{
     configured_project_plugin_skill_dirs, enabled_plugin_skill_dirs_with_config,
     installed_plugin_skill_dirs,
 };
+use crate::session::SessionType;
 use crate::sources::parse_frontmatter;
 use agent_client_protocol::Error;
 use anyhow::Result;
@@ -192,6 +193,28 @@ pub fn skill_argument_names(skill: &SourceEntry) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+pub fn is_delegate_only_skill(skill: &SourceEntry) -> bool {
+    skill
+        .properties
+        .get("delegate_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub fn is_skill_visible_to_session(skill: &SourceEntry, session_type: SessionType) -> bool {
+    session_type == SessionType::SubAgent || !is_delegate_only_skill(skill)
+}
+
+pub fn list_visible_skills(
+    working_dir: Option<&Path>,
+    session_type: SessionType,
+) -> Vec<SourceEntry> {
+    list_installed_skills(working_dir)
+        .into_iter()
+        .filter(|skill| is_skill_visible_to_session(skill, session_type))
+        .collect()
 }
 
 fn canonicalize_or_original(path: &Path) -> PathBuf {
@@ -713,6 +736,16 @@ mod tests {
                 json!(["component", "from", "to"]),
             )]),
         }
+    }
+
+    #[test]
+    fn delegate_only_skill_uses_metadata_flag() {
+        let mut skill = skill_with_content("Private instructions.");
+        skill
+            .properties
+            .insert("delegate_only".to_string(), Value::Bool(true));
+
+        assert!(is_delegate_only_skill(&skill));
     }
 
     fn builtin_goose_doc_guide_skill() -> SourceEntry {

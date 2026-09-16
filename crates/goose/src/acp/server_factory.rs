@@ -1,5 +1,6 @@
 use crate::acp::server::{
-    AcpBuiltinSelection, AcpProviderFactory, ActiveRunRegistry, GooseAcpAgent, GooseAcpAgentOptions,
+    AcpBuiltinSelection, AcpProviderFactory, ActiveRunRegistry, GooseAcpAgent,
+    GooseAcpAgentOptions, SessionAdmissionFence,
 };
 use crate::agents::GoosePlatform;
 use crate::scheduler_trait::SchedulerTrait;
@@ -27,6 +28,7 @@ pub struct AcpServer {
     config: AcpServerFactoryConfig,
     scheduler: OnceCell<Arc<dyn SchedulerTrait>>,
     active_prompt_runs: ActiveRunRegistry,
+    session_admission_fence: SessionAdmissionFence,
 }
 
 impl AcpServer {
@@ -35,6 +37,7 @@ impl AcpServer {
             config,
             scheduler: OnceCell::new(),
             active_prompt_runs: ActiveRunRegistry::default(),
+            session_admission_fence: SessionAdmissionFence::default(),
         }
     }
 
@@ -43,6 +46,11 @@ impl AcpServer {
     /// retries. No-op when the scheduler is disabled.
     pub async fn start_scheduler(&self) -> Result<()> {
         self.scheduler().await.map(|_| ())
+    }
+
+    pub async fn shutdown_active_runs(&self) -> Vec<anyhow::Error> {
+        self.session_admission_fence.lock().await.shutting_down = true;
+        crate::acp::server::shutdown_active_runs(&self.active_prompt_runs).await
     }
 
     async fn scheduler(&self) -> Result<Option<Arc<dyn SchedulerTrait>>> {
@@ -124,6 +132,7 @@ impl AcpServer {
             session_cwd,
             scheduler,
             active_prompt_runs: self.active_prompt_runs.clone(),
+            session_admission_fence: self.session_admission_fence.clone(),
         })
         .await?;
         info!("Created new ACP agent");
@@ -181,6 +190,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_shutdown_closes_active_run_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let server = server(root.path().to_path_buf(), false);
+        let agent = server.create_agent().await.unwrap();
+
+        assert!(server.shutdown_active_runs().await.is_empty());
+
+        let error = agent
+            .test_start_active_run(
+                "late-session",
+                "late-run".to_string(),
+                Arc::new(crate::agents::Agent::new()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound
+        );
+    }
+
+    #[tokio::test]
     async fn steer_routes_to_the_agent_that_owns_the_run() {
         let root = tempfile::tempdir().unwrap();
         let server = server(root.path().to_path_buf(), false);
@@ -220,7 +251,18 @@ mod tests {
             .unwrap();
 
         running.test_drop_active_run_guard("session-1", "run-1");
-        tokio::task::yield_now().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while server
+                .active_prompt_runs
+                .lock()
+                .await
+                .contains_key("session-1")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped prompt cleanup should finish");
 
         let second = server.create_agent().await.unwrap();
         assert!(

@@ -4,9 +4,8 @@
 
 use crate::config::paths::Paths;
 use crate::skills::{
-    build_skill_md, discover_skills, infer_skill_name, is_global_skill_dir,
-    parse_skill_frontmatter, resolve_discoverable_skill_dir, resolve_skill_dir, skill_base_dir,
-    validate_skill_name,
+    build_skill_md, infer_skill_name, is_global_skill_dir, parse_skill_frontmatter,
+    resolve_discoverable_skill_dir, resolve_skill_dir, skill_base_dir, validate_skill_name,
 };
 use crate::source_roots::SourceRoot;
 use agent_client_protocol::Error;
@@ -925,9 +924,12 @@ pub fn list_sources_with_roots(
                     .filter(|p| !p.is_empty())
                     .map(PathBuf::from);
                 sources.extend(
-                    discover_skills(working_dir.as_deref())
-                        .into_iter()
-                        .filter(|s| s.source_type == SourceType::Skill),
+                    crate::skills::list_visible_skills(
+                        working_dir.as_deref(),
+                        crate::session::SessionType::User,
+                    )
+                    .into_iter()
+                    .filter(|s| s.source_type == SourceType::Skill),
                 );
 
                 if include_project_sources {
@@ -949,7 +951,10 @@ pub fn list_sources_with_roots(
                             if Some(wd_path.as_path()) == already_scanned {
                                 continue;
                             }
-                            for skill in discover_skills(Some(&wd_path)) {
+                            for skill in crate::skills::list_visible_skills(
+                                Some(&wd_path),
+                                crate::session::SessionType::User,
+                            ) {
                                 if skill.source_type != SourceType::Skill || skill.global {
                                     continue;
                                 }
@@ -974,10 +979,13 @@ pub fn list_sources_with_roots(
                     .filter(|p| !p.is_empty())
                     .map(PathBuf::from);
                 sources.extend(
-                    discover_skills(working_dir.as_deref())
-                        .into_iter()
-                        .filter(|s| s.source_type == SourceType::BuiltinSkill)
-                        .map(builtin_skill_entry),
+                    crate::skills::list_visible_skills(
+                        working_dir.as_deref(),
+                        crate::session::SessionType::User,
+                    )
+                    .into_iter()
+                    .filter(|s| s.source_type == SourceType::BuiltinSkill)
+                    .map(builtin_skill_entry),
                 );
             }
             SourceType::Project => {

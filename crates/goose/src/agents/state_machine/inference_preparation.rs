@@ -55,6 +55,21 @@ impl InferenceRequestPreparer<Session> for GooseInferenceRequestPreparer<'_> {
             input.prompt_parts,
             goose_mode,
         );
+        let span = tracing::Span::current();
+        span.record(
+            "session.id",
+            session
+                .parent_session_id
+                .as_deref()
+                .unwrap_or(session.id.as_str()),
+        );
+        span.record("goose.execution.session.id", session.id.as_str());
+        span.record("gen_ai.conversation.id", session.id.as_str());
+        if crate::agents::gen_ai_telemetry::capture_message_content() {
+            let system_instructions =
+                crate::agents::gen_ai_telemetry::system_instructions_json(&system_prompt);
+            span.record("gen_ai.system_instructions", system_instructions.as_str());
+        }
         let turn = messages_since_kickoff(conversation)?;
         let turn_start = turn
             .first()
@@ -80,6 +95,7 @@ impl InferenceRequestPreparer<Session> for GooseInferenceRequestPreparer<'_> {
             system_prompt,
             tools,
             additional_messages,
+            capture_message_content: crate::agents::gen_ai_telemetry::capture_message_content(),
         })
     }
 }

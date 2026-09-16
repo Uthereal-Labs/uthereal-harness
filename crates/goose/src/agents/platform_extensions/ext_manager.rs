@@ -1,7 +1,7 @@
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
 use crate::agents::tool_execution::ToolCallContext;
-use crate::config::get_extension_by_name;
+use crate::config::Config;
 use crate::session::SessionType;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -73,6 +73,7 @@ pub struct ExtensionManagerClient {
     info: InitializeResult,
     #[allow(dead_code)]
     context: PlatformExtensionContext,
+    config: &'static Config,
 }
 
 impl ExtensionManagerClient {
@@ -99,7 +100,17 @@ impl ExtensionManagerClient {
             Use list_resources and read_resource to work with extension data and resources.
         "#});
 
-        Ok(Self { info, context })
+        Ok(Self {
+            info,
+            context,
+            config: Config::global(),
+        })
+    }
+
+    #[cfg(test)]
+    fn with_config(mut self, config: &'static Config) -> Self {
+        self.config = config;
+        self
     }
 
     async fn handle_search_available_extensions(
@@ -196,7 +207,10 @@ impl ExtensionManagerClient {
                 .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None));
         }
 
-        let config = match get_extension_by_name(&extension_name) {
+        let config = match crate::config::extensions::get_extension_by_name_with_config(
+            self.config,
+            &extension_name,
+        ) {
             Some(config) => config,
             None => {
                 return Err(ErrorData::new(
@@ -209,6 +223,20 @@ impl ExtensionManagerClient {
                 ));
             }
         };
+
+        if crate::config::extensions::is_delegate_only_extension_with_config(
+            self.config,
+            &extension_name,
+        ) || crate::config::extensions::is_delegate_only_extension_with_config(
+            self.config,
+            &config.name(),
+        ) {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_REQUEST,
+                format!("Extension '{extension_name}' is only available to delegated agents"),
+                None,
+            ));
+        }
 
         extension_manager
             .add_extension(config, None, None, None)
@@ -523,6 +551,16 @@ mod tests {
         .unwrap()
     }
 
+    fn test_config(content: &str) -> &'static Config {
+        let root = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let config_file = root.path().join("config.yaml");
+        let secrets_file = root.path().join("secrets.yaml");
+        std::fs::write(&config_file, content).unwrap();
+        std::fs::write(&secrets_file, "").unwrap();
+        let config = Config::new_with_file_secrets(config_file, secrets_file).unwrap();
+        Box::leak(Box::new(config))
+    }
+
     async fn create_session(manager: &ExtensionManager, session_type: SessionType) -> String {
         manager
             .get_context()
@@ -628,5 +666,62 @@ mod tests {
         let unknown_enable = manage(&client, "missing-session", "enable").await;
         assert!(unknown_enable.is_error.unwrap_or(false));
         assert!(!manager.is_extension_enabled("developer").await);
+    }
+
+    #[tokio::test]
+    async fn parent_cannot_enable_delegate_only_extension_through_manager_tool() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ExtensionManager::new_without_provider(
+            temp_dir.path().to_path_buf(),
+        ));
+        let client = client_for(&manager)
+            .with_config(test_config("delegate_only_extensions: [developer]\n"));
+        let user_id = create_session(&manager, SessionType::User).await;
+
+        let enable = manage(&client, &user_id, "enable").await;
+
+        assert!(enable.is_error.unwrap_or(false));
+        assert!(!manager.is_extension_enabled("developer").await);
+    }
+
+    #[tokio::test]
+    async fn parent_cannot_enable_delegate_only_extension_by_registry_alias() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(ExtensionManager::new_without_provider(
+            temp_dir.path().to_path_buf(),
+        ));
+        let client = client_for(&manager).with_config(test_config(
+            r#"
+delegate_only_extensions: [Private Tool]
+extensions:
+  private_alias:
+    enabled: false
+    type: stdio
+    name: Private Tool
+    description: private tools
+    cmd: private-tool
+    args: []
+"#,
+        ));
+        let user_id = create_session(&manager, SessionType::User).await;
+        let arguments = serde_json::json!({
+            "action": "enable",
+            "extension_name": "private_alias",
+        })
+        .as_object()
+        .cloned();
+
+        let enable = client
+            .call_tool(
+                &ToolCallContext::new(user_id, None, None),
+                MANAGE_EXTENSIONS_TOOL_NAME,
+                arguments,
+                CancellationToken::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(enable.is_error.unwrap_or(false));
+        assert!(!manager.is_extension_enabled("Private Tool").await);
     }
 }

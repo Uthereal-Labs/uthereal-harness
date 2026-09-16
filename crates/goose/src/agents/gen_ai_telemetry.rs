@@ -13,8 +13,18 @@ pub(super) fn capture_message_content() -> bool {
     std::env::var(CAPTURE_MESSAGE_CONTENT_ENV).is_ok_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-pub(super) fn input_messages_json(messages: &[Message]) -> String {
-    Value::Array(messages.iter().map(message_json).collect()).to_string()
+pub(super) fn input_messages_with_system_json(system_prompt: &str, messages: &[Message]) -> String {
+    let mut values = Vec::with_capacity(messages.len() + 1);
+    values.push(json!({
+        "role": "system",
+        "parts": [{"type": "text", "content": system_prompt}],
+    }));
+    values.extend(messages.iter().map(message_json));
+    Value::Array(values).to_string()
+}
+
+pub(super) fn system_instructions_json(system_prompt: &str) -> String {
+    json!([{"type": "text", "content": system_prompt}]).to_string()
 }
 
 pub(super) fn simple_input_json(text: &str) -> String {
@@ -403,13 +413,36 @@ mod tests {
             Message::assistant().with_tool_request("call-1", Ok(request)),
         ];
 
-        let value: Value = serde_json::from_str(&input_messages_json(&messages)).unwrap();
-        assert_eq!(value[0]["role"], "user");
-        assert_eq!(value[0]["parts"][0]["type"], "text");
-        assert_eq!(value[0]["parts"][0]["content"], "Weather?");
-        assert_eq!(value[1]["parts"][0]["type"], "tool_call");
-        assert_eq!(value[1]["parts"][0]["name"], "get_weather");
-        assert_eq!(value[1]["parts"][0]["arguments"]["location"], "Paris");
+        let value: Value =
+            serde_json::from_str(&input_messages_with_system_json("System", &messages)).unwrap();
+        assert_eq!(value[0]["role"], "system");
+        assert_eq!(value[1]["role"], "user");
+        assert_eq!(value[1]["parts"][0]["type"], "text");
+        assert_eq!(value[1]["parts"][0]["content"], "Weather?");
+        assert_eq!(value[2]["parts"][0]["type"], "tool_call");
+        assert_eq!(value[2]["parts"][0]["name"], "get_weather");
+        assert_eq!(value[2]["parts"][0]["arguments"]["location"], "Paris");
+    }
+
+    #[test]
+    fn system_instructions_preserve_the_actual_prompt() {
+        let value: Value =
+            serde_json::from_str(&system_instructions_json("Be concise.\nUse tools.")).unwrap();
+
+        assert_eq!(value[0]["type"], "text");
+        assert_eq!(value[0]["content"], "Be concise.\nUse tools.");
+    }
+
+    #[test]
+    fn input_messages_include_the_actual_system_prompt() {
+        let messages = vec![Message::user().with_text("Hello")];
+        let value: Value =
+            serde_json::from_str(&input_messages_with_system_json("System prompt", &messages))
+                .unwrap();
+
+        assert_eq!(value[0]["role"], "system");
+        assert_eq!(value[0]["parts"][0]["content"], "System prompt");
+        assert_eq!(value[1]["role"], "user");
     }
 
     #[test]

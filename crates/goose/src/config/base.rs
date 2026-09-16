@@ -1397,6 +1397,7 @@ impl Config {
 }
 
 config_value!(GOOSE_DEFAULT_EXTENSION_TIMEOUT, u64);
+config_value!(GOOSE_ACP_WORKSPACE_ROOT, String);
 
 fn find_workspace_or_exe_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;

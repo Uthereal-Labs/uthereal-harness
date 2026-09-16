@@ -110,6 +110,13 @@ impl EffectHandler<Session, GooseEffect> for SessionManager {
                 GooseEffect::RecordUsage(provider_usage) => {
                     usage::record(self, session, provider_usage, false).await?;
                 }
+                GooseEffect::DeliverMailboxMessage {
+                    mailbox_id,
+                    message,
+                } => {
+                    self.deliver_session_message(&session.id, *mailbox_id, message)
+                        .await?;
+                }
             }
         }
 

@@ -100,15 +100,44 @@ impl GooseAcpAgent {
         req: DeleteSessionRequest,
     ) -> Result<DeleteSessionResponse, agent_client_protocol::Error> {
         let session_id = req.session_id.0.to_string();
-        self.session_manager
-            .delete_session(&session_id)
-            .await
-            .internal_err()?;
+        let (drained, errors) = self.cancel_and_drain_session(&session_id).await;
+        if !drained {
+            self.closed_session_ids.lock().await.remove(&session_id);
+            self.session_admission_fence
+                .lock()
+                .await
+                .session_ids
+                .remove(&session_id);
+            let error = errors
+                .into_iter()
+                .last()
+                .expect("a failed drain records an error");
+            return Err(agent_client_protocol::Error::internal_error().data(error.to_string()));
+        }
+        let delete_result = self.session_manager.delete_session(&session_id).await;
+        if let Err(error) = delete_result {
+            self.closed_session_ids.lock().await.remove(&session_id);
+            self.session_admission_fence
+                .lock()
+                .await
+                .session_ids
+                .remove(&session_id);
+            return Err(agent_client_protocol::Error::internal_error().data(error.to_string()));
+        }
         self.sessions.lock().await.remove(&session_id);
-        self.agent_manager
+        let remove_result = self
+            .agent_manager
             .remove_session_if_loaded(&session_id)
+            .await;
+        self.session_admission_fence
+            .lock()
             .await
-            .internal_err_ctx("Failed to remove in-memory agent")?;
+            .session_ids
+            .remove(&session_id);
+        remove_result.internal_err_ctx("Failed to remove in-memory agent")?;
+        if let Some(error) = errors.into_iter().next() {
+            return Err(agent_client_protocol::Error::internal_error().data(error.to_string()));
+        }
         Ok(DeleteSessionResponse::new())
     }
 

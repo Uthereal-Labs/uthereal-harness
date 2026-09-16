@@ -11,7 +11,6 @@ use crate::agents::final_output_tool::{FINAL_OUTPUT_CONTINUATION_MESSAGE, FINAL_
 use crate::agents::platform_extensions::scheduler::MANAGE_SCHEDULE_TOOL_NAME_COMPLETE;
 #[cfg(feature = "code-mode")]
 use crate::agents::state_machine::ops_tool_approval::TOOL_EXECUTABLE_KEY;
-use crate::agents::state_machine::MAX_TURNS_MESSAGE;
 use crate::agents::tool_execution::CHAT_MODE_TOOL_SKIPPED_RESPONSE;
 use crate::agents::types::{RetryConfig, SuccessCheck};
 #[cfg(feature = "code-mode")]
@@ -155,11 +154,16 @@ settings:
         .call("delegate", json!({ "source": "bounded" }));
     api.on("Keep taking actions")
         .unadvertised_call("keep_working", json!({}));
-    api.on(MAX_TURNS_MESSAGE).reply("child stopped on time");
+    api.on("Subagent reached its maximum action limit")
+        .reply("child stopped on time");
 
     let result = pipeline.run(["Delegate the bounded child"]).await?;
     assert_eq!(api.call_count(), 3);
-    result.assert_message(-2, ToolResponse, MAX_TURNS_MESSAGE);
+    result.assert_message(
+        -2,
+        ToolResponse,
+        "Subagent reached its maximum action limit",
+    );
     result.assert_message(-1, Agent, "child stopped on time");
 
     Ok(())

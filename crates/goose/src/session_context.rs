@@ -7,6 +7,7 @@ pub const WORKING_DIR_HEADER: &str = "agent-working-dir";
 
 tokio::task_local! {
     pub static SESSION_ID: Option<String>;
+    pub static TELEMETRY_SESSION_ID: Option<String>;
 }
 
 pub async fn with_session_id<F>(session_id: Option<String>, f: F) -> F::Output
@@ -18,6 +19,21 @@ where
 
 pub fn current_session_id() -> Option<String> {
     SESSION_ID.try_with(|id| id.clone()).ok().flatten()
+}
+
+pub async fn with_telemetry_session_id<F>(session_id: Option<String>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TELEMETRY_SESSION_ID.scope(session_id, future).await
+}
+
+pub fn telemetry_session_id(execution_session_id: &str) -> String {
+    TELEMETRY_SESSION_ID
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| execution_session_id.to_string())
 }
 
 pub fn session_id_request_builder() -> goose_providers::api_client::RequestBuilderDecorator {

@@ -590,6 +590,9 @@ pub fn shutdown_otlp() {
         .unwrap_or_else(|e| e.into_inner())
         .take()
     {
+        if let Err(e) = provider.force_flush() {
+            tracing::warn!("OTLP tracer provider flush error: {e}");
+        }
         if let Err(e) = provider.shutdown_with_timeout(timeout) {
             tracing::warn!("OTLP tracer provider shutdown error: {e}");
         }
@@ -599,6 +602,9 @@ pub fn shutdown_otlp() {
         .unwrap_or_else(|e| e.into_inner())
         .take()
     {
+        if let Err(e) = provider.force_flush() {
+            tracing::warn!("OTLP meter provider flush error: {e}");
+        }
         if let Err(e) = provider.shutdown_with_timeout(timeout) {
             tracing::warn!("OTLP meter provider shutdown error: {e}");
         }
@@ -608,6 +614,9 @@ pub fn shutdown_otlp() {
         .unwrap_or_else(|e| e.into_inner())
         .take()
     {
+        if let Err(e) = provider.force_flush() {
+            tracing::warn!("OTLP logger provider flush error: {e}");
+        }
         if let Err(e) = provider.shutdown_with_timeout(timeout) {
             tracing::warn!("OTLP logger provider shutdown error: {e}");
         }

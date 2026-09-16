@@ -1,16 +1,27 @@
 use std::path::Path;
 
+use crate::session::SessionType;
 use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
 
 use super::types::{SlashCommandEntry, SlashCommandSource};
 use super::util::normalize_command_name;
 
 pub fn list_commands(working_dir: Option<&Path>) -> Vec<SlashCommandEntry> {
-    commands_from_sources(crate::skills::list_installed_skills(working_dir))
+    commands_from_sources(crate::skills::list_visible_skills(
+        working_dir,
+        SessionType::User,
+    ))
 }
 
 pub fn format_installed_skills(working_dir: Option<&Path>) -> String {
-    let sources = crate::skills::list_installed_skills(working_dir);
+    format_installed_skills_for_session(working_dir, SessionType::User)
+}
+
+pub fn format_installed_skills_for_session(
+    working_dir: Option<&Path>,
+    session_type: SessionType,
+) -> String {
+    let sources = crate::skills::list_visible_skills(working_dir, session_type);
     let skills: Vec<_> = sources
         .iter()
         .filter(|s| matches!(s.source_type, SourceType::Skill | SourceType::BuiltinSkill))
@@ -45,7 +56,16 @@ pub fn resolve_command(
     params_str: &str,
     working_dir: Option<&Path>,
 ) -> Result<Option<String>, String> {
-    let Some(skill) = crate::skills::list_installed_skills(working_dir)
+    resolve_command_for_session(command, params_str, working_dir, SessionType::User)
+}
+
+pub fn resolve_command_for_session(
+    command: &str,
+    params_str: &str,
+    working_dir: Option<&Path>,
+    session_type: SessionType,
+) -> Result<Option<String>, String> {
+    let Some(skill) = crate::skills::list_visible_skills(working_dir, session_type)
         .into_iter()
         .find(|skill| skill.name.eq_ignore_ascii_case(command))
     else {
@@ -145,6 +165,45 @@ mod tests {
         assert_eq!(command.description, "Review changed code");
         assert_eq!(command.source, SlashCommandSource::Skill);
         assert_eq!(command.input_hint.as_deref(), Some("[task]"));
+    }
+
+    #[test]
+    fn delegate_only_skill_slash_command_is_subagent_only() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join(".agents/skills/private-review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: private-review\ndescription: Private review\nmetadata:\n  delegate_only: true\n---\nPrivate instructions.",
+        )
+        .unwrap();
+
+        assert!(resolve_command_for_session(
+            "private-review",
+            "",
+            Some(tmp.path()),
+            SessionType::User,
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            !format_installed_skills_for_session(Some(tmp.path()), SessionType::User)
+                .contains("private-review")
+        );
+
+        assert!(resolve_command_for_session(
+            "private-review",
+            "",
+            Some(tmp.path()),
+            SessionType::SubAgent,
+        )
+        .unwrap()
+        .unwrap()
+        .contains("Private instructions."));
+        assert!(
+            format_installed_skills_for_session(Some(tmp.path()), SessionType::SubAgent)
+                .contains("private-review")
+        );
     }
 
     fn source_entry(source_type: SourceType, name: &str, description: &str) -> SourceEntry {

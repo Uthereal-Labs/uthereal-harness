@@ -17,7 +17,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, Instrument};
 
 pub type OnMessageCallback = Arc<dyn Fn(&Message) + Send + Sync>;
 
@@ -41,23 +41,46 @@ pub struct SubagentRunParams {
     pub cancellation_token: Option<CancellationToken>,
     pub on_message: Option<OnMessageCallback>,
     pub notification_tx: Option<tokio::sync::mpsc::UnboundedSender<ServerNotification>>,
+    pub parent_span: tracing::Span,
 }
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyhow::Error> {
     let return_last_only = params.return_last_only;
-    let (messages, final_output) = get_agent_messages(params).await.map_err(|e| {
-        ErrorData::new(
-            ErrorCode::INTERNAL_ERROR,
-            format!("Failed to execute task: {}", e),
-            None,
-        )
-    })?;
+    let telemetry_session_id = params.task_config.parent_session_id.clone();
+    let parent_span = params.parent_span.clone();
+    let execution = get_agent_messages(params).instrument(parent_span);
+    let (messages, final_output) =
+        crate::session_context::with_telemetry_session_id(Some(telemetry_session_id), execution)
+            .await
+            .map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Failed to execute task: {}", e),
+                    None,
+                )
+            })?;
 
     if let Some(output) = final_output {
         return Ok(output);
     }
 
+    if let Some(error) = terminal_subagent_failure(&messages) {
+        return Err(anyhow!(error));
+    }
+
     Ok(extract_response_text(&messages, return_last_only))
+}
+
+fn terminal_subagent_failure(messages: &Conversation) -> Option<String> {
+    let message = messages.messages().last()?;
+    if message.as_concat_text() == crate::agents::state_machine::MAX_TURNS_MESSAGE {
+        return Some("Subagent reached its maximum action limit".to_string());
+    }
+    message
+        .content
+        .iter()
+        .find_map(|content| content.as_error())
+        .map(|error| format!("Subagent failed: {}", error.message))
 }
 
 fn extract_response_text(messages: &Conversation, return_last_only: bool) -> String {
@@ -122,7 +145,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
         let SubagentRunParams {
             config,
             recipe,
-            task_config,
+            mut task_config,
             session_id,
             cancellation_token,
             on_message,
@@ -138,6 +161,30 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
 
         let agent = Arc::new(Agent::with_config(config));
 
+        if let Some(crate::agents::ExtensionConfig::Platform {
+            available_tools, ..
+        }) = task_config
+            .extensions
+            .iter_mut()
+            .find(|extension| extension.name() == "summon")
+        {
+            if !available_tools.is_empty()
+                && !available_tools.iter().any(|tool| tool == "message_parent")
+            {
+                available_tools.push("message_parent".to_string());
+            }
+        } else {
+            task_config
+                .extensions
+                .push(crate::agents::ExtensionConfig::Platform {
+                    name: "summon".to_string(),
+                    description: String::new(),
+                    display_name: None,
+                    bundled: None,
+                    available_tools: vec!["message_parent".to_string()],
+                });
+        }
+
         agent
             .update_provider(
                 task_config.provider.clone(),
@@ -148,11 +195,22 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .map_err(|e| anyhow!("Failed to set provider on sub agent: {}", e))?;
 
         for extension in &task_config.extensions {
+            let extension_name = extension.name();
             if let Err(e) = agent.add_extension(extension.clone(), &session_id).await {
+                if task_config
+                    .required_extension_names
+                    .iter()
+                    .any(|required| required == &extension_name)
+                {
+                    return Err(anyhow!(
+                        "Failed to load required extension '{}': {}",
+                        extension_name,
+                        e
+                    ));
+                }
                 debug!(
                     "Failed to add extension '{}' to subagent: {}",
-                    extension.name(),
-                    e
+                    extension_name, e
                 );
             }
         }
@@ -234,8 +292,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                     conversation = updated_conversation;
                 }
                 Err(e) => {
-                    tracing::error!("Error receiving message from subagent: {}", e);
-                    break;
+                    return Err(anyhow!("Subagent stream failed: {e}"));
                 }
             }
         }
@@ -316,8 +373,9 @@ pub fn create_tool_notification(
 
 #[cfg(test)]
 mod tests {
-    use super::{create_tool_notification, SUBAGENT_TOOL_REQUEST_TYPE};
-    use crate::conversation::message::MessageContent;
+    use super::{create_tool_notification, terminal_subagent_failure, SUBAGENT_TOOL_REQUEST_TYPE};
+    use crate::conversation::message::{Message, MessageContent, MessageErrorKind};
+    use crate::conversation::Conversation;
     use rmcp::model::{CallToolRequestParams, ServerNotification};
     use serde_json::json;
 
@@ -360,5 +418,29 @@ mod tests {
     fn create_tool_notification_ignores_non_tool_request() {
         let content = MessageContent::text("hello");
         assert!(create_tool_notification(&content, "session_1").is_none());
+    }
+
+    #[test]
+    fn terminal_error_message_fails_subagent() {
+        let conversation = Conversation::new_unvalidated(vec![Message::assistant().with_content(
+            MessageContent::error(MessageErrorKind::Other, "provider unavailable"),
+        )]);
+
+        assert_eq!(
+            terminal_subagent_failure(&conversation).as_deref(),
+            Some("Subagent failed: provider unavailable")
+        );
+    }
+
+    #[test]
+    fn max_turn_message_fails_subagent() {
+        let conversation = Conversation::new_unvalidated(vec![
+            Message::assistant().with_text(crate::agents::state_machine::MAX_TURNS_MESSAGE)
+        ]);
+
+        assert_eq!(
+            terminal_subagent_failure(&conversation).as_deref(),
+            Some("Subagent reached its maximum action limit")
+        );
     }
 }

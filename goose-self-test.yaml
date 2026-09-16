@@ -14,8 +14,10 @@ activities:
   - Test extension discovery and management
   - Test load tool for knowledge injection and discovery
   - Test delegate tool for task delegation (sync and async)
+  - Validate native task steering, parent reports, and specialist capability policies
   - Test multi-turn thinking preservation for providers that reject replayed reasoning_content
   - Validate ACP thinking-effort discovery, forwarding, and provider switching
+  - Validate opt-in ACP conversation workspace creation, reuse, and rejection of traversal or symlink paths
   - Validate GDK observability hook lifecycle events and payload opt-in
   - Test error boundaries including nested delegation prevention
   - Generate comprehensive test report
@@ -91,6 +93,16 @@ instructions: |
   - Delegate tool for asynchronous background tasks
   - Parallel delegate execution
   - Nested delegation prevention (critical security test)
+  - Send updated guidance to a running child with summon.send and verify that
+    its next turn incorporates the guidance without starting a replacement task
+  - Have a child send an interim message with summon.message_parent and verify
+    that the main agent handles the update and the later terminal report
+  - Validate an opt-in non_blocking specialist: delegation returns immediately,
+    load reports running status, and the final result is delivered automatically
+  - Verify delegate_only extensions and skills stay out of the parent while
+    a specialist receives its configured required extensions and skills
+  - In a separate headless CLI run, verify background children finish before
+    process exit and that JSON output contains only one final result
 
   ### Phase 4: Advanced Self-Testing
   Push boundaries and test limits:

@@ -319,7 +319,7 @@ pub(crate) fn prepare_tools_for_provider(
 #[tracing::instrument(
     skip(provider, model_config, session_id, system_prompt, messages, tools, toolshim_tools),
     fields(
-        session.id = %session_id,
+        session.id = %crate::session_context::telemetry_session_id(session_id),
         gen_ai.conversation.id = %session_id,
         gen_ai.operation.name = "chat",
         gen_ai.provider.name = %provider.get_name(),
@@ -367,9 +367,13 @@ pub(crate) async fn stream_response_from_provider(
     gen_ai_telemetry::record_request_params(&span, &model_config);
     let capture_message_content = gen_ai_telemetry::capture_message_content();
     if capture_message_content {
-        let input_messages =
-            gen_ai_telemetry::input_messages_json(messages_for_provider.messages());
+        let input_messages = gen_ai_telemetry::input_messages_with_system_json(
+            system_prompt,
+            messages_for_provider.messages(),
+        );
         span.record("gen_ai.input.messages", input_messages.as_str());
+        let system_instructions = gen_ai_telemetry::system_instructions_json(system_prompt);
+        span.record("gen_ai.system_instructions", system_instructions.as_str());
     }
 
     // Clone owned data to move into the async stream
@@ -946,7 +950,10 @@ mod tests {
 
         let input: Value =
             serde_json::from_str(fields["gen_ai.input.messages"].as_str().unwrap()).unwrap();
-        assert_eq!(input[0]["parts"][0]["content"], "Say hello");
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[0]["parts"][0]["content"], "system");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["parts"][0]["content"], "Say hello");
 
         let output: Value =
             serde_json::from_str(fields["gen_ai.output.messages"].as_str().unwrap()).unwrap();

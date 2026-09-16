@@ -2786,6 +2786,41 @@ impl ExtensionManager {
         }
         parts
     }
+
+    pub async fn has_active_tasks(&self, session_id: &str) -> anyhow::Result<bool> {
+        let clients: Vec<_> = self
+            .extensions
+            .lock()
+            .await
+            .values()
+            .map(|extension| extension.get_client())
+            .collect();
+        for client in clients {
+            if client.has_active_tasks(session_id).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub async fn shutdown_session(&self, session_id: &str) -> anyhow::Result<()> {
+        let clients: Vec<_> = self
+            .extensions
+            .lock()
+            .await
+            .values()
+            .map(|extension| extension.get_client())
+            .collect();
+        let mut first_error = None;
+        for client in clients {
+            if let Err(error) = client.shutdown_session(session_id).await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
 }
 
 #[cfg(test)]
