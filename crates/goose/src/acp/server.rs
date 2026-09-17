@@ -81,6 +81,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, OnceCell};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "otel")]
+use tracing::Instrument;
 use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -94,6 +96,24 @@ use self::tool_calls::conversion::{
     tool_call_update_fields_from_response, trusted_update_meta,
 };
 use self::tool_calls::enrichment::{spawn_chain_summary_enrichment, spawn_tool_title_enrichment};
+
+#[cfg(feature = "otel")]
+fn prompt_trace_context(meta: Option<&Meta>) -> Option<opentelemetry::Context> {
+    use opentelemetry::propagation::TextMapPropagator;
+    use opentelemetry::trace::TraceContextExt;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+    let meta = meta?;
+    let traceparent = meta.get("traceparent")?.as_str()?;
+    let mut carrier =
+        std::collections::HashMap::from([("traceparent".to_string(), traceparent.to_string())]);
+    if let Some(tracestate) = meta.get("tracestate").and_then(serde_json::Value::as_str) {
+        carrier.insert("tracestate".to_string(), tracestate.to_string());
+    }
+    let parent = TraceContextPropagator::new()
+        .extract_with_context(&opentelemetry::Context::new(), &carrier);
+    parent.span().span_context().is_valid().then_some(parent)
+}
 
 mod agent_requests;
 pub use agent_requests::agent_request_schemas;
@@ -2617,14 +2637,23 @@ impl GooseAcpAgent {
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         let message = Self::convert_acp_prompt_to_message(&args.prompt);
-        self.run_session_message(
+        let run = self.run_session_message(
             cx,
             session_id,
             Some(message),
             use_state_machine,
             await_background_tasks,
-        )
-        .await
+        );
+        #[cfg(feature = "otel")]
+        if let Some(parent) = prompt_trace_context(args.meta.as_ref()) {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+            let span = tracing::info_span!("acp_prompt");
+            if span.set_parent(parent).is_ok() {
+                return crate::agents::with_acp_remote_prompt_parent(run.instrument(span)).await;
+            }
+        }
+        run.await
     }
 
     async fn run_session_message(

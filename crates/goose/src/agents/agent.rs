@@ -82,6 +82,15 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+tokio::task_local! {
+    static ACP_REMOTE_PROMPT_PARENT: bool;
+}
+
+#[cfg(feature = "otel")]
+pub(crate) async fn with_acp_remote_prompt_parent<F: std::future::Future>(future: F) -> F::Output {
+    ACP_REMOTE_PROMPT_PARENT.scope(true, future).await
+}
+
 const DEFAULT_MAX_TURNS: u32 = 1000;
 const DEFAULT_STOP_HOOK_BLOCK_CAP: u32 = 8;
 const COMPACTION_PROGRESS_TEXT: &str = "goose is compacting the conversation...";
@@ -2113,7 +2122,12 @@ impl Agent {
             .as_deref()
             .unwrap_or(&execution_session_id);
         let current_span = tracing::Span::current();
-        let parent_span = if self.config.is_subagent && current_span.id().is_some() {
+        let parent_span = if (self.config.is_subagent
+            || ACP_REMOTE_PROMPT_PARENT
+                .try_with(|active| *active)
+                .unwrap_or(false))
+            && current_span.id().is_some()
+        {
             current_span
         } else {
             self.session_trace_root(telemetry_session_id)
