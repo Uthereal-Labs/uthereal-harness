@@ -140,6 +140,7 @@ fn extract_response_text(messages: &Conversation, return_last_only: bool) -> Str
 }
 
 pub const SUBAGENT_TOOL_REQUEST_TYPE: &str = "subagent_tool_request";
+pub const SUBAGENT_TOOL_RESPONSE_TYPE: &str = "subagent_tool_response";
 
 fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
     Box::pin(async move {
@@ -348,33 +349,37 @@ pub fn create_tool_notification(
     content: &MessageContent,
     subagent_id: &str,
 ) -> Option<ServerNotification> {
-    if let MessageContent::ToolRequest(req) = content {
+    let data = if let MessageContent::ToolRequest(req) = content {
         let tool_call = req.tool_call.as_ref().ok()?;
-
-        Some(ServerNotification::LoggingMessageNotification(
-            Notification::new(
-                LoggingMessageNotificationParam::new(
-                    LoggingLevel::Info,
-                    serde_json::json!({
-                        "type": SUBAGENT_TOOL_REQUEST_TYPE,
-                        "subagent_id": subagent_id,
-                        "tool_call": {
-                            "name": tool_call.name,
-                            "arguments": tool_call.arguments
-                        }
-                    }),
-                )
-                .with_logger(format!("subagent:{}", subagent_id)),
-            ),
-        ))
+        serde_json::json!({
+            "type": SUBAGENT_TOOL_REQUEST_TYPE,
+            "subagent_id": subagent_id,
+            "tool_call": {"id": req.id, "name": tool_call.name, "arguments": tool_call.arguments}
+        })
+    } else if let MessageContent::ToolResponse(response) = content {
+        serde_json::json!({
+            "type": SUBAGENT_TOOL_RESPONSE_TYPE,
+            "subagent_id": subagent_id,
+            "tool_call": {"id": response.id},
+            "status": if response.tool_result.as_ref().is_ok_and(|result| result.is_error != Some(true)) { "completed" } else { "failed" }
+        })
     } else {
-        None
-    }
+        return None;
+    };
+    Some(ServerNotification::LoggingMessageNotification(
+        Notification::new(
+            LoggingMessageNotificationParam::new(LoggingLevel::Info, data)
+                .with_logger(format!("subagent:{}", subagent_id)),
+        ),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{create_tool_notification, terminal_subagent_failure, SUBAGENT_TOOL_REQUEST_TYPE};
+    use super::{
+        create_tool_notification, terminal_subagent_failure, SUBAGENT_TOOL_REQUEST_TYPE,
+        SUBAGENT_TOOL_RESPONSE_TYPE,
+    };
     use crate::conversation::message::{Message, MessageContent, MessageErrorKind};
     use crate::conversation::Conversation;
     use rmcp::model::{CallToolRequestParams, ServerNotification};
@@ -419,6 +424,31 @@ mod tests {
     fn create_tool_notification_ignores_non_tool_request() {
         let content = MessageContent::text("hello");
         assert!(create_tool_notification(&content, "session_1").is_none());
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn create_tool_notification_for_tool_response_exposes_only_status() {
+        let content = MessageContent::tool_response(
+            "req1",
+            Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::ContentBlock::text("private result"),
+            ])),
+        );
+        let notification =
+            create_tool_notification(&content, "session_1").expect("expected notification");
+        let ServerNotification::LoggingMessageNotification(log_notif) = notification else {
+            panic!("expected logging notification");
+        };
+        let data = log_notif
+            .params
+            .data
+            .as_object()
+            .expect("expected object data");
+        assert_eq!(data["type"], SUBAGENT_TOOL_RESPONSE_TYPE);
+        assert_eq!(data["tool_call"]["id"], "req1");
+        assert_eq!(data["status"], "completed");
+        assert!(!log_notif.params.data.to_string().contains("private result"));
     }
 
     #[test]
