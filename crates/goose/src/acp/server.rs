@@ -242,6 +242,7 @@ struct GooseAcpSession {
 pub struct ActivePromptRun {
     run_id: String,
     cancel_token: CancellationToken,
+    accepting_steers: bool,
     /// The agent actually running this prompt. Roaming gives each connection
     /// its own agent, so a steer arriving on a second connection must be
     /// routed here rather than to the caller's connection-local agent.
@@ -316,22 +317,25 @@ impl Drop for ActiveRunDropGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let agent = {
-                    let runs = registry.lock().await;
-                    match runs.get(&session_id) {
-                        Some(run) if run.run_id == run_id => Some(run.agent.clone()),
-                        _ => None,
-                    }
+                    let mut runs = registry.lock().await;
+                    runs.get_mut(&session_id).and_then(|run| {
+                        if run.run_id != run_id {
+                            return None;
+                        }
+                        run.accepting_steers = false;
+                        Some(run.agent.clone())
+                    })
                 };
                 if let Some(agent) = agent {
                     if let Err(error) = agent.shutdown_session(&session_id).await {
                         warn!(session_id, %error, "Failed to shut down dropped ACP run");
                     }
-                    agent.discard_pending_steers(&session_id).await;
                     let mut runs = registry.lock().await;
                     if runs
                         .get(&session_id)
                         .is_some_and(|run| run.run_id == run_id)
                     {
+                        agent.discard_pending_steers(&session_id).await;
                         runs.remove(&session_id);
                     }
                 }
@@ -1399,6 +1403,7 @@ impl GooseAcpAgent {
                                 SessionId::new(session_id.clone()),
                                 None,
                                 use_state_machine,
+                                false,
                             )
                             .await;
                         let failed = match result {
@@ -2124,6 +2129,7 @@ impl GooseAcpAgent {
             ActivePromptRun {
                 run_id,
                 cancel_token,
+                accepting_steers: true,
                 agent,
             },
         );
@@ -2195,26 +2201,18 @@ impl GooseAcpAgent {
     }
 
     async fn clear_active_run(&self, session_id: &str, run_id: &str) {
-        let agent = {
-            let mut active_prompt_runs = self.active_prompt_runs.lock().await;
-            let Some(active_run) = active_prompt_runs.get(session_id) else {
-                return;
-            };
-
-            if active_run.run_id != run_id {
-                return;
-            }
-
-            active_prompt_runs
-                .remove(session_id)
-                .map(|active_run| active_run.agent)
+        let mut active_prompt_runs = self.active_prompt_runs.lock().await;
+        let Some(active_run) = active_prompt_runs.get(session_id) else {
+            return;
         };
-
-        // Discard steers on the agent that owned the run; under roaming it may
-        // not be this connection's agent.
-        if let Some(agent) = agent {
-            agent.discard_pending_steers(session_id).await;
+        if active_run.run_id != run_id {
+            return;
         }
+        // Keep admission closed through queue cleanup so a new run cannot have
+        // its guidance discarded by the old run's cleanup.
+        active_run.agent.discard_pending_steers(session_id).await;
+        active_prompt_runs.remove(session_id);
+        drop(active_prompt_runs);
 
         if self.closed_session_ids.lock().await.contains(session_id) {
             self.sessions.lock().await.remove(session_id);
@@ -2257,6 +2255,10 @@ impl GooseAcpAgent {
                     "actualRunId": active_run.run_id.as_str(),
                 })),
             );
+        }
+        if !active_run.accepting_steers {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("active run is finishing; send a new prompt"));
         }
         Ok((active_run.run_id.clone(), active_run.agent.clone()))
     }
@@ -2607,9 +2609,22 @@ impl GooseAcpAgent {
             .and_then(|goose| goose.get("unrolledAgentLoop"))
             .and_then(|value| value.as_bool())
             .unwrap_or_else(crate::agents::state_machine::enabled);
+        let await_background_tasks = args
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("goose"))
+            .and_then(|goose| goose.get("awaitBackgroundTasks"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
         let message = Self::convert_acp_prompt_to_message(&args.prompt);
-        self.run_session_message(cx, session_id, Some(message), use_state_machine)
-            .await
+        self.run_session_message(
+            cx,
+            session_id,
+            Some(message),
+            use_state_machine,
+            await_background_tasks,
+        )
+        .await
     }
 
     async fn run_session_message(
@@ -2618,6 +2633,7 @@ impl GooseAcpAgent {
         acp_session_id: SessionId,
         user_message: Option<Message>,
         use_state_machine: bool,
+        await_background_tasks: bool,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
         // The ACP session_id IS the thread ID.
         let session_id = acp_session_id.0.to_string();
@@ -2707,6 +2723,31 @@ impl GooseAcpAgent {
                     break;
                 }
 
+                if await_background_tasks {
+                    let steers = agent.drain_pending_steers(&session_id).await;
+                    if !steers.is_empty() {
+                        for steer in steers {
+                            let steer_outcome = self
+                                .run_agent_reply(
+                                    cx,
+                                    &acp_session_id,
+                                    &agent,
+                                    steer,
+                                    use_state_machine,
+                                    &cancel_token,
+                                )
+                                .await?;
+                            outcome.was_cancelled |= steer_outcome.was_cancelled;
+                            outcome.output_token_limit_reached |=
+                                steer_outcome.output_token_limit_reached;
+                            if outcome.was_cancelled || outcome.output_token_limit_reached {
+                                return Ok(outcome);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
                 let reports = self
                     .session_manager
                     .pending_session_messages(&session_id)
@@ -2747,6 +2788,42 @@ impl GooseAcpAgent {
                     continue;
                 }
 
+                if await_background_tasks
+                    && agent
+                        .has_active_tasks(&session_id)
+                        .await
+                        .internal_err_ctx("Failed to inspect background tasks")?
+                {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => {
+                            outcome.was_cancelled = true;
+                            break;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    }
+                    continue;
+                }
+                if await_background_tasks
+                    && !self
+                        .session_manager
+                        .pending_session_messages(&session_id)
+                        .await
+                        .internal_err_ctx("Failed to recheck background task reports")?
+                        .is_empty()
+                {
+                    continue;
+                }
+                if await_background_tasks {
+                    let mut runs = self.active_prompt_runs.lock().await;
+                    if agent.has_pending_steers(&session_id).await {
+                        continue;
+                    }
+                    if let Some(run) = runs.get_mut(&session_id) {
+                        if run.run_id == run_id {
+                            run.accepting_steers = false;
+                        }
+                    }
+                }
                 break;
             }
             Ok(outcome)
@@ -2806,7 +2883,16 @@ impl GooseAcpAgent {
 
         let message_id = format!("steer_{}", Uuid::new_v4());
         let message = message.with_id(message_id.clone());
+        let runs = self.active_prompt_runs.lock().await;
+        if !runs
+            .get(&req.session_id)
+            .is_some_and(|run| run.run_id == active_run_id && run.accepting_steers)
+        {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("active run is finishing; send a new prompt"));
+        }
         agent.steer(&req.session_id, message).await;
+        drop(runs);
 
         if let Some(cx) = self.client_cx.get() {
             let _ = Self::send_queued_steer_update(
@@ -3183,6 +3269,58 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use test_case::test_case;
+
+    #[tokio::test]
+    async fn sealed_run_rejects_concurrent_steer_without_queuing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let provider_factory: AcpProviderFactory = Arc::new(
+            |_provider_name, _extensions, _working_dir, _use_default_model| {
+                Box::pin(async { Err(anyhow::anyhow!("unused provider factory")) })
+            },
+        );
+        let server = Arc::new(
+            GooseAcpAgent::new(GooseAcpAgentOptions {
+                provider_factory,
+                builtin_selection: AcpBuiltinSelection::default(),
+                data_dir: root.path().to_path_buf(),
+                config_dir: root.path().to_path_buf(),
+                disable_session_naming: true,
+                goose_platform: GoosePlatform::GooseCli,
+                additional_source_roots: Vec::new(),
+                scheduler: None,
+                session_cwd: None,
+                active_prompt_runs: Default::default(),
+                session_admission_fence: Default::default(),
+            })
+            .await
+            .unwrap(),
+        );
+        let agent = Arc::new(Agent::new());
+        server
+            .start_active_run(
+                "session",
+                "run".to_string(),
+                CancellationToken::new(),
+                agent.clone(),
+            )
+            .await
+            .unwrap();
+        let request: SteerSessionRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "session",
+            "expectedRunId": "run",
+            "prompt": [{"type": "text", "text": "late guidance"}],
+        }))
+        .unwrap();
+        let mut runs = server.active_prompt_runs.lock().await;
+        let pending = tokio::spawn({
+            let server = server.clone();
+            async move { server.on_steer_session(request).await }
+        });
+        runs.get_mut("session").unwrap().accepting_steers = false;
+        drop(runs);
+        assert!(pending.await.unwrap().is_err());
+        assert!(!agent.has_pending_steers("session").await);
+    }
 
     #[derive(Debug)]
     struct AsyncEffortProvider {
