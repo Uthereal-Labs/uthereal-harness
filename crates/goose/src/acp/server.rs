@@ -115,6 +115,16 @@ fn prompt_trace_context(meta: Option<&Meta>) -> Option<opentelemetry::Context> {
     parent.span().span_context().is_valid().then_some(parent)
 }
 
+fn prompt_telemetry_session_id(meta: Option<&Meta>) -> Option<String> {
+    meta.and_then(|meta| meta.get("goose"))
+        .and_then(|goose| goose.get("telemetrySessionId"))
+        .and_then(|value| value.as_str())
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+}
+
 mod agent_requests;
 pub use agent_requests::agent_request_schemas;
 mod agent_mentions;
@@ -2636,6 +2646,7 @@ impl GooseAcpAgent {
             .and_then(|goose| goose.get("awaitBackgroundTasks"))
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+        let telemetry_session_id = prompt_telemetry_session_id(args.meta.as_ref());
         let message = Self::convert_acp_prompt_to_message(&args.prompt);
         let run = self.run_session_message(
             cx,
@@ -2644,6 +2655,7 @@ impl GooseAcpAgent {
             use_state_machine,
             await_background_tasks,
         );
+        let run = crate::session_context::with_telemetry_session_id(telemetry_session_id, run);
         #[cfg(feature = "otel")]
         if let Some(parent) = prompt_trace_context(args.meta.as_ref()) {
             use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -3283,6 +3295,31 @@ pub async fn run(builtins: Vec<String>, enable_scheduler: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prompt_telemetry_session_id_requires_bounded_string() {
+        let meta = serde_json::Map::from_iter([(
+            "goose".to_string(),
+            serde_json::json!({"telemetrySessionId": "cortex-session"}),
+        )]);
+        assert_eq!(
+            super::prompt_telemetry_session_id(Some(&meta)).as_deref(),
+            Some("cortex-session")
+        );
+        for value in [
+            serde_json::json!(""),
+            serde_json::json!("x".repeat(129)),
+            serde_json::json!("a\nb"),
+            serde_json::json!(1),
+        ] {
+            let meta = serde_json::Map::from_iter([(
+                "goose".to_string(),
+                serde_json::json!({"telemetrySessionId": value}),
+            )]);
+            assert!(super::prompt_telemetry_session_id(Some(&meta)).is_none());
+        }
+        assert!(super::prompt_telemetry_session_id(None).is_none());
+    }
+
     #[cfg(feature = "otel")]
     #[test]
     fn prompt_trace_context_accepts_only_valid_w3c_parent() {

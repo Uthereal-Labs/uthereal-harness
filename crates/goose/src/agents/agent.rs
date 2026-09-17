@@ -2117,10 +2117,12 @@ impl Agent {
             .session_manager
             .get_session(&execution_session_id, false)
             .await?;
-        let telemetry_session_id = session
-            .parent_session_id
-            .as_deref()
-            .unwrap_or(&execution_session_id);
+        let telemetry_session_id = crate::session_context::telemetry_session_id(
+            session
+                .parent_session_id
+                .as_deref()
+                .unwrap_or(&execution_session_id),
+        );
         let current_span = tracing::Span::current();
         let parent_span = if (self.config.is_subagent
             || ACP_REMOTE_PROMPT_PARENT
@@ -2130,7 +2132,7 @@ impl Agent {
         {
             current_span
         } else {
-            self.session_trace_root(telemetry_session_id)
+            self.session_trace_root(&telemetry_session_id)
         };
         let reply_span = tracing::info_span!(
             parent: &parent_span,
@@ -4238,28 +4240,31 @@ mod tests {
                     .await?;
                 let acp_span = tracing::info_span!("acp_prompt");
                 acp_span.set_parent(parent.clone())?;
-                super::with_acp_remote_prompt_parent(
-                    async {
-                        let stream = agent
-                            .reply(
-                                Message::user().with_text("hello"),
-                                SessionConfig {
-                                    id: session.id,
-                                    schedule_id: None,
-                                    max_turns: Some(1),
-                                    retry_config: None,
-                                },
-                                use_state_machine,
-                                None,
-                            )
-                            .await?;
-                        tokio::pin!(stream);
-                        while let Some(event) = stream.next().await {
-                            event?;
+                crate::session_context::with_telemetry_session_id(
+                    Some("cortex-session".to_string()),
+                    super::with_acp_remote_prompt_parent(
+                        async {
+                            let stream = agent
+                                .reply(
+                                    Message::user().with_text("hello"),
+                                    SessionConfig {
+                                        id: session.id,
+                                        schedule_id: None,
+                                        max_turns: Some(1),
+                                        retry_config: None,
+                                    },
+                                    use_state_machine,
+                                    None,
+                                )
+                                .await?;
+                            tokio::pin!(stream);
+                            while let Some(event) = stream.next().await {
+                                event?;
+                            }
+                            Result::<()>::Ok(())
                         }
-                        Result::<()>::Ok(())
-                    }
-                    .instrument(acp_span),
+                        .instrument(acp_span),
+                    ),
                 )
                 .await
             }
@@ -4271,6 +4276,11 @@ mod tests {
         let replies: Vec<_> = spans.iter().filter(|span| span.name == "reply").collect();
         assert_eq!(replies.len(), 2);
         for reply in replies {
+            assert!(reply
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key.as_str() == "session.id"
+                    && attribute.value.as_str() == "cortex-session"));
             assert_eq!(
                 reply.span_context.trace_id().to_string(),
                 "0123456789abcdef0123456789abcdef"
