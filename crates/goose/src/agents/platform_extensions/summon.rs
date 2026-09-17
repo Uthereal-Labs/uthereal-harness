@@ -1133,7 +1133,12 @@ impl SummonClient {
                     serde_json::Value::Number(secs.into()),
                 );
             }
-            return Ok(CallToolResult::success(task_result.content).with_meta(Some(meta)));
+            let mut result = CallToolResult::success(task_result.content).with_meta(Some(meta));
+            result.structured_content = Some(serde_json::json!({
+                "subagent_session_id": name,
+                "task_status": task_result.status
+            }));
+            return Ok(result);
         }
 
         self.handle_load_source(session_id, name, &working_dir)
@@ -1564,9 +1569,14 @@ impl SummonClient {
             let mut meta = MetaObject::new();
             meta.0.insert(
                 "subagent_session_id".to_string(),
-                serde_json::Value::String(task_id),
+                serde_json::Value::String(task_id.clone()),
             );
-            return Ok(CallToolResult::success(content).with_meta(Some(meta)));
+            let mut result = CallToolResult::success(content).with_meta(Some(meta));
+            result.structured_content = Some(serde_json::json!({
+                "subagent_session_id": task_id,
+                "task_status": "running"
+            }));
+            return Ok(result);
         }
 
         let working_dir = session.working_dir.clone();
