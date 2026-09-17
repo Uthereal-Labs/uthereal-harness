@@ -235,6 +235,8 @@ const PROVIDER_CONFIG_STATUS_CHECK_CONCURRENCY: usize = 16;
 /// below is keyed by session ID.
 struct GooseAcpSession {
     agent: Arc<Agent>,
+    use_state_machine: bool,
+    automatic_reports_paused: bool,
 }
 
 pub struct ActivePromptRun {
@@ -262,6 +264,7 @@ pub type ActiveRunRegistry = Arc<Mutex<HashMap<String, ActivePromptRun>>>;
 #[derive(Default)]
 pub struct SessionAdmissionFenceState {
     pub(crate) shutting_down: bool,
+    pub(crate) loaded_agents: HashMap<String, Vec<std::sync::Weak<Agent>>>,
     session_ids: HashSet<String>,
 }
 pub type SessionAdmissionFence = Arc<Mutex<SessionAdmissionFenceState>>;
@@ -395,6 +398,8 @@ pub struct GooseAcpAgent {
     client_requests_tool_call_label_enrichment: OnceCell<bool>,
     use_login_shell_path: OnceCell<bool>,
     client_cx: OnceCell<ConnectionTo<Client>>,
+    report_receiver: OnceCell<std::sync::Weak<Self>>,
+    report_subscriptions: Mutex<HashSet<String>>,
     thinking_effort_update_tx: mpsc::UnboundedSender<String>,
     thinking_effort_update_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
     config_dir: std::path::PathBuf,
@@ -1038,6 +1043,8 @@ impl GooseAcpAgent {
             client_requests_tool_call_label_enrichment: OnceCell::new(),
             use_login_shell_path: OnceCell::new(),
             client_cx: OnceCell::new(),
+            report_receiver: OnceCell::new(),
+            report_subscriptions: Mutex::new(HashSet::new()),
             thinking_effort_update_tx,
             thinking_effort_update_rx: Mutex::new(Some(thinking_effort_update_rx)),
             config_dir: options.config_dir,
@@ -1291,13 +1298,147 @@ impl GooseAcpAgent {
     async fn register_acp_session(&self, session_id: String, agent: Arc<Agent>) {
         let acp_session = GooseAcpSession {
             agent: agent.clone(),
+            use_state_machine: crate::agents::state_machine::enabled(),
+            automatic_reports_paused: false,
         };
+        let mut fence = self.session_admission_fence.lock().await;
+        let loaded = fence.loaded_agents.entry(session_id.clone()).or_default();
+        loaded.retain(|agent| agent.strong_count() > 0);
+        if !loaded
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .any(|loaded| Arc::ptr_eq(&loaded, &agent))
+        {
+            loaded.push(Arc::downgrade(&agent));
+        }
+        drop(fence);
         self.sessions
             .lock()
             .await
             .insert(session_id.clone(), acp_session);
+        self.subscribe_background_reports(&session_id).await;
         self.subscribe_thinking_effort_updates(&session_id, &agent)
             .await;
+    }
+
+    fn subscribe_background_reports<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let (Some(receiver), Some(cx)) = (self.report_receiver.get(), self.client_cx.get())
+            else {
+                return;
+            };
+            if !self
+                .report_subscriptions
+                .lock()
+                .await
+                .insert(session_id.to_string())
+            {
+                return;
+            }
+            let receiver = receiver.clone();
+            let cx = cx.clone();
+            let session_id = session_id.to_string();
+            let subscription_id = session_id.clone();
+            let events = cx.clone();
+            if cx
+                .spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+                    loop {
+                        tick.tick().await;
+                        let Some(server) = receiver.upgrade() else {
+                            break;
+                        };
+                        if server.session_admission_fence.lock().await.shutting_down
+                            || server.closed_session_ids.lock().await.contains(&session_id)
+                        {
+                            break;
+                        }
+                        let mode = server
+                            .sessions
+                            .lock()
+                            .await
+                            .get(&session_id)
+                            .map(|session| {
+                                (session.use_state_machine, session.automatic_reports_paused)
+                            });
+                        let Some((use_state_machine, paused)) = mode else {
+                            break;
+                        };
+                        if paused
+                            || server
+                                .active_prompt_runs
+                                .lock()
+                                .await
+                                .contains_key(&session_id)
+                        {
+                            continue;
+                        }
+                        match server
+                            .session_manager
+                            .pending_session_messages(&session_id)
+                            .await
+                        {
+                            Ok(messages) if messages.is_empty() => continue,
+                            Ok(_) => {}
+                            Err(error) => {
+                                warn!(%error, "Failed to read delegated task reports");
+                                if let Some(session) =
+                                    server.sessions.lock().await.get_mut(&session_id)
+                                {
+                                    session.automatic_reports_paused = true;
+                                }
+                                continue;
+                            }
+                        }
+                        let result = server
+                            .run_session_message(
+                                &events,
+                                SessionId::new(session_id.clone()),
+                                None,
+                                use_state_machine,
+                            )
+                            .await;
+                        let failed = match result {
+                            Ok(response) => response.stop_reason != StopReason::EndTurn,
+                            Err(error) => {
+                                // A user prompt can claim the session between the idle check and admission.
+                                if error.code
+                                    == agent_client_protocol::schema::v1::ErrorCode::InvalidParams
+                                    && server
+                                        .active_prompt_runs
+                                        .lock()
+                                        .await
+                                        .contains_key(&session_id)
+                                {
+                                    continue;
+                                }
+                                warn!(?error, "Delegated task reports remain pending");
+                                true
+                            }
+                        };
+                        if failed {
+                            if let Some(session) = server.sessions.lock().await.get_mut(&session_id)
+                            {
+                                session.automatic_reports_paused = true;
+                            }
+                        }
+                    }
+                    if let Some(server) = receiver.upgrade() {
+                        server.report_subscriptions.lock().await.remove(&session_id);
+                    }
+                    Ok(())
+                })
+                .is_err()
+            {
+                self.report_subscriptions
+                    .lock()
+                    .await
+                    .remove(&subscription_id);
+            }
+        })
     }
 
     async fn subscribe_thinking_effort_updates(&self, session_id: &str, agent: &Arc<Agent>) {
@@ -2010,21 +2151,23 @@ impl GooseAcpAgent {
             token.cancel();
         }
 
-        let agent = match active_run {
-            Some((_, agent)) => Some(agent),
-            None => self
-                .sessions
-                .lock()
-                .await
-                .get(session_id)
-                .map(|session| session.agent.clone()),
-        };
+        let agents = self
+            .session_admission_fence
+            .lock()
+            .await
+            .loaded_agents
+            .get(session_id)
+            .map(|agents| {
+                agents
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut errors = Vec::new();
-        if let Some(agent) = agent {
+        for agent in agents {
             if let Err(error) = agent.shutdown_session(session_id).await {
-                errors.push(anyhow::anyhow!(
-                    "Failed to shut down session background tasks: {error}"
-                ));
+                errors.push(error);
             }
         }
 
@@ -2456,8 +2599,28 @@ impl GooseAcpAgent {
         cx: &ConnectionTo<Client>,
         args: PromptRequest,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
+        let session_id = args.session_id.clone();
+        let use_state_machine = args
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("goose"))
+            .and_then(|goose| goose.get("unrolledAgentLoop"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or_else(crate::agents::state_machine::enabled);
+        let message = Self::convert_acp_prompt_to_message(&args.prompt);
+        self.run_session_message(cx, session_id, Some(message), use_state_machine)
+            .await
+    }
+
+    async fn run_session_message(
+        &self,
+        cx: &ConnectionTo<Client>,
+        acp_session_id: SessionId,
+        user_message: Option<Message>,
+        use_state_machine: bool,
+    ) -> Result<PromptResponse, agent_client_protocol::Error> {
         // The ACP session_id IS the thread ID.
-        let session_id = args.session_id.0.to_string();
+        let session_id = acp_session_id.0.to_string();
 
         let run_id = format!("run_{}", Uuid::new_v4());
         let cancel_token = CancellationToken::new();
@@ -2474,6 +2637,13 @@ impl GooseAcpAgent {
         )
         .await?;
 
+        if user_message.is_some() {
+            if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+                session.use_state_machine = use_state_machine;
+                session.automatic_reports_paused = false;
+            }
+        }
+
         // Frees the run if this future is dropped mid-prompt (e.g. the roaming
         // connection carrying it is revoked or lost); a normal completion's
         // explicit clear wins and makes the guard's cleanup a no-op.
@@ -2486,45 +2656,50 @@ impl GooseAcpAgent {
 
         if cancel_token.is_cancelled() {
             self.clear_active_run(&session_id, &run_id).await;
-            Self::send_active_run_update(cx, &args.session_id, None)?;
+            Self::send_active_run_update(cx, &acp_session_id, None)?;
             return Ok(PromptResponse::new(StopReason::Cancelled));
         }
 
-        if let Err(error) = Self::send_active_run_update(cx, &args.session_id, Some(&run_id)) {
+        if let Err(error) = Self::send_active_run_update(cx, &acp_session_id, Some(&run_id)) {
             self.clear_active_run(&session_id, &run_id).await;
             return Err(error);
         }
 
         if let Err(error) = self
-            .send_local_inference_progress_update(cx, &args.session_id, &session_id, &agent)
+            .send_local_inference_progress_update(cx, &acp_session_id, &session_id, &agent)
             .await
         {
             self.clear_active_run(&session_id, &run_id).await;
-            let _ = Self::send_active_run_update(cx, &args.session_id, None);
+            let _ = Self::send_active_run_update(cx, &acp_session_id, None);
             return Err(error);
         }
 
-        let user_message = Self::convert_acp_prompt_to_message(&args.prompt);
-        let use_state_machine = args
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get("goose"))
-            .and_then(|goose| goose.get("unrolledAgentLoop"))
-            .and_then(|value| value.as_bool())
-            .unwrap_or_else(crate::agents::state_machine::enabled);
         let stream_result = async {
-            let mut outcome = self
-                .run_agent_reply(
+            let mut outcome = if let Some(user_message) = user_message {
+                self.run_agent_reply(
                     cx,
-                    &args.session_id,
+                    &acp_session_id,
                     &agent,
                     user_message,
                     use_state_machine,
                     &cancel_token,
                 )
-                .await?;
+                .await?
+            } else {
+                AgentStreamOutcome {
+                    was_cancelled: false,
+                    output_token_limit_reached: false,
+                    completed_visible_response: false,
+                }
+            };
             if outcome.was_cancelled || outcome.output_token_limit_reached {
                 return Ok(outcome);
+            }
+            if outcome.completed_visible_response {
+                self.session_manager
+                    .acknowledge_loaded_task_completions(&session_id)
+                    .await
+                    .internal_err_ctx("Failed to acknowledge loaded task completions")?;
             }
             loop {
                 if cancel_token.is_cancelled() {
@@ -2544,7 +2719,7 @@ impl GooseAcpAgent {
                     let report_outcome = self
                         .run_agent_reply(
                             cx,
-                            &args.session_id,
+                            &acp_session_id,
                             &agent,
                             envelope,
                             use_state_machine,
@@ -2572,30 +2747,7 @@ impl GooseAcpAgent {
                     continue;
                 }
 
-                if !agent
-                    .has_active_tasks(&session_id)
-                    .await
-                    .internal_err_ctx("Failed to inspect background tasks")?
-                {
-                    if self
-                        .session_manager
-                        .pending_session_messages(&session_id)
-                        .await
-                        .internal_err_ctx("Failed to recheck background task reports")?
-                        .is_empty()
-                    {
-                        break;
-                    }
-                    continue;
-                }
-
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        outcome.was_cancelled = true;
-                        break;
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                }
+                break;
             }
             Ok(outcome)
         }
@@ -2604,16 +2756,19 @@ impl GooseAcpAgent {
             outcome.was_cancelled || outcome.output_token_limit_reached
         });
         if should_shutdown || cancel_token.is_cancelled() {
+            if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+                session.automatic_reports_paused = true;
+            }
             if let Err(error) = agent.shutdown_session(&session_id).await {
                 warn!(session_id, %error, "Failed to shut down background tasks after ACP prompt");
             }
         }
         self.clear_active_run(&session_id, &run_id).await;
-        Self::send_active_run_update(cx, &args.session_id, None)?;
+        Self::send_active_run_update(cx, &acp_session_id, None)?;
         let outcome = stream_result?;
 
         let session = self
-            .send_session_usage_updates(cx, &args.session_id, &session_id, &agent, &mut None)
+            .send_session_usage_updates(cx, &acp_session_id, &session_id, &agent, &mut None)
             .await?;
 
         let stop_reason =
@@ -2685,10 +2840,26 @@ impl GooseAcpAgent {
         if let Some(token) = token {
             info!(session_id = %session_id, "prompt cancelled");
             token.cancel();
-        } else if !self.sessions.lock().await.contains_key(&session_id) {
-            warn!(session_id = %session_id, "cancel request for unknown session");
         }
-
+        let agents = self
+            .session_admission_fence
+            .lock()
+            .await
+            .loaded_agents
+            .get(&session_id)
+            .map(|agents| {
+                agents
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for agent in agents {
+            agent
+                .shutdown_session(&session_id)
+                .await
+                .internal_err_ctx("Failed to cancel delegated tasks")?;
+        }
         Ok(())
     }
 

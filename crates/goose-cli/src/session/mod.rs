@@ -1742,6 +1742,13 @@ impl CliSession {
             return Err(error);
         }
 
+        if succeeded {
+            self.agent
+                .config
+                .session_manager
+                .acknowledge_loaded_task_completions(&self.session_id)
+                .await?;
+        }
         Ok(succeeded)
     }
 

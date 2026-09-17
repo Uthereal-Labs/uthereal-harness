@@ -142,7 +142,7 @@ impl Provider for GooseInferenceProvider {
                 .collect(),
         );
         let session_id = crate::session_context::current_session_id().unwrap_or_default();
-        let stream = crate::agents::reply_parts::stream_response_from_provider(
+        let stream = crate::agents::reply_parts::stream_response_from_provider_in_span(
             self.inner.clone(),
             model_config.clone(),
             &session_id,

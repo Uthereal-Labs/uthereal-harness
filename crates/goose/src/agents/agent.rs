@@ -756,6 +756,7 @@ impl Agent {
         let category = categorize_tool(&tool_name);
         let span = tracing::Span::current();
         let capture_message_content = gen_ai_telemetry::capture_message_content();
+        let tool_span = span.clone();
 
         let fut = async move {
             let processed_result =
@@ -813,7 +814,7 @@ impl Agent {
         ToolCallResult {
             notification_stream: result.notification_stream,
             action_required_stream: result.action_required_stream,
-            result: Box::new(fut.boxed()),
+            result: Box::new(fut.instrument(tool_span).boxed()),
         }
     }
 
@@ -4161,20 +4162,25 @@ mod tests {
         // contract isolated from their global callsite and subscriber state.
         const CHILD_ENV: &str = "GOOSE_TEST_SESSION_TRACE_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
-            let output = std::process::Command::new(std::env::current_exe()?)
+            for mode in ["legacy", "state_machine"] {
+                for capture in ["false", "true"] {
+                    let output = std::process::Command::new(std::env::current_exe()?)
                 .args([
                     "--exact",
                     "agents::agent::tests::exported_traces_separate_sessions_and_parent_detached_subagents",
                     "--nocapture",
                 ])
-                .env(CHILD_ENV, "1")
+                .env(CHILD_ENV, mode)
+                .env("GOOSE_TEST_TRACE_CAPTURE", capture)
                 .output()?;
-            anyhow::ensure!(
-                output.status.success(),
-                "isolated trace contract failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
+                    anyhow::ensure!(
+                        output.status.success(),
+                        "isolated trace contract failed:\n{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                }
+            }
             return Ok(());
         }
 
@@ -4184,7 +4190,16 @@ mod tests {
         use tracing_futures::{Instrument, WithSubscriber};
         use tracing_subscriber::prelude::*;
 
-        let _otel_env = goose_test_support::otel::clear_otel_env(&[]);
+        let use_state_machine = std::env::var(CHILD_ENV)? == "state_machine";
+        let capture = if std::env::var("GOOSE_TEST_TRACE_CAPTURE")? == "true" {
+            "true"
+        } else {
+            "false"
+        };
+        let _otel_env = goose_test_support::otel::clear_otel_env(&[(
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+            capture,
+        )]);
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
@@ -4254,7 +4269,7 @@ mod tests {
                             max_turns: Some(1),
                             retry_config: None,
                         },
-                        false,
+                        use_state_machine,
                         None,
                     )
                     .await?;
@@ -4315,7 +4330,7 @@ mod tests {
                                 max_turns: Some(1),
                                 retry_config: None,
                             },
-                            false,
+                            use_state_machine,
                             None,
                         )
                         .await?;
@@ -4397,7 +4412,7 @@ mod tests {
         let child_generation = spans
             .iter()
             .find(|span| {
-                span.name == "stream_response_from_provider"
+                attribute(span, "gen_ai.operation.name").as_deref() == Some("chat")
                     && attribute(span, "gen_ai.conversation.id").as_deref()
                         == Some(child_id.as_str())
             })
@@ -4411,6 +4426,45 @@ mod tests {
             attribute(child_generation, "gen_ai.conversation.id").as_deref(),
             Some(child_id.as_str())
         );
+        let generations = spans
+            .iter()
+            .filter(|span| attribute(span, "gen_ai.operation.name").as_deref() == Some("chat"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generations.len(),
+            3,
+            "exactly one generation per model call"
+        );
+        for generation in generations {
+            assert_eq!(
+                attribute(generation, "gen_ai.usage.input_tokens").as_deref(),
+                Some("12")
+            );
+            assert_eq!(
+                attribute(generation, "gen_ai.usage.output_tokens").as_deref(),
+                Some("3")
+            );
+            assert_eq!(
+                attribute(generation, "gen_ai.usage.cache_read.input_tokens").as_deref(),
+                Some("4")
+            );
+            if capture == "true" {
+                let input: Value =
+                    serde_json::from_str(&attribute(generation, "gen_ai.input.messages").unwrap())?;
+                assert_eq!(input[0]["role"], "system");
+                assert!(!input[0]["parts"][0]["content"].as_str().unwrap().is_empty());
+                let output: Value = serde_json::from_str(
+                    &attribute(generation, "gen_ai.output.messages").unwrap(),
+                )?;
+                assert_eq!(
+                    output[0]["parts"][0]["content"],
+                    "output-super-secret-token"
+                );
+            } else {
+                assert!(attribute(generation, "gen_ai.input.messages").is_none());
+                assert!(attribute(generation, "gen_ai.output.messages").is_none());
+            }
+        }
         Ok(())
     }
 
@@ -4496,7 +4550,7 @@ mod tests {
         assert_eq!(arguments["action"], "list");
         let output: Value = serde_json::from_str(fields["output"].as_str().unwrap()).unwrap();
         assert_eq!(output["status"], "error");
-        assert!(!fields.contains_key("gen_ai.tool.call.result"));
+        assert!(fields.contains_key("gen_ai.tool.call.result"));
     }
 
     #[tokio::test]
@@ -4514,11 +4568,17 @@ mod tests {
             output = tracing::field::Empty,
             gen_ai.tool.call.result = tracing::field::Empty,
         );
+        let expected_span_id = span.id();
         let entered = span.enter();
         let result = agent.with_post_tool_hook(
-            ToolCallResult::from(Ok(CallToolResult::success(vec![ContentBlock::text(
-                "done",
-            )]))),
+            ToolCallResult {
+                result: Box::new(Box::pin(async move {
+                    assert_eq!(tracing::Span::current().id(), expected_span_id);
+                    Ok(CallToolResult::success(vec![ContentBlock::text("done")]))
+                })),
+                notification_stream: None,
+                action_required_stream: None,
+            },
             &tool_call,
             &session,
             "call-post-hook",
@@ -5622,7 +5682,15 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             _tools: &[Tool],
         ) -> Result<MessageStream, ProviderError> {
             let message = Message::assistant().with_text("output-super-secret-token");
-            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            let usage = ProviderUsage::new(
+                "mock-model".to_string(),
+                Usage {
+                    input_tokens: Some(12),
+                    output_tokens: Some(3),
+                    cache_read_input_tokens: Some(4),
+                    ..Usage::default()
+                },
+            );
             Ok(stream_from_single_message(message, usage))
         }
 

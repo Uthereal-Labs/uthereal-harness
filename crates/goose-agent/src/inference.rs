@@ -118,6 +118,9 @@ pub fn chat_span(
         "gen_ai.response.id" = tracing::field::Empty,
         "gen_ai.usage.input_tokens" = tracing::field::Empty,
         "gen_ai.usage.output_tokens" = tracing::field::Empty,
+        "gen_ai.usage.cache_read.input_tokens" = tracing::field::Empty,
+        "gen_ai.usage.cache_creation.input_tokens" = tracing::field::Empty,
+        "gen_ai.output.messages" = tracing::field::Empty,
         "goose.chat.purpose" = purpose,
         "error.type" = tracing::field::Empty,
         session.id = %telemetry_session_id,
@@ -271,6 +274,9 @@ fn inference_span(provider: &dyn Provider, model_config: &ModelConfig) -> tracin
         "gen_ai.response.id" = tracing::field::Empty,
         "gen_ai.usage.input_tokens" = tracing::field::Empty,
         "gen_ai.usage.output_tokens" = tracing::field::Empty,
+        "gen_ai.usage.cache_read.input_tokens" = tracing::field::Empty,
+        "gen_ai.usage.cache_creation.input_tokens" = tracing::field::Empty,
+        "gen_ai.output.messages" = tracing::field::Empty,
         "error.type" = tracing::field::Empty,
         session.id = tracing::field::Empty,
         goose.execution.session.id = tracing::field::Empty,
@@ -394,17 +400,16 @@ impl<S: Sync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> 
                 merge_consecutive_messages_for_request(fixed.messages().clone()),
             );
             if capture_message_content {
-                let mut input_messages = vec![serde_json::json!({
-                    "role": "system",
-                    "content": system_prompt,
-                })];
-                input_messages.extend(
-                    conversation_for_provider.messages().iter().map(|message| {
-                        serde_json::to_value(message).expect("message must serialize")
-                    }),
+                let input_messages = crate::telemetry::input_messages_with_system_json(
+                    &system_prompt,
+                    conversation_for_provider.messages(),
                 );
-                let input_messages = serde_json::Value::Array(input_messages).to_string();
-                tracing::Span::current().record("gen_ai.input.messages", input_messages.as_str());
+                let span = tracing::Span::current();
+                span.record("gen_ai.input.messages", input_messages.as_str());
+                span.record(
+                    "gen_ai.system_instructions",
+                    crate::telemetry::system_instructions_json(&system_prompt).as_str(),
+                );
             }
             let stream = self
                 .provider
@@ -440,6 +445,15 @@ impl<S: Sync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> 
             });
 
             let mut accumulator = Conversation::empty();
+            let mut output_message = None;
+            let record_output = |output: &Option<Message>| {
+                if let Some(message) = output {
+                    tracing::Span::current().record(
+                        "gen_ai.output.messages",
+                        crate::telemetry::output_message_json(message).as_str(),
+                    );
+                }
+            };
             let mut tool_request_ids = std::collections::HashSet::new();
             let mut provider_usage = None;
             let mut cancelled = false;
@@ -455,6 +469,7 @@ impl<S: Sync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> 
                         let (msg_opt, usage_opt) = match result {
                             Ok(chunk) => chunk,
                             Err(err) => {
+                                record_output(&output_message);
                                 if let Some(usage) = provider_usage {
                                     usage_effects.push(E::record_usage(usage));
                                 }
@@ -469,6 +484,9 @@ impl<S: Sync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> 
                             provider_usage = Some(usage);
                         }
                         if let Some(mut chunk) = msg_opt {
+                            if capture_message_content {
+                                crate::telemetry::append_message(&mut output_message, &chunk);
+                            }
                             if let Some(inference) = &inference {
                                 chunk = chunk.with_inference_if_assistant(inference.clone());
                             }
@@ -492,6 +510,8 @@ impl<S: Sync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> 
                     }
                 }
             }
+
+            record_output(&output_message);
 
             if let Some(usage) = provider_usage {
                 usage_effects.push(E::record_usage(usage));

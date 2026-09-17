@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-use crate::conversation::message::Message;
+use crate::conversation::message::{Message, MessageContent};
 
 use super::session_manager::role_to_string;
 use super::SessionManager;
@@ -57,6 +57,85 @@ impl MailboxMessage {
 }
 
 impl SessionManager {
+    /// A successful parent reply may already have consumed a completion through Summon's load tool.
+    /// Acknowledge it here rather than at tool execution, so failed replies retain their reports.
+    pub async fn acknowledge_loaded_task_completions(&self, session_id: &str) -> Result<()> {
+        let pending = self.pending_session_messages(session_id).await?;
+        if !pending
+            .iter()
+            .any(|message| message.kind == MailboxMessageKind::Completion)
+        {
+            return Ok(());
+        }
+        let session = self.get_session(session_id, true).await?;
+        let Some(conversation) = session.conversation else {
+            return Ok(());
+        };
+        let messages = conversation.messages();
+        let Some(reply_index) = messages.iter().rposition(|message| {
+            message.role == rmcp::model::Role::Assistant
+                && message.is_user_visible()
+                && !message.is_tool_call()
+                && !message.as_concat_text().trim().is_empty()
+        }) else {
+            return Ok(());
+        };
+        let mut loads = std::collections::HashMap::new();
+        let mut consumed = std::collections::HashSet::new();
+        for message in &messages[..reply_index] {
+            for content in &message.content {
+                match content {
+                    MessageContent::ToolRequest(request) => {
+                        if let Ok(call) = &request.tool_call {
+                            if matches!(call.name.as_ref(), "load" | "summon__load") {
+                                if let Some(source) = call
+                                    .arguments
+                                    .as_ref()
+                                    .and_then(|args| args.get("source"))
+                                    .and_then(|value| value.as_str())
+                                {
+                                    loads.insert(request.id.as_str(), source);
+                                }
+                            }
+                        }
+                    }
+                    MessageContent::ToolResponse(response) => {
+                        if let Ok(result) = &response.tool_result {
+                            if let Some(meta) = &result.meta {
+                                let child = meta
+                                    .0
+                                    .get("subagent_session_id")
+                                    .and_then(|value| value.as_str());
+                                let status =
+                                    meta.0.get("task_status").and_then(|value| value.as_str());
+                                if matches!(status, Some("completed" | "failed" | "panicked")) {
+                                    if let Some(child) = child.filter(|child| {
+                                        loads.get(response.id.as_str()) == Some(child)
+                                    }) {
+                                        consumed.insert(child);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let pool = self.storage().pool().await?;
+        for report in pending.iter().filter(|message| {
+            message.kind == MailboxMessageKind::Completion
+                && consumed.contains(message.sender_session_id.as_str())
+        }) {
+            sqlx::query("UPDATE session_mailbox SET delivered_at = CURRENT_TIMESTAMP WHERE id = ? AND recipient_session_id = ? AND delivered_at IS NULL")
+                .bind(report.id)
+                .bind(session_id)
+                .execute(pool)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn send_to_child(
         &self,
         parent_session_id: &str,
@@ -278,6 +357,87 @@ mod tests {
             .await
             .unwrap()
             .id
+    }
+
+    #[tokio::test]
+    async fn loaded_completions_are_acknowledged_only_after_a_visible_reply() {
+        use rmcp::model::{CallToolRequestParams, CallToolResult, MetaObject};
+        use serde_json::json;
+
+        let data_dir = TempDir::new().unwrap();
+        let manager = SessionManager::new(data_dir.path().to_path_buf());
+        let parent = create_session(&manager, "parent", SessionType::User).await;
+        let mut children = Vec::new();
+        for status in ["completed", "failed", "panicked", "running"] {
+            let child = create_session(&manager, status, SessionType::SubAgent).await;
+            manager
+                .update(&child)
+                .parent_session_id(Some(parent.clone()))
+                .apply()
+                .await
+                .unwrap();
+            manager
+                .enqueue_completion_to_parent(&child, "terminal report")
+                .await
+                .unwrap();
+            manager
+                .send_to_parent(&child, "separate update")
+                .await
+                .unwrap();
+            let request = Message::assistant().with_tool_request(
+                status,
+                Ok(CallToolRequestParams::new("summon__load")
+                    .with_arguments(json!({"source": child}).as_object().unwrap().clone())),
+            );
+            let response = Message::user().with_tool_response(
+                status,
+                Ok(CallToolResult::success(vec![]).with_meta(Some(MetaObject(
+                    json!({"subagent_session_id": child, "task_status": status})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )))),
+            );
+            manager.add_message(&parent, &request).await.unwrap();
+            manager.add_message(&parent, &response).await.unwrap();
+            children.push(child);
+        }
+        manager
+            .acknowledge_loaded_task_completions(&parent)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .pending_session_messages(&parent)
+                .await
+                .unwrap()
+                .len(),
+            8
+        );
+        manager
+            .add_message(
+                &parent,
+                &Message::assistant().with_text("Reviewed the completed results."),
+            )
+            .await
+            .unwrap();
+        manager
+            .acknowledge_loaded_task_completions(&parent)
+            .await
+            .unwrap();
+        let pending = manager.pending_session_messages(&parent).await.unwrap();
+        assert_eq!(pending.len(), 5);
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|message| message.kind == MailboxMessageKind::Completion)
+                .count(),
+            1
+        );
+        assert!(pending
+            .iter()
+            .any(|message| message.kind == MailboxMessageKind::Completion
+                && message.sender_session_id == children[3]));
     }
 
     #[tokio::test]

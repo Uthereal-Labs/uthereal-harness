@@ -45,7 +45,7 @@ fn warn_grpc_protocol_skipped_once() {
     });
 }
 
-/// Dedicated single-thread Tokio runtime for OTLP HTTP export.
+/// Dedicated worker runtime for OTLP HTTP export.
 ///
 /// `BatchSpanProcessor`, `BatchLogProcessor`, and `PeriodicReader` all
 /// spawn raw `std::thread`s with no Tokio reactor. The async reqwest HTTP
@@ -59,7 +59,11 @@ fn get_or_create_otel_rt() -> OtlpResult<Arc<tokio::runtime::Runtime>> {
     if let Some(rt) = guard.as_ref() {
         return Ok(Arc::clone(rt));
     }
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Keep pooled HTTP connection drivers alive between batch exports so remote
+    // keep-alive closures are observed before the next request reuses a socket.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("goose-otel")
         .enable_all()
         .build()?;
     let rt = Arc::new(rt);
@@ -195,7 +199,7 @@ impl ExporterType {
 /// (matching what `.with_http()` produces in this build).
 ///
 /// goose's `opentelemetry-otlp` build only enables the `http-proto` /
-/// `reqwest-blocking-client` transport features — not `grpc-tonic`. If the caller's
+/// `reqwest-client` transport features — not `grpc-tonic`. If the caller's
 /// environment sets `…_PROTOCOL=grpc`, the `.with_http()` exporter still
 /// builds successfully but its background batch / metric reader threads
 /// panic on the first export with
@@ -927,6 +931,33 @@ mod tests {
     /// that triggered the "no reactor running" panic: `BatchSpanProcessor`
     /// spawns a raw `std::thread`, and the async reqwest client inside the
     /// exporter calls `tokio::time::sleep`, which requires a reactor.
+    #[test]
+    fn otel_runtime_drives_connections_between_exports() {
+        use tokio::io::AsyncReadExt;
+        let _env = clear_otel_env(&[]);
+        let rt = get_or_create_otel_rt().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = rt
+            .block_on(tokio::net::TcpStream::connect(
+                listener.local_addr().unwrap(),
+            ))
+            .unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.spawn(async move {
+            let mut byte = [0];
+            let count = client.read(&mut byte).await.unwrap();
+            tx.send(count).unwrap();
+        });
+        drop(peer);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            0
+        );
+        drop(rt);
+        shutdown_otlp();
+    }
+
     #[test]
     fn test_otlp_layers_ok_without_tokio_context() {
         let _env = clear_otel_env(&[

@@ -19,6 +19,8 @@ activities:
   - Validate ACP thinking-effort discovery, forwarding, and provider switching
   - Validate opt-in ACP conversation workspace creation, reuse, and rejection of traversal or symlink paths
   - Validate GDK observability hook lifecycle events and payload opt-in
+  - Verify ACP returns after delegation, accepts steering of the same live task, and delivers an automatic main-agent completion
+  - Verify one Langfuse generation per provider call, tool input/output, parent-child traces, latency, cached tokens, and configured costs in both agent loops
   - Test error boundaries including nested delegation prevention
   - Generate comprehensive test report
 
@@ -27,7 +29,7 @@ parameters:
     input_type: string
     requirement: optional
     default: "all"
-    description: "Which test phases to run: all, basic, extensions, delegation, reasoning, acp-effort, advanced"
+    description: "Which test phases to run: all, basic, extensions, delegation, native-parity, reasoning, acp-effort, advanced"
 
   - key: test_depth
     input_type: string
@@ -363,6 +365,31 @@ prompt: |
   Each delegate runs independently but the tasks are sequentially dependent.
 
   Log results to: {{ workspace_dir }}/phase3_delegation.md
+  {% endif %}
+
+  {% if "native-parity" in test_phases %}
+  ## Native specialist steering
+
+  Run from examples/native-specialist so document-writer is discoverable.
+  Discover it with load(). Confirm loading its private instructions with
+  load(source: "document-writer") is rejected. Delegate a document-writing task
+  to this named specialist using prepared content: "Native task messages keep
+  the existing specialist working." Ask it to run sleep 5 before writing
+  {{ workspace_dir }}/steering.md with title ORIGINAL_TITLE.
+  Send guidance to that same task ID immediately: change the title to
+  REVISED_TITLE and include "Steering reached the original task."
+  Do not start a replacement task. Verify the saved artifact after its automatic
+  completion report, and record the task ID and pass/fail evidence.
+  Return control after sending guidance; do not poll or sleep in the parent.
+  The completion should produce one parent-authored result, without a duplicate
+  automatic report after an explicitly loaded terminal result.
+  Confirm the child has no delegate tool. Do not attempt recursive delegation.
+  The external ACP integration test verifies idle delivery and additional user
+  prompts; the CLI cannot simulate a second ACP user prompt itself.
+  Langfuse verification is external: check one generation per provider call,
+  tool input/output (including errors), the child under its delegate span,
+  common parent session ID, distinct execution IDs, latency, tokens and costs.
+  Do not mark external checks passed without inspecting their evidence.
   {% endif %}
 
   {% if test_phases == "all" or "vision" in test_phases %}

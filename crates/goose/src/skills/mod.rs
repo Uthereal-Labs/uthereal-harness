@@ -196,11 +196,13 @@ pub fn skill_argument_names(skill: &SourceEntry) -> Vec<String> {
 }
 
 pub fn is_delegate_only_skill(skill: &SourceEntry) -> bool {
-    skill
-        .properties
-        .get("delegate_only")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    ["delegate_only", "delegate-only"].iter().any(|key| {
+        skill
+            .properties
+            .get(*key)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
 }
 
 pub fn is_skill_visible_to_session(skill: &SourceEntry, session_type: SessionType) -> bool {
@@ -740,12 +742,15 @@ mod tests {
 
     #[test]
     fn delegate_only_skill_uses_metadata_flag() {
-        let mut skill = skill_with_content("Private instructions.");
-        skill
-            .properties
-            .insert("delegate_only".to_string(), Value::Bool(true));
-
-        assert!(is_delegate_only_skill(&skill));
+        for key in ["delegate-only", "delegate_only"] {
+            let skill = parse_skill_content(
+                &format!("---\nname: private\ndescription: Private\nmetadata:\n  {key}: true\n---\nPrivate instructions."),
+                std::path::Path::new("private/SKILL.md"), false, true,
+            ).unwrap();
+            assert!(is_delegate_only_skill(&skill));
+            assert!(!is_skill_visible_to_session(&skill, SessionType::User));
+            assert!(is_skill_visible_to_session(&skill, SessionType::SubAgent));
+        }
     }
 
     fn builtin_goose_doc_guide_skill() -> SourceEntry {

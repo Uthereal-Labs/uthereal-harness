@@ -50,7 +50,26 @@ impl AcpServer {
 
     pub async fn shutdown_active_runs(&self) -> Vec<anyhow::Error> {
         self.session_admission_fence.lock().await.shutting_down = true;
-        crate::acp::server::shutdown_active_runs(&self.active_prompt_runs).await
+        let mut errors = crate::acp::server::shutdown_active_runs(&self.active_prompt_runs).await;
+        let agents = self
+            .session_admission_fence
+            .lock()
+            .await
+            .loaded_agents
+            .iter()
+            .flat_map(|(id, agents)| {
+                agents
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade)
+                    .map(|agent| (id.clone(), agent))
+            })
+            .collect::<Vec<_>>();
+        for (id, agent) in agents {
+            if let Err(error) = agent.shutdown_session(&id).await {
+                errors.push(error);
+            }
+        }
+        errors
     }
 
     async fn scheduler(&self) -> Result<Option<Arc<dyn SchedulerTrait>>> {

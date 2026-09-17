@@ -498,6 +498,10 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
         return String::new();
     };
 
+    if session.session_type == SessionType::SubAgent {
+        return "Own the delegated task within your specialist scope. Apply parent guidance at the next checkpoint. Use message_parent(message: ...) for a question, blocker, or important update; only the main agent communicates with the user. This is asynchronous: continue independent work while awaiting guidance. Your final result is delivered automatically, so do not duplicate it with message_parent. Do not delegate further.".to_string();
+    }
+
     // filter the sources down to what we want even though currently that is what we get
     let mut sources: Vec<SourceEntry> = discover_filesystem_sources(&session.working_dir)
         .into_iter()
@@ -534,10 +538,6 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
         }
     }
 
-    if sources.is_empty() {
-        return String::new();
-    }
-
     sources.sort_by(|a, b| (&a.source_type, &a.name).cmp(&(&b.source_type, &b.name)));
     let subagents: Vec<&SourceEntry> = sources.iter().collect();
 
@@ -547,11 +547,8 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
         .collect::<Vec<_>>()
         .join(", ");
 
-    let mut out = String::new();
-    out.push_str(
-        "\n\nThe following named subagents are available in this session and \
-         can be invoked through the `delegate` tool (run as a subagent) or \
-         the `load` tool (read their instructions into your own context):\n",
+    let mut out = String::from(
+        "Route each part of the request by the available named specialists' scope, including each requested deliverable in a compound task. Delegate specialist-owned work; complete work without a matching specialist yourself. When a requested deliverable matches a specialist, hand it off even if you could produce an inline answer yourself. For a specialist-owned deliverable with ready inputs, delegate directly; after completing prerequisites, delegate the remaining deliverable before declaring the request complete. A skill alone is not a reason to invent an ad-hoc delegate. Complete prerequisites before handing off dependent work: for research followed by document creation, prepare verified content and citations before delegating document operations. Pass the completed content or a local artifact, not a bare URL list or unfinished research. Keep the specialist's domain tools and private instructions in its child session.\n\nAvailable specialists are isolated execution targets; invoke them with delegate, never load their instructions into your own context:\n",
     );
 
     let mut current_kind: Option<SourceType> = None;
@@ -574,13 +571,13 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
          context whether they want it invoked, and if so, call it.\n\
          • The user's request strongly matches a subagent's description — \
          call it.\n\n\
-         Calling a subagent normally means `delegate(source: \"<name>\", \
-         instructions: ...)`, which runs it as an isolated subagent and \
-         returns its result. Use `load(source: \"<name>\")` instead if you \
-         only want to read the subagent's instructions into your own \
-         context. For long-running work, pass `async: true` to `delegate` — \
-         it returns a task id immediately, and you collect the result later \
-         with `load(source: \"<task_id>\")`, which waits for completion.",
+         Call delegate(source: \"<name>\", instructions: ...) with the complete handoff. \
+         Specialists marked always_async or non_blocking run in the background: return control \
+         after delegation without waiting, polling, or sleeping. Briefly tell the user which specialist owns the work. Use the returned task ID for send(task_id: ..., message: ...) \
+         to steer the existing task instead of starting a replacement. Use load(source: task_id, peek: true) \
+         for requested status. Questions and terminal reports arrive automatically as internal evidence. \
+         Review reports against the latest user instructions, verify requested artifacts, and author \
+         the user-facing response yourself. Never claim success when a specialist reports failure.",
     ));
 
     out
@@ -1226,6 +1223,7 @@ impl SummonClient {
                 let turns = Arc::clone(&task.turns);
                 let last_activity = Arc::clone(&task.last_activity);
                 let description = task.description.clone();
+                let non_blocking = task.non_blocking;
                 let notification_sink = Arc::clone(&task.notification_sink);
 
                 drop(running);
@@ -1252,6 +1250,10 @@ impl SummonClient {
 
                 if buffered_count == 0 && last_activity_at == 0 {
                     output.push_str("\n\n_Task is initialising (no tool activity yet)._");
+                }
+
+                if non_blocking {
+                    output.push_str("\n\nCompletion arrives automatically. Do not poll or sleep; finish your reply when no independent work remains. Use send to steer this task.");
                 }
 
                 return Ok(TaskLoadResult {
@@ -1458,13 +1460,7 @@ impl SummonClient {
 
         match source {
             Some(mut source) => {
-                if source.source_type == SourceType::Agent
-                    && source
-                        .properties
-                        .get("delegate_only")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-                {
+                if source.source_type == SourceType::Agent {
                     return Err(format!(
                         "Agent '{}' is delegate-only and cannot be loaded as context",
                         source.name
@@ -1915,24 +1911,19 @@ impl SummonClient {
 
         if required_extensions.is_empty() {
             if let Some(filter) = &params.extensions {
-                if filter.is_empty() {
-                    extensions = Vec::new();
-                } else {
-                    let available_names: Vec<String> =
-                        extensions.iter().map(|ext| ext.name()).collect();
-                    extensions.retain(|ext| filter.contains(&ext.name()));
-                    let unmatched: Vec<&str> = filter
-                        .iter()
-                        .filter(|name| !available_names.iter().any(|n| n == *name))
-                        .map(String::as_str)
-                        .collect();
-                    if !unmatched.is_empty() {
-                        warn!(
-                            "Delegate requested extensions not available in session: {:?}. Available: {:?}",
-                            unmatched, available_names
-                        );
-                    }
-                }
+                extensions = filter
+                    .iter()
+                    .map(|name| {
+                        extensions
+                            .iter()
+                            .find(|extension| extension.name() == *name)
+                            .cloned()
+                            .or_else(|| crate::config::get_extension_by_name(name))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Requested extension '{}' is not configured", name)
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
             }
         }
 
@@ -2450,7 +2441,7 @@ impl SummonClient {
 
         let retrieval = if non_blocking {
             format!(
-                "It will report back automatically. load(source: \"{task_id}\") returns current status without waiting."
+                "It will report back automatically. Do not poll or sleep; finish your reply when no independent work remains. Use load(source: \"{task_id}\", peek: true) only for requested status."
             )
         } else {
             format!(
@@ -2705,19 +2696,18 @@ impl McpClientTrait for SummonClient {
                 "failed"
             };
             lines.push(format!(
-                "• {}: \"{}\" - {} in {} ({} turns) - use load(\"{}\") to get result",
+                "• {}: \"{}\" - {} in {} ({} turns) - completion is reported automatically",
                 task.id,
                 task.description,
                 status,
                 round_duration(task.duration),
                 task.turns_taken,
-                task.id
             ));
         }
 
         if !running.is_empty() {
             lines.push(
-                "\n→ Use load(source: \"<id>\") to wait for a task, or load(source: \"<id>\", cancel: true) to stop it"
+                "\n→ Reports arrive automatically. Do not poll or sleep; finish your reply when no independent work remains. Use send to steer an existing task, load(source: \"<id>\", peek: true) for requested status, or load(source: \"<id>\", cancel: true) to stop it"
                     .to_string(),
             );
         }
@@ -3185,15 +3175,12 @@ You review code."#;
         .unwrap();
 
         let client = SummonClient::new(create_test_context()).unwrap();
-        let result = client
+        let error = client
             .handle_load_source("test", "reviewer", temp_dir.path())
             .await
-            .unwrap();
+            .unwrap_err();
 
-        let text = &result[0].as_text().expect("expected text content").text;
-        assert!(text.contains("reviewer"));
-        assert!(text.contains("You review code carefully"));
-        assert!(text.contains("now available in your context"));
+        assert!(error.contains("delegate-only"));
     }
 
     #[tokio::test]
@@ -4339,8 +4326,8 @@ You review code."#;
         let moim = client.get_moim("test").await.unwrap();
         assert!(moim.contains("20260204_2"));
         assert!(moim.contains("20260204_3"));
-        assert!(moim.contains(r#"use load("20260204_2") to get result"#));
-        assert!(moim.contains(r#"use load("20260204_3") to get result"#));
+        assert!(moim.contains("completion is reported automatically"));
+        assert!(!moim.contains("to get result"));
 
         let discovery = client
             .handle_load_discovery("test", temp_dir.path())
@@ -5022,6 +5009,10 @@ You review code."#;
         .expect("non-blocking load should return immediately")
         .unwrap();
         assert_eq!(result.status, "running");
+        assert!(extract_text(&result.content[0]).contains("Do not poll or sleep"));
+        let moim = client.get_moim("test").await.unwrap();
+        assert!(moim.contains("Do not poll or sleep"));
+        assert!(!moim.contains("to wait for a task"));
         assert!(client.background_tasks.lock().await.contains_key(task_id));
     }
 

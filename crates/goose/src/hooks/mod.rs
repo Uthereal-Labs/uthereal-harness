@@ -492,7 +492,7 @@ impl HookManager {
             "goose.hook.event" = %event,
             "goose.hook.plugin" = %rule.plugin_name,
             "error.type" = tracing::field::Empty,
-            session.id = %session_id,
+            session.id = %crate::session_context::telemetry_session_id(session_id),
         );
         let result = run_command_hook(
             command,
