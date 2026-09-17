@@ -13,8 +13,8 @@ use common_tests::fixtures::server::{
     assert_session_response_precedes_available_commands, AcpServerConnection,
 };
 use common_tests::fixtures::{
-    run_test, spawn_acp_server_in_process, Connection, OpenAiFixture, PermissionDecision, Session,
-    SessionData, TestConnectionConfig,
+    run_test, send_custom, spawn_acp_server_in_process, Connection, OpenAiFixture,
+    PermissionDecision, Session, SessionData, TestConnectionConfig,
 };
 #[cfg(feature = "code-mode")]
 use common_tests::run_prompt_codemode;
@@ -478,6 +478,156 @@ fn detached_delegation_accepts_steering_and_reports_completion() {
             2,
             "steering must not launch a replacement child"
         );
+    });
+}
+
+#[test]
+fn opted_in_prompt_waits_for_detached_child_and_its_report() {
+    run_test(async {
+        use std::sync::{atomic::Ordering, Arc};
+        for use_state_machine in [false, true] {
+            let provider = Arc::new(DetachedContractState::default());
+            let openai = OpenAiFixture::new(
+                vec![],
+                <AcpServerConnection as Connection>::expected_session_id(),
+            )
+            .await;
+            openai
+                .mount_responder(DetachedContractResponder(provider.clone()))
+                .await;
+            let mut conn = <AcpServerConnection as Connection>::new(
+                TestConnectionConfig {
+                    builtins: vec!["summon".to_string()],
+                    goose_mode: GooseMode::Auto,
+                    ..Default::default()
+                },
+                openai,
+            )
+            .await;
+            let SessionData { session, .. } = conn.new_session().await.unwrap();
+            let request = conn
+            .cx()
+            .send_request(
+                PromptRequest::new(
+                    session.session_id().clone(),
+                    vec![ContentBlock::Text(TextContent::new(
+                        "start detached contract",
+                    ))],
+                )
+                .meta(
+                    serde_json::json!({"goose": {"awaitBackgroundTasks": true, "unrolledAgentLoop": use_state_machine}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .block_task();
+            tokio::pin!(request);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(500), &mut request)
+                    .await
+                    .is_err(),
+                "opted-in prompt returned before the child finished"
+            );
+            let run_id = session
+                .session_updates()
+                .iter()
+                .find_map(|update| {
+                    let SessionUpdate::SessionInfoUpdate(info) = update else {
+                        return None;
+                    };
+                    info.meta
+                        .as_ref()?
+                        .get("goose")?
+                        .get("activeRunId")?
+                        .as_str()
+                        .map(ToString::to_string)
+                })
+                .expect("opted-in prompt keeps an active run for steering");
+            send_custom(
+                conn.cx(),
+                "_goose/unstable/session/steer",
+                serde_json::json!({
+                    "sessionId": session.session_id().0,
+                    "expectedRunId": run_id,
+                    "prompt": [{"type": "text", "text": "steer existing child"}],
+                }),
+            )
+            .await
+            .unwrap();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(10), &mut request)
+                .await
+                .expect("opted-in prompt must finish after its child")
+                .unwrap();
+            assert_eq!(response.stop_reason, StopReason::EndTurn);
+            assert_eq!(provider.child_calls.load(Ordering::SeqCst), 2);
+            assert!(provider.child_saw_guidance.load(Ordering::SeqCst));
+            let manager = SessionManager::new(conn.data_root());
+            assert!(manager
+                .pending_session_messages(&session.session_id().0)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    });
+}
+
+#[test]
+fn opted_in_prompt_cancellation_interrupts_background_wait() {
+    run_test(async {
+        use agent_client_protocol::schema::v1::CancelNotification;
+        use std::sync::Arc;
+        let provider = Arc::new(DetachedContractState::default());
+        let openai = OpenAiFixture::new(
+            vec![],
+            <AcpServerConnection as Connection>::expected_session_id(),
+        )
+        .await;
+        openai
+            .mount_responder(DetachedContractResponder(provider))
+            .await;
+        let mut conn = <AcpServerConnection as Connection>::new(
+            TestConnectionConfig {
+                builtins: vec!["summon".to_string()],
+                goose_mode: GooseMode::Auto,
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+        let SessionData { session, .. } = conn.new_session().await.unwrap();
+        let session_id = session.session_id().clone();
+        let request = conn
+            .cx()
+            .send_request(
+                PromptRequest::new(
+                    session_id.clone(),
+                    vec![ContentBlock::Text(TextContent::new(
+                        "start detached contract",
+                    ))],
+                )
+                .meta(
+                    serde_json::json!({"goose": {"awaitBackgroundTasks": true}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .block_task();
+        tokio::pin!(request);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut request)
+                .await
+                .is_err()
+        );
+        conn.cx()
+            .send_notification(CancelNotification::new(session_id))
+            .unwrap();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), &mut request)
+            .await
+            .expect("cancellation must release the opted-in prompt")
+            .unwrap();
+        assert_eq!(response.stop_reason, StopReason::Cancelled);
     });
 }
 

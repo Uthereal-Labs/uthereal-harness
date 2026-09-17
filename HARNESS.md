@@ -210,6 +210,12 @@ connection. Only one main-agent run owns a session at a time, including across
 ACP connections. Failed automatic report delivery pauses until another user
 prompt or session reload; pending reports are preserved.
 
+Clients that close the session after each prompt can set
+`_meta.goose.awaitBackgroundTasks: true` on `session/prompt`. The active run then
+waits for delegated tasks to finish and handles their reports before returning,
+so the client may close the session after the response. The default remains
+asynchronous, and cancellation stops the prompt and its children.
+
 Cancellation, session closure, and server shutdown stop child tasks, including
 while main is idle. Deleting a session waits for its active prompt to leave the
 run registry before deleting history. Clients must not close the session or
