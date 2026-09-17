@@ -3283,6 +3283,36 @@ pub async fn run(builtins: Vec<String>, enable_scheduler: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "otel")]
+    #[test]
+    fn prompt_trace_context_accepts_only_valid_w3c_parent() {
+        use opentelemetry::trace::TraceContextExt;
+
+        let valid = serde_json::Map::from_iter([
+            (
+                "traceparent".to_string(),
+                serde_json::json!("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"),
+            ),
+            ("tracestate".to_string(), serde_json::json!("vendor=value")),
+        ]);
+        let parent = super::prompt_trace_context(Some(&valid)).expect("valid W3C parent");
+        let context = parent.span();
+        assert_eq!(
+            context.span_context().trace_id().to_string(),
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            context.span_context().span_id().to_string(),
+            "0123456789abcdef"
+        );
+        assert!(super::prompt_trace_context(None).is_none());
+        let invalid =
+            serde_json::Map::from_iter([("traceparent".to_string(), serde_json::json!("invalid"))]);
+        assert!(super::prompt_trace_context(Some(&invalid)).is_none());
+        let _ambient = parent.attach();
+        assert!(super::prompt_trace_context(Some(&invalid)).is_none());
+    }
+
     use super::*;
     use crate::session::session_manager::SessionType;
     use agent_client_protocol::schema::v1::{
