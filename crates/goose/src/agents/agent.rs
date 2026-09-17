@@ -82,6 +82,15 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+tokio::task_local! {
+    static ACP_REMOTE_PROMPT_PARENT: bool;
+}
+
+#[cfg(feature = "otel")]
+pub(crate) async fn with_acp_remote_prompt_parent<F: std::future::Future>(future: F) -> F::Output {
+    ACP_REMOTE_PROMPT_PARENT.scope(true, future).await
+}
+
 const DEFAULT_MAX_TURNS: u32 = 1000;
 const DEFAULT_STOP_HOOK_BLOCK_CAP: u32 = 8;
 const COMPACTION_PROGRESS_TEXT: &str = "goose is compacting the conversation...";
@@ -2113,7 +2122,12 @@ impl Agent {
             .as_deref()
             .unwrap_or(&execution_session_id);
         let current_span = tracing::Span::current();
-        let parent_span = if self.config.is_subagent && current_span.id().is_some() {
+        let parent_span = if (self.config.is_subagent
+            || ACP_REMOTE_PROMPT_PARENT
+                .try_with(|active| *active)
+                .unwrap_or(false))
+            && current_span.id().is_some()
+        {
             current_span
         } else {
             self.session_trace_root(telemetry_session_id)
@@ -4045,6 +4059,23 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn acp_remote_prompt_parent_is_scoped_to_one_future() {
+        assert!(super::ACP_REMOTE_PROMPT_PARENT
+            .try_with(|active| *active)
+            .is_err());
+        super::with_acp_remote_prompt_parent(async {
+            assert!(super::ACP_REMOTE_PROMPT_PARENT
+                .try_with(|active| *active)
+                .unwrap());
+        })
+        .await;
+        assert!(super::ACP_REMOTE_PROMPT_PARENT
+            .try_with(|active| *active)
+            .is_err());
+    }
+
     use super::*;
     use crate::agents::gen_ai_telemetry::{self, test_support::SpanFieldCapture};
     use crate::plugins::discovery::{DiscoveredPlugin, PluginScope};
@@ -4153,6 +4184,108 @@ mod tests {
             .await
             .unwrap();
         (agent, session, data_dir)
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn acp_prompt_reply_inherits_incoming_trace() -> Result<()> {
+        use opentelemetry::propagation::TextMapPropagator as _;
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_futures::{Instrument, WithSubscriber};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        use tracing_subscriber::prelude::*;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let parent = TraceContextPropagator::new().extract(&std::collections::HashMap::from([(
+            "traceparent".to_string(),
+            "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_string(),
+        )]));
+        for use_state_machine in [false, true] {
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_opentelemetry::layer().with_tracer(provider.tracer("acp-parent-test")),
+            );
+            async {
+                let temp_dir = tempfile::tempdir()?;
+                let path = temp_dir.path().join("data");
+                let manager = Arc::new(SessionManager::new(path.clone()));
+                let agent = Agent::with_config(AgentConfig::new(
+                    Arc::clone(&manager),
+                    Arc::new(PermissionManager::new(path)),
+                    None,
+                    GooseMode::Auto,
+                    true,
+                    GoosePlatform::GooseCli,
+                ));
+                let session = manager
+                    .create_session(
+                        PathBuf::default(),
+                        "acp-parent".to_string(),
+                        SessionType::User,
+                        GooseMode::Auto,
+                    )
+                    .await?;
+                agent
+                    .update_provider(
+                        Arc::new(TraceContentProvider),
+                        goose_providers::model::ModelConfig::new("mock-model"),
+                        &session.id,
+                    )
+                    .await?;
+                let acp_span = tracing::info_span!("acp_prompt");
+                acp_span.set_parent(parent.clone())?;
+                super::with_acp_remote_prompt_parent(
+                    async {
+                        let stream = agent
+                            .reply(
+                                Message::user().with_text("hello"),
+                                SessionConfig {
+                                    id: session.id,
+                                    schedule_id: None,
+                                    max_turns: Some(1),
+                                    retry_config: None,
+                                },
+                                use_state_machine,
+                                None,
+                            )
+                            .await?;
+                        tokio::pin!(stream);
+                        while let Some(event) = stream.next().await {
+                            event?;
+                        }
+                        Result::<()>::Ok(())
+                    }
+                    .instrument(acp_span),
+                )
+                .await
+            }
+            .with_subscriber(subscriber)
+            .await?;
+        }
+        provider.force_flush()?;
+        let spans = exporter.get_finished_spans()?;
+        let replies: Vec<_> = spans.iter().filter(|span| span.name == "reply").collect();
+        assert_eq!(replies.len(), 2);
+        for reply in replies {
+            assert_eq!(
+                reply.span_context.trace_id().to_string(),
+                "0123456789abcdef0123456789abcdef"
+            );
+            let acp = spans
+                .iter()
+                .find(|span| {
+                    span.name == "acp_prompt"
+                        && span.span_context.trace_id() == reply.span_context.trace_id()
+                        && span.span_context.span_id() == reply.parent_span_id
+                })
+                .expect("reply follows ACP prompt");
+            assert_eq!(acp.parent_span_id.to_string(), "0123456789abcdef");
+        }
+        Ok(())
     }
 
     #[cfg(feature = "otel")]
