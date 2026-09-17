@@ -1,6 +1,8 @@
+use base64::Engine as _;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_appender_tracing::layer::{OpenTelemetryTracingBridge, TracingSpanAttributes};
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::{SdkMeterProvider, Temporality};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -78,6 +80,108 @@ fn get_or_create_otel_rt() -> OtlpResult<Arc<tokio::runtime::Runtime>> {
 struct TokioSpanExporter {
     inner: opentelemetry_otlp::SpanExporter,
     rt: Arc<tokio::runtime::Runtime>,
+}
+
+/// Force Langfuse authentication after the OTLP builder has merged shared OTEL headers.
+struct LangfuseHttpClient {
+    inner: reqwest::Client,
+    authorization: reqwest::header::HeaderValue,
+}
+
+impl std::fmt::Debug for LangfuseHttpClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LangfuseHttpClient")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct LangfuseSpanExporter {
+    inner: TokioSpanExporter,
+    environment: Option<String>,
+}
+
+impl opentelemetry_sdk::trace::SpanExporter for LangfuseSpanExporter {
+    async fn export(
+        &self,
+        mut batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        if let Some(environment) = &self.environment {
+            for span in &mut batch {
+                span.attributes
+                    .push(KeyValue::new("langfuse.environment", environment.clone()));
+            }
+        }
+        self.inner.export(batch).await
+    }
+
+    fn shutdown_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
+}
+
+#[async_trait::async_trait]
+impl opentelemetry_http::HttpClient for LangfuseHttpClient {
+    async fn send_bytes(
+        &self,
+        mut request: opentelemetry_http::Request<opentelemetry_http::Bytes>,
+    ) -> Result<
+        opentelemetry_http::Response<opentelemetry_http::Bytes>,
+        opentelemetry_http::HttpError,
+    > {
+        request
+            .headers_mut()
+            .insert(reqwest::header::AUTHORIZATION, self.authorization.clone());
+        opentelemetry_http::HttpClient::send_bytes(&self.inner, request).await
+    }
+}
+
+pub fn langfuse_otlp_enabled() -> bool {
+    env::var("GOOSE_LANGFUSE_OTLP").as_deref() == Ok("1")
+}
+
+fn langfuse_span_exporter(rt: Arc<tokio::runtime::Runtime>) -> OtlpResult<LangfuseSpanExporter> {
+    let base = env::var("LANGFUSE_BASE_URL")?;
+    let public = env::var("LANGFUSE_PUBLIC_KEY")?;
+    let secret = env::var("LANGFUSE_SECRET_KEY")?;
+    let endpoint = url::Url::parse(&format!("{}/", base.trim_end_matches('/')))?
+        .join("api/public/otel/v1/traces")?;
+    if !matches!(endpoint.scheme(), "https" | "http") {
+        return Err("Langfuse OTLP endpoint must be HTTP(S)".into());
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{public}:{secret}"));
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Basic {encoded}"))?;
+    authorization.set_sensitive(true);
+    let client = LangfuseHttpClient {
+        inner: reqwest::Client::new(),
+        authorization,
+    };
+    let inner = TokioSpanExporter {
+        inner: opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint.to_string())
+            .with_http_client(client)
+            .build()?,
+        rt,
+    };
+    Ok(LangfuseSpanExporter {
+        inner,
+        environment: env::var("LANGFUSE_TRACING_ENVIRONMENT")
+            .ok()
+            .filter(|value| !value.is_empty()),
+    })
 }
 
 impl opentelemetry_sdk::trace::SpanExporter for TokioSpanExporter {
@@ -342,12 +446,18 @@ fn create_otlp_tracing_layer() -> OtlpResult<OtlpTracingLayer> {
                 inner: opentelemetry_otlp::SpanExporter::builder()
                     .with_http()
                     .build()?,
-                rt,
+                rt: Arc::clone(&rt),
             };
-            SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
-                .with_resource(resource)
-                .build()
+            let mut provider = SdkTracerProvider::builder().with_batch_exporter(exporter);
+            if langfuse_otlp_enabled() {
+                match langfuse_span_exporter(rt) {
+                    Ok(langfuse) => provider = provider.with_batch_exporter(langfuse),
+                    Err(error) => {
+                        eprintln!("goose otel: Langfuse trace exporter unavailable: {error}")
+                    }
+                }
+            }
+            provider.with_resource(resource).build()
         }
         ExporterType::Console => {
             let exporter = opentelemetry_stdout::SpanExporter::default();
@@ -651,6 +761,107 @@ mod tests {
     use test_case::test_case;
     use tracing::{Event, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn langfuse_and_primary_receive_the_same_span_with_separate_auth() {
+        use opentelemetry::trace::{
+            Span as _, SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState,
+            Tracer as _,
+        };
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use prost::Message as _;
+        use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+
+        let primary = MockServer::start().await;
+        let langfuse = MockServer::start().await;
+        Mock::given(path("/v1/traces"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&primary)
+            .await;
+        Mock::given(path("/api/public/otel/v1/traces"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&langfuse)
+            .await;
+        let langfuse_uri = langfuse.uri();
+        let _guard = env_lock::lock_env([
+            ("LANGFUSE_BASE_URL", Some(langfuse_uri.as_str())),
+            ("LANGFUSE_PUBLIC_KEY", Some("public")),
+            ("LANGFUSE_SECRET_KEY", Some("secret")),
+            ("LANGFUSE_TRACING_ENVIRONMENT", Some("staging")),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+                Some("Authorization=Bearer%20wrong"),
+            ),
+        ]);
+        let rt = get_or_create_otel_rt().unwrap();
+        let primary_exporter = TokioSpanExporter {
+            inner: opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(format!("{}/v1/traces", primary.uri()))
+                .build()
+                .unwrap(),
+            rt: Arc::clone(&rt),
+        };
+        let langfuse_exporter = langfuse_span_exporter(rt).unwrap();
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(primary_exporter)
+            .with_batch_exporter(langfuse_exporter)
+            .build();
+        let parent = opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from_hex("0123456789abcdef0123456789abcdef").unwrap(),
+            SpanId::from_hex("0123456789abcdef").unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        ));
+        let mut span = provider
+            .tracer("test")
+            .start_with_context("native_child", &parent);
+        span.end();
+        tokio::task::spawn_blocking(move || provider.force_flush())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let sig_requests = primary.received_requests().await.unwrap();
+        let lf_requests = langfuse.received_requests().await.unwrap();
+        assert_eq!(sig_requests.len(), 1);
+        assert_eq!(lf_requests.len(), 1);
+        let primary_batch =
+            ExportTraceServiceRequest::decode(sig_requests[0].body.as_slice()).unwrap();
+        let langfuse_batch =
+            ExportTraceServiceRequest::decode(lf_requests[0].body.as_slice()).unwrap();
+        let primary_span = &primary_batch.resource_spans[0].scope_spans[0].spans[0];
+        let langfuse_span = &langfuse_batch.resource_spans[0].scope_spans[0].spans[0];
+        assert_eq!(primary_span.trace_id, langfuse_span.trace_id);
+        assert_eq!(primary_span.span_id, langfuse_span.span_id);
+        assert_eq!(primary_span.parent_span_id, langfuse_span.parent_span_id);
+        assert_eq!(
+            primary_span.trace_id,
+            TraceId::from_hex("0123456789abcdef0123456789abcdef")
+                .unwrap()
+                .to_bytes()
+        );
+        assert_eq!(
+            primary_span.parent_span_id,
+            SpanId::from_hex("0123456789abcdef").unwrap().to_bytes()
+        );
+        assert!(!primary_span
+            .attributes
+            .iter()
+            .any(|attribute| attribute.key == "langfuse.environment"));
+        assert!(langfuse_span.attributes.iter().any(|attribute| attribute.key == "langfuse.environment"
+            && attribute.value.as_ref().and_then(|value| value.value.as_ref()).is_some_and(|value| matches!(value, opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(environment) if environment == "staging"))));
+        assert_eq!(
+            lf_requests[0]
+                .headers
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Basic cHVibGljOnNlY3JldA=="
+        );
+    }
 
     #[derive(Clone)]
     struct EventCounter(Arc<AtomicUsize>);
