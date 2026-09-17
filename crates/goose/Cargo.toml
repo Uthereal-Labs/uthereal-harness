@@ -18,6 +18,7 @@ otel = [
     "dep:opentelemetry-appender-tracing",
     "dep:opentelemetry-otlp",
     "dep:opentelemetry-stdout",
+    "dep:opentelemetry-http",
 ]
 code-mode = ["dep:pctx_code_mode"]
 local-inference = [
@@ -234,6 +235,7 @@ icu_locale = { version = "=2.1.1", default-features = false }
 image = { version = "0.24.9", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 subtle = { version = "2.5", default-features = false, features = ["std"] }
 gethostname = "1.1.0"
+opentelemetry-http = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { workspace = true, features = ["accctrl", "aclapi", "fileapi", "handleapi", "minwinbase", "sddl", "securitybaseapi", "winbase", "winerror"] }
@@ -264,6 +266,8 @@ test-case = { workspace = true }
 env-lock = { workspace = true }
 rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
+prost = "0.14"
 goose-test-support = { path = "../goose-test-support", default-features = false }
 bytes = { workspace = true }
 http = { workspace = true }

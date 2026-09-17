@@ -1598,6 +1598,8 @@ impl SummonClient {
             .await?;
 
         let subagent_session_id = subagent_session.id.clone();
+        let telemetry_session_id =
+            crate::session_context::telemetry_session_id(&task_config.parent_session_id);
 
         let params = SubagentRunParams {
             config: agent_config,
@@ -1609,6 +1611,7 @@ impl SummonClient {
             on_message: None,
             notification_tx: None,
             parent_span: tracing::Span::current(),
+            telemetry_session_id,
         };
         let result = Self::run_subagent_with_notifications(
             Self::notification_sink(notification_emitter),
@@ -2361,6 +2364,8 @@ impl SummonClient {
         let task_token_clone = task_token.clone();
         let completion_cancellation_token = task_token.clone();
         let parent_span = tracing::Span::current();
+        let telemetry_session_id =
+            crate::session_context::telemetry_session_id(&task_config.parent_session_id);
 
         let notification_sink = Self::notification_sink(None);
         let task_notification_sink = Arc::clone(&notification_sink);
@@ -2377,6 +2382,7 @@ impl SummonClient {
                 on_message: Some(on_message),
                 notification_tx: None,
                 parent_span,
+                telemetry_session_id,
             };
             let result = std::panic::AssertUnwindSafe(Self::run_subagent_with_notifications(
                 task_notification_sink,

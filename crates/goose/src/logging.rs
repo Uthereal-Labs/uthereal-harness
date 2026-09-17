@@ -99,8 +99,14 @@ pub fn build_logging_subscriber(
         crate::config::Config::global(),
     ));
 
-    if let Some(langfuse) = crate::tracing::langfuse_layer::create_langfuse_observer() {
-        layers.push(langfuse.with_filter(LevelFilter::DEBUG).boxed());
+    #[cfg(feature = "otel")]
+    let legacy_langfuse_enabled = !crate::otel::otlp::langfuse_otlp_enabled();
+    #[cfg(not(feature = "otel"))]
+    let legacy_langfuse_enabled = true;
+    if legacy_langfuse_enabled {
+        if let Some(langfuse) = crate::tracing::langfuse_layer::create_langfuse_observer() {
+            layers.push(langfuse.with_filter(LevelFilter::DEBUG).boxed());
+        }
     }
 
     Ok(Registry::default().with(layers))

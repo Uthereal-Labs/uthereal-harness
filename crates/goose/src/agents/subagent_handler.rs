@@ -42,11 +42,12 @@ pub struct SubagentRunParams {
     pub on_message: Option<OnMessageCallback>,
     pub notification_tx: Option<tokio::sync::mpsc::UnboundedSender<ServerNotification>>,
     pub parent_span: tracing::Span,
+    pub telemetry_session_id: String,
 }
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyhow::Error> {
     let return_last_only = params.return_last_only;
-    let telemetry_session_id = params.task_config.parent_session_id.clone();
+    let telemetry_session_id = params.telemetry_session_id.clone();
     let parent_span = params.parent_span.clone();
     let execution = get_agent_messages(params).instrument(parent_span);
     let (messages, final_output) =
