@@ -1121,6 +1121,33 @@ fn inject_session_context_into_extensions(
         );
     }
 
+    meta_map.retain(|key, _| {
+        !key.eq_ignore_ascii_case("traceparent") && !key.eq_ignore_ascii_case("tracestate")
+    });
+    #[cfg(feature = "otel")]
+    {
+        use opentelemetry::trace::TraceContextExt;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let context = tracing::Span::current().context();
+        let span = context.span();
+        let parent = span.span_context();
+        if parent.is_valid() {
+            meta_map.insert(
+                "traceparent".to_string(),
+                Value::String(format!(
+                    "00-{}-{}-{:02x}",
+                    parent.trace_id(),
+                    parent.span_id(),
+                    parent.trace_flags().to_u8(),
+                )),
+            );
+            let state = parent.trace_state().header();
+            if !state.is_empty() {
+                meta_map.insert("tracestate".to_string(), Value::String(state));
+            }
+        }
+    }
+
     extensions.insert(MetaObject(meta_map));
     extensions
 }
@@ -1193,6 +1220,61 @@ fn inject_session_context_into_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn mcp_metadata_propagates_the_current_span_and_removes_stale_context() {
+        use opentelemetry::trace::{TraceContextExt, TracerProvider};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        use tracing_subscriber::prelude::*;
+
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(InMemorySpanExporter::default())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("mcp-test")));
+        let extensions = tracing::subscriber::with_default(subscriber, || {
+            let parent = tracing::info_span!("tool");
+            let _entered = parent.enter();
+            let context = parent.context();
+            let span = context.span();
+            let span_context = span.span_context();
+            let mut extensions = Extensions::new();
+            extensions.insert(MetaObject(
+                serde_json::from_value(serde_json::json!({
+                    "traceparent": "stale", "tracestate": "old=value", "custom": "kept",
+                }))
+                .unwrap(),
+            ));
+            let injected = inject_session_context_into_extensions(
+                extensions,
+                Some("session"),
+                None,
+                Some("call"),
+            );
+            let meta = &injected.get::<MetaObject>().unwrap().0;
+            assert_eq!(
+                meta["traceparent"],
+                format!(
+                    "00-{}-{}-{:02x}",
+                    span_context.trace_id(),
+                    span_context.span_id(),
+                    span_context.trace_flags().to_u8()
+                )
+            );
+            assert!(!meta.contains_key("tracestate"));
+            assert_eq!(meta["custom"], "kept");
+            injected
+        });
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            let injected =
+                inject_session_context_into_extensions(extensions, Some("session"), None, None);
+            let meta = &injected.get::<MetaObject>().unwrap().0;
+            assert!(!meta.contains_key("traceparent"));
+            assert!(!meta.contains_key("tracestate"));
+        });
+    }
 
     #[test]
     fn sampling_text_preserves_text_first_provider_responses() {

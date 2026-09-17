@@ -293,6 +293,16 @@ impl OpenAiFixture {
         }
     }
 
+    #[allow(dead_code)]
+    pub async fn mount_responder(&self, responder: impl wiremock::Respond + 'static) {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(responder)
+            .with_priority(1)
+            .mount(&self._server)
+            .await;
+    }
+
     pub fn uri(&self) -> &str {
         &self.base_url
     }

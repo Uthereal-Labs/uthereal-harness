@@ -153,7 +153,7 @@ Named-agent Markdown frontmatter supports these optional fields:
 | `required_skills: [names]` | Loads the named skills directly into the child's instructions. Missing skills fail delegation. |
 | `always_async: true` | Forces background execution even when the caller omits `async`. |
 | `non_blocking: true` | Also forces background execution; loading a running task returns status instead of waiting. |
-| `delegate_only: true` | Keeps the agent definition available for delegation but rejects loading its instructions into the parent. |
+| `delegate_only: true` | Accepted for compatibility; all named agents are delegation targets and cannot be loaded into the parent as instructions. |
 
 Without these fields, existing synchronous delegation and extension inheritance
 continue to work. The child always receives the internal `message_parent` tool.
@@ -161,7 +161,7 @@ continue to work. The child always receives the internal `message_parent` tool.
 Set `delegate_only_extensions: [names]` in Goose's normal configuration to keep
 specific extensions out of parent sessions, including restored sessions and
 attempts to enable them through tools. Their registry entries remain available
-to specialists. Set `metadata.delegate_only: true` in skill frontmatter to hide
+to specialists. Set `metadata.delegate-only: true` (or `metadata.delegate_only: true`) in skill frontmatter to hide
 that skill from the parent's skill tools while permitting child use. These are
 tool/context routing policies, not filesystem or operating-system sandboxes.
 
@@ -200,11 +200,21 @@ stream-JSON emits a final `complete` event on success or `error` on failure.
 A headless run cannot receive new
 human input while running.
 
-ACP `session/prompt` also waits for background tasks and processes their reports
-before returning its final JSON-RPC response. Progress continues to stream during
-that wait. Cancellation and session closure stop child tasks; deleting a session
-waits for its active prompt to leave the run registry before deleting history.
-Only one prompt can own a session at a time, including across ACP connections.
+ACP `session/prompt` returns when the main agent finishes its reply, while
+specialists keep working in the same loaded conversation. Keep the ACP connection
+and session event stream open. A new user prompt can steer the existing specialist
+through `summon.send`; when main is actively generating, use
+`_goose/unstable/session/steer` with the current run ID instead. Child reports wake
+main automatically when it is idle, and its response streams over the existing
+connection. Only one main-agent run owns a session at a time, including across
+ACP connections. Failed automatic report delivery pauses until another user
+prompt or session reload; pending reports are preserved.
+
+Cancellation, session closure, and server shutdown stop child tasks, including
+while main is idle. Deleting a session waits for its active prompt to leave the
+run registry before deleting history. Clients must not close the session or
+connection after each prompt if they expect continuing specialist work. Reopening
+a session can deliver persisted reports; it does not restart an interrupted child.
 
 Messages live in the existing Goose SQLite database, under `session_mailbox`,
 with an automatic schema migration. Child steering is acknowledged atomically
@@ -250,7 +260,36 @@ Content capture is off by default. Opt in with
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` to include the actual
 assembled system prompt in generation input, conversation messages, and tool
 arguments/results. Exported content is then stored at the configured destination.
-Model pricing belongs in Langfuse's deployment configuration, not this source tree.
+Each provider call emits one generation in both agent loops, including cached
+input usage. Tool observations contain arguments and results, including failure
+output and error status, when content capture is enabled. Deferred tool execution
+retains the tool span until completion, including the specialist's lifetime.
+The exporter keeps its HTTP connection runtime running between batches. MCP requests carry the current tool span's `traceparent` and
+`tracestate` in request metadata across stdio and HTTP; external tools must extract
+that context to attach their own observations. Model pricing belongs in Langfuse's
+deployment configuration, not this source tree. Configure the exact deployment
+alias and the provider's returned model name (which may be a dated snapshot),
+including cache-read, cache-creation, and long-context rates, before validating
+cost. Validate the ingested generation's usage and cost details; an exported trace
+alone does not prove pricing matched.
+
+### Migrating the PR #4806 setup
+
+The Python coordinator is replaced by native mailboxes. Remove `agent_coordinator`
+from specialist `required_extensions` and remove `agent-coordination` from
+`required_skills`. Remove instructions to open/bind/poll/finish Python jobs;
+mailbox delivery and terminal reports are automatic. Keep the domain extensions,
+domain skills, `always_async`, and `non_blocking`. `task_id_as_job_id` is no longer
+needed: the child session ID returned by `delegate` is the native message address.
+Both spellings of the delegate-only skill metadata are accepted. Agent definitions
+are always private delegation targets.
+
+Keep Quire/Cortex tool implementations and their domain instructions in the
+application project. No domain bridge is hardcoded into the harness. The native
+routing instructions require main to complete prerequisites and pass researched
+content to the relevant specialist. The example under
+`examples/native-specialist` demonstrates the same policy with a local file-writing
+specialist; its working directory can be opened directly in Goose Desktop.
 
 ## Validation
 

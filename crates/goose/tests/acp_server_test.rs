@@ -246,6 +246,241 @@ fn failed_parent_report_response_remains_pending() {
     });
 }
 
+#[test]
+fn idle_session_delivers_reports_without_another_prompt() {
+    run_test(async {
+        let expected = <AcpServerConnection as Connection>::expected_session_id();
+        let openai = OpenAiFixture::new(
+            vec![
+                (
+                    format!("start work{TURN_CONTEXT_OPEN}"),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                ),
+                (
+                    "idle child finished".to_string(),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                ),
+            ],
+            expected.clone(),
+        )
+        .await;
+        let mut conn =
+            <AcpServerConnection as Connection>::new(TestConnectionConfig::default(), openai).await;
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        expected.set(&session.session_id().0);
+        assert_eq!(
+            session
+                .prompt("start work", PermissionDecision::Cancel)
+                .await
+                .unwrap()
+                .text,
+            "2"
+        );
+        session.session_updates();
+        let manager = SessionManager::new(conn.data_root());
+        let child = manager
+            .create_session(
+                session.work_dir(),
+                "idle child".to_string(),
+                SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        manager
+            .update(&child.id)
+            .parent_session_id(Some(session.session_id().0.to_string()))
+            .apply()
+            .await
+            .unwrap();
+        manager
+            .enqueue_completion_to_parent(&child.id, "idle child finished")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !manager
+                .pending_session_messages(&session.session_id().0)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("main agent must consume the report without another user prompt");
+        let updates = session.session_updates();
+        assert!(updates
+            .iter()
+            .any(|update| matches!(update, SessionUpdate::AgentMessageChunk(_))));
+        let history = manager
+            .get_session(&session.session_id().0, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap();
+        assert!(history.iter().any(|message| !message.is_user_visible()
+            && message.as_concat_text().contains("idle child finished")));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message.role == rmcp::model::Role::Assistant
+                    && message.as_concat_text() == "2")
+                .count(),
+            2
+        );
+    });
+}
+
+#[derive(Default)]
+struct DetachedContractState {
+    child_started: tokio::sync::Notify,
+    child_id: std::sync::Mutex<String>,
+    child_calls: std::sync::atomic::AtomicUsize,
+    child_saw_guidance: std::sync::atomic::AtomicBool,
+}
+
+struct DetachedContractResponder(std::sync::Arc<DetachedContractState>);
+
+impl wiremock::Respond for DetachedContractResponder {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        use serde_json::json;
+        use std::sync::atomic::Ordering;
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let text = messages
+            .iter()
+            .filter(|message| message["role"] != "system")
+            .map(|message| message["content"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tool = |id: &str, name: &str, args: serde_json::Value| {
+            json!({
+                "role": "assistant", "tool_calls": [{"index": 0, "id": id, "type": "function", "function": {"name": name, "arguments": args.to_string()}}]
+            })
+        };
+        let mut delay = std::time::Duration::ZERO;
+        let delta = if text.contains("Subagent ID:") {
+            if self.0.child_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let id = text
+                    .split("Subagent ID: ")
+                    .nth(1)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap();
+                *self.0.child_id.lock().unwrap() = id.to_string();
+                self.0.child_started.notify_one();
+                delay = std::time::Duration::from_secs(3);
+                tool("checkpoint", "checkpoint_tool", json!({}))
+            } else {
+                self.0
+                    .child_saw_guidance
+                    .store(text.contains("REVISED_TITLE"), Ordering::SeqCst);
+                json!({"role": "assistant", "content": "Child finished with REVISED_TITLE"})
+            }
+        } else if text.contains("Completion from task") {
+            json!({"role": "assistant", "content": "Main reviewed the revised child result"})
+        } else if messages
+            .last()
+            .is_some_and(|message| message["role"] == "tool")
+        {
+            json!({"role": "assistant", "content": "Guidance queued or task started"})
+        } else if text.contains("steer existing child") {
+            tool(
+                "send-guidance",
+                "send",
+                json!({"task_id": self.0.child_id.lock().unwrap().clone(), "message": "REVISED_TITLE"}),
+            )
+        } else {
+            tool(
+                "delegate",
+                "delegate",
+                json!({"instructions": "Complete the document", "async": true, "extensions": []}),
+            )
+        };
+        let finish = if delta.get("tool_calls").is_some() {
+            "tool_calls"
+        } else {
+            "stop"
+        };
+        let chunk = json!({"id": "contract", "model": "gpt-4.1", "choices": [{"index": 0, "delta": delta, "finish_reason": null}]});
+        let done = json!({"id": "contract", "model": "gpt-4.1", "choices": [{"index": 0, "delta": {}, "finish_reason": finish}], "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}});
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n"))
+            .set_delay(delay)
+    }
+}
+
+#[test]
+fn detached_delegation_accepts_steering_and_reports_completion() {
+    run_test(async {
+        use std::sync::{atomic::Ordering, Arc};
+        let provider = Arc::new(DetachedContractState::default());
+        let openai = OpenAiFixture::new(
+            vec![],
+            <AcpServerConnection as Connection>::expected_session_id(),
+        )
+        .await;
+        openai
+            .mount_responder(DetachedContractResponder(provider.clone()))
+            .await;
+        let mut conn = <AcpServerConnection as Connection>::new(
+            TestConnectionConfig {
+                builtins: vec!["summon".to_string()],
+                goose_mode: GooseMode::Auto,
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            session.prompt("start detached contract", PermissionDecision::Cancel),
+        )
+        .await
+        .expect("initial prompt must return while the child is still running")
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.child_started.notified(),
+        )
+        .await
+        .unwrap();
+        session
+            .prompt("steer existing child", PermissionDecision::Cancel)
+            .await
+            .unwrap();
+        let manager = SessionManager::new(conn.data_root());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let history = manager
+                    .get_session(&session.session_id().0, true)
+                    .await
+                    .unwrap()
+                    .conversation
+                    .unwrap();
+                if history.iter().any(|message| {
+                    message.as_concat_text() == "Main reviewed the revised child result"
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("completion must wake the main agent");
+        assert!(provider.child_saw_guidance.load(Ordering::SeqCst));
+        assert_eq!(
+            provider.child_calls.load(Ordering::SeqCst),
+            2,
+            "steering must not launch a replacement child"
+        );
+    });
+}
+
 fn assert_invalid_params(error: anyhow::Error) {
     let acp_error = error.downcast::<agent_client_protocol::Error>().unwrap();
     assert_eq!(acp_error.code, ErrorCode::InvalidParams);

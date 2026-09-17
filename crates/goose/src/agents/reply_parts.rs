@@ -335,10 +335,32 @@ pub(crate) fn prepare_tools_for_provider(
         gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
         gen_ai.usage.cache_creation.input_tokens = tracing::field::Empty,
         gen_ai.input.messages = tracing::field::Empty,
+        gen_ai.system_instructions = tracing::field::Empty,
         gen_ai.output.messages = tracing::field::Empty,
     )
 )]
 pub(crate) async fn stream_response_from_provider(
+    provider: Arc<dyn Provider>,
+    model_config: ModelConfig,
+    session_id: &str,
+    system_prompt: &str,
+    messages: &[Message],
+    tools: &[Tool],
+    toolshim_tools: &[Tool],
+) -> Result<MessageStream, ProviderError> {
+    stream_response_from_provider_in_span(
+        provider,
+        model_config,
+        session_id,
+        system_prompt,
+        messages,
+        tools,
+        toolshim_tools,
+    )
+    .await
+}
+
+pub(crate) async fn stream_response_from_provider_in_span(
     provider: Arc<dyn Provider>,
     model_config: ModelConfig,
     session_id: &str,
