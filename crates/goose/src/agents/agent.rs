@@ -1116,7 +1116,7 @@ impl Agent {
         fields(
             input,
             output,
-            session.id = %session.parent_session_id.as_deref().unwrap_or(&session.id),
+            session.id = %crate::session_context::telemetry_session_id(session.parent_session_id.as_deref().unwrap_or(&session.id)),
             goose.execution.session.id = %session.id,
             gen_ai.conversation.id = %session.id,
             gen_ai.operation.name = "execute_tool",
@@ -2608,7 +2608,7 @@ impl Agent {
             parent: &reply_span,
             "reply_stream",
             trace_output = tracing::field::Empty,
-            session.id = %session.parent_session_id.as_deref().unwrap_or(&session_config.id),
+            session.id = %crate::session_context::telemetry_session_id(session.parent_session_id.as_deref().unwrap_or(&session_config.id)),
             goose.execution.session.id = %session_config.id,
             session.user = %crate::session_context::session_user(),
             session.host = %crate::session_context::session_host(),
@@ -4275,6 +4275,22 @@ mod tests {
         let spans = exporter.get_finished_spans()?;
         let replies: Vec<_> = spans.iter().filter(|span| span.name == "reply").collect();
         assert_eq!(replies.len(), 2);
+        assert!(spans.iter().any(|span| span.name == "reply_stream"));
+        assert!(spans.iter().any(|span| span.name == "chat"));
+        for span in &spans {
+            for attribute in span
+                .attributes
+                .iter()
+                .filter(|attribute| attribute.key.as_str() == "session.id")
+            {
+                assert_eq!(
+                    attribute.value.as_str(),
+                    "cortex-session",
+                    "native span {} replaced the owning conversation session",
+                    span.name
+                );
+            }
+        }
         for reply in replies {
             assert!(reply
                 .attributes
@@ -4669,14 +4685,16 @@ mod tests {
         let tool_call =
             CallToolRequestParams::new(tool_name).with_arguments(object!({ "action": "list" }));
 
-        let (request_id, result) = agent
-            .dispatch_tool_call(
+        let (request_id, result) = crate::session_context::with_telemetry_session_id(
+            Some("cortex-session".to_string()),
+            agent.dispatch_tool_call(
                 tool_call,
                 "call-42".to_string(),
                 Some(CancellationToken::new()),
                 &session,
-            )
-            .await;
+            ),
+        )
+        .await;
         assert_eq!(request_id, "call-42");
         let result = result.unwrap();
         assert!(result.result.await.is_err());
@@ -4685,6 +4703,8 @@ mod tests {
         assert_eq!(fields["gen_ai.operation.name"], "execute_tool");
         assert_eq!(fields["gen_ai.tool.name"], tool_name);
         assert_eq!(fields["gen_ai.tool.call.id"], "call-42");
+        assert_eq!(fields["session.id"], "cortex-session");
+        assert_eq!(fields["goose.execution.session.id"], session.id);
         assert_eq!(fields["gen_ai.conversation.id"], session.id);
         let input: Value = serde_json::from_str(fields["input"].as_str().unwrap()).unwrap();
         assert_eq!(input["arguments"]["action"], "list");

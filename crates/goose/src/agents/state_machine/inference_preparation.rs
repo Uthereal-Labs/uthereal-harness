@@ -56,13 +56,13 @@ impl InferenceRequestPreparer<Session> for GooseInferenceRequestPreparer<'_> {
             goose_mode,
         );
         let span = tracing::Span::current();
-        span.record(
-            "session.id",
+        let telemetry_session_id = crate::session_context::telemetry_session_id(
             session
                 .parent_session_id
                 .as_deref()
                 .unwrap_or(session.id.as_str()),
         );
+        span.record("session.id", telemetry_session_id.as_str());
         span.record("goose.execution.session.id", session.id.as_str());
         span.record("gen_ai.conversation.id", session.id.as_str());
         if crate::agents::gen_ai_telemetry::capture_message_content() {
