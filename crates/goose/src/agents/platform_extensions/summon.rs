@@ -1898,18 +1898,24 @@ impl SummonClient {
             Vec::new()
         };
 
+        let session_extensions = EnabledExtensionsState::extensions_or_default(
+            Some(&session.extension_data),
+            Config::global(),
+        );
         let mut extensions = if required_extensions.is_empty() {
-            EnabledExtensionsState::extensions_or_default(
-                Some(&session.extension_data),
-                Config::global(),
-            )
+            session_extensions
         } else {
             required_extensions
                 .iter()
                 .map(|name| {
-                    crate::config::get_extension_by_name(name).ok_or_else(|| {
-                        anyhow::anyhow!("Required extension '{}' is not configured", name)
-                    })
+                    session_extensions
+                        .iter()
+                        .find(|extension| extension.name() == *name)
+                        .cloned()
+                        .or_else(|| crate::config::get_extension_by_name(name))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Required extension '{}' is not configured", name)
+                        })
                 })
                 .collect::<std::result::Result<Vec<_>, anyhow::Error>>()?
         };
@@ -3510,6 +3516,80 @@ You review code."#;
             .unwrap();
 
         assert!(Arc::ptr_eq(&parent_provider, &resolved_provider));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn named_agent_uses_required_session_extension_with_scoped_headers() {
+        use crate::session::extension_data::ExtensionState;
+
+        let temp_dir = TempDir::new().unwrap();
+        let parent_provider: Arc<dyn crate::providers::base::Provider> = Arc::new(
+            crate::providers::testprovider::TestProvider::new_replaying(
+                temp_dir.path().join("records.json").display().to_string(),
+            )
+            .unwrap(),
+        );
+        let extension_manager = Arc::new(
+            crate::agents::extension_manager::ExtensionManager::new_without_provider(
+                temp_dir.path().to_path_buf(),
+            ),
+        );
+        *extension_manager.get_provider().lock().await = Some(Arc::clone(&parent_provider));
+        let mut context = extension_manager.get_context().clone();
+        context.extension_manager = Some(Arc::downgrade(&extension_manager));
+        let client = SummonClient::new(context).unwrap();
+        let agent_dir = temp_dir.path().join(".agents/agents");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("document.md"),
+            "---\nname: document\nrequired_extensions: [scoped-document]\n---\nAuthor documents.",
+        )
+        .unwrap();
+        let mut scoped = ExtensionConfig::streamable_http(
+            "scoped-document",
+            "http://localhost/mcp",
+            "Owned document tools",
+            60u64,
+        );
+        if let ExtensionConfig::StreamableHttp { headers, .. } = &mut scoped {
+            headers.insert(
+                "Authorization".to_string(),
+                "Bearer scoped-test-token".to_string(),
+            );
+        }
+        let mut session = crate::session::Session {
+            provider_name: Some(parent_provider.get_name().to_string()),
+            model_config: Some(goose_providers::model::ModelConfig::new("test-model")),
+            working_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        EnabledExtensionsState::new(vec![
+            scoped.clone(),
+            ExtensionConfig::streamable_http(
+                "unrelated",
+                "http://localhost/other",
+                "Other tools",
+                60u64,
+            ),
+        ])
+        .to_extension_data(&mut session.extension_data)
+        .unwrap();
+        let params = DelegateParams {
+            source: Some("document".to_string()),
+            instructions: Some("Write a story".to_string()),
+            ..Default::default()
+        };
+        let config = client
+            .build_task_config(&params, &empty_recipe(), &session)
+            .await
+            .unwrap();
+        assert_eq!(config.extensions.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&config.extensions[0]).unwrap(),
+            serde_json::to_value(scoped).unwrap()
+        );
+        assert_eq!(config.required_extension_names, vec!["scoped-document"]);
     }
 
     #[tokio::test]
