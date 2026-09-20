@@ -1237,3 +1237,88 @@ fn test_app_tool_call_dispatched_in_auto_mode() {
         assert!(text.contains(FAKE_CODE));
     });
 }
+
+#[test]
+#[serial]
+fn durable_attempts_cannot_resume_through_ordinary_session_methods() {
+    write_acp_global_config(DEFAULT_ACP_TEST_CONFIG);
+    run_test(async {
+        for use_state_machine in [false, true] {
+            let openai = OpenAiFixture::new(
+                vec![(
+                    "what is 1+1".to_string(),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                )],
+                Arc::new(IgnoreSessionId),
+            )
+            .await;
+            let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+            let SessionData { session, .. } = conn.new_session().await.unwrap();
+            let key = uuid::Uuid::new_v4().to_string();
+            let response = conn.cx().send_request(
+                PromptRequest::new(session.session_id().clone(), vec![ContentBlock::Text(TextContent::new("what is 1+1"))])
+                    .meta(serde_json::from_value::<agent_client_protocol::schema::v1::Meta>(serde_json::json!({"goose": {
+                        "attemptKey": key, "awaitBackgroundTasks": true, "unrolledAgentLoop": use_state_machine,
+                    }})).unwrap()),
+            ).block_task().await.unwrap();
+            assert_eq!(response.stop_reason, StopReason::EndTurn);
+            let mut status = serde_json::Value::Null;
+            for _ in 0..100 {
+                status = send_custom(
+                    conn.cx(),
+                    "_goose/unstable/attempt/status",
+                    serde_json::json!({"attemptKey": key}),
+                )
+                .await
+                .unwrap();
+                if status["stopped"] == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(status["state"], "completed");
+            assert_eq!(status["stopped"], true);
+            assert!(conn
+                .cx()
+                .send_request(PromptRequest::new(
+                    session.session_id().clone(),
+                    vec![ContentBlock::Text(TextContent::new("replay"))],
+                ))
+                .block_task()
+                .await
+                .is_err());
+            assert!(send_custom(
+                conn.cx(),
+                "session/load",
+                serde_json::json!({
+                    "sessionId": session.session_id(), "cwd": "/tmp", "mcpServers": [],
+                })
+            )
+            .await
+            .is_err());
+            let transcript = send_custom(
+                conn.cx(),
+                "_goose/unstable/attempt/transcript",
+                serde_json::json!({"attemptKey": key}),
+            )
+            .await
+            .unwrap();
+            assert!(!transcript["data"].as_str().unwrap().is_empty());
+            assert_eq!(transcript["done"], false);
+
+            let cancelled_key = uuid::Uuid::new_v4().to_string();
+            send_custom(
+                conn.cx(),
+                "_goose/unstable/attempt/cancel",
+                serde_json::json!({"attemptKey": cancelled_key}),
+            )
+            .await
+            .unwrap();
+            let SessionData { session: late, .. } = conn.new_session().await.unwrap();
+            assert!(conn.cx().send_request(
+                PromptRequest::new(late.session_id().clone(), vec![ContentBlock::Text(TextContent::new("delayed request"))])
+                    .meta(serde_json::from_value::<agent_client_protocol::schema::v1::Meta>(serde_json::json!({"goose": {"attemptKey": cancelled_key, "awaitBackgroundTasks": true}})).unwrap()),
+            ).block_task().await.is_err());
+        }
+    });
+}

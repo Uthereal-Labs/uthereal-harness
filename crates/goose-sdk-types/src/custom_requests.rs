@@ -239,6 +239,66 @@ pub struct SteerSessionResponse {
     pub message_id: String,
 }
 
+/// Observe an attempt without loading a session or resuming tool execution.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/attempt/status", response = PromptAttemptResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAttemptStatusRequest {
+    pub attempt_key: String,
+}
+
+/// Persist cancellation even when the corresponding prompt has not arrived yet.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/attempt/cancel", response = PromptAttemptResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAttemptCancelRequest {
+    pub attempt_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptAttemptState {
+    Running,
+    CancelRequested,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAttemptResponse {
+    pub state: Option<PromptAttemptState>,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    /// False until the executor has released its process lock after cleanup.
+    pub stopped: bool,
+    pub result: Option<serde_json::Value>,
+}
+
+/// Read a bounded fragment of persisted transcript JSON without activating an agent.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/attempt/transcript", response = PromptAttemptTranscriptResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAttemptTranscriptRequest {
+    pub attempt_key: String,
+    #[serde(default)]
+    pub after: i64,
+    #[serde(default)]
+    pub offset: u32,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAttemptTranscriptResponse {
+    pub message_id: Option<i64>,
+    pub data: String,
+    pub next_after: i64,
+    pub next_offset: u32,
+    pub done: bool,
+}
+
 /// Get a diagnostic report for a session.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
 #[request(

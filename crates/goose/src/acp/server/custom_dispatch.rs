@@ -125,6 +125,39 @@ impl GooseAcpAgent {
         self.on_set_session_system_prompt(req).await
     }
 
+    #[custom_method(PromptAttemptTranscriptRequest)]
+    async fn dispatch_prompt_attempt_transcript(
+        &self,
+        req: PromptAttemptTranscriptRequest,
+    ) -> Result<PromptAttemptTranscriptResponse, agent_client_protocol::Error> {
+        self.session_manager
+            .prompt_attempt_transcript(&req)
+            .await
+            .internal_err_ctx("Failed to read prompt attempt transcript")
+    }
+
+    #[custom_method(PromptAttemptStatusRequest)]
+    async fn dispatch_prompt_attempt_status(
+        &self,
+        req: PromptAttemptStatusRequest,
+    ) -> Result<PromptAttemptResponse, agent_client_protocol::Error> {
+        self.session_manager
+            .prompt_attempt_status(&req.attempt_key)
+            .await
+            .internal_err_ctx("Failed to inspect prompt attempt")
+    }
+
+    #[custom_method(PromptAttemptCancelRequest)]
+    async fn dispatch_prompt_attempt_cancel(
+        &self,
+        req: PromptAttemptCancelRequest,
+    ) -> Result<PromptAttemptResponse, agent_client_protocol::Error> {
+        self.session_manager
+            .cancel_prompt_attempt(&req.attempt_key)
+            .await
+            .internal_err_ctx("Failed to cancel prompt attempt")
+    }
+
     #[custom_method(SteerSessionRequest)]
     async fn dispatch_steer_session(
         &self,

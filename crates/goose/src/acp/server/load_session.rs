@@ -262,6 +262,7 @@ impl GooseAcpAgent {
             run_id.clone(),
             cancel_token.clone(),
             agent.clone(),
+            true,
         )
         .await?;
 
@@ -309,6 +310,8 @@ impl GooseAcpAgent {
                 session_id: task_session_id.clone(),
                 run_id: task_run_id.clone(),
                 cancel_token: task_cancel_token.clone(),
+                attempt: None,
+                session_manager: server.session_manager.clone(),
             };
             let result = server
                 .forward_agent_stream(
@@ -387,6 +390,15 @@ impl GooseAcpAgent {
         debug!(?args, "load session request");
 
         let session_id_str = args.session_id.0.to_string();
+        if self
+            .session_manager
+            .session_has_prompt_attempt(&session_id_str)
+            .await
+            .internal_err_ctx("Failed to check durable session ownership")?
+        {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("durable attempt sessions use passive attempt APIs, not session/load"));
+        }
 
         let mut session = self
             .session_manager
