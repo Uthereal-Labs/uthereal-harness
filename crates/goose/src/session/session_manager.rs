@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 17;
+pub const CURRENT_SCHEMA_VERSION: i32 = 18;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
@@ -957,6 +957,10 @@ impl SessionStorage {
         }
     }
 
+    pub(crate) fn attempt_lock_path(&self, key: &str) -> PathBuf {
+        self.session_dir.join(format!("attempt-{key}.lock"))
+    }
+
     pub(crate) async fn pool(&self) -> Result<&Pool<Sqlite>> {
         self.initialized
             .get_or_try_init(|| async {
@@ -1106,6 +1110,12 @@ impl SessionStorage {
         )
         .execute(&mut *tx)
         .await?;
+
+        sqlx::query(super::prompt_attempt::CREATE_TABLE)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_attempt_session ON prompt_attempts(session_id) WHERE session_id IS NOT NULL")
+            .execute(&mut *tx).await?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)")
             .execute(&mut *tx)
@@ -1642,6 +1652,13 @@ impl SessionStorage {
                 )
                 .execute(&mut **tx)
                 .await?;
+            }
+            18 => {
+                sqlx::query(super::prompt_attempt::CREATE_TABLE)
+                    .execute(&mut **tx)
+                    .await?;
+                sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_attempt_session ON prompt_attempts(session_id) WHERE session_id IS NOT NULL")
+                    .execute(&mut **tx).await?;
             }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);

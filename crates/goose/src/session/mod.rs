@@ -8,6 +8,7 @@ mod legacy;
 mod mailbox;
 #[cfg(feature = "nostr")]
 pub mod nostr_share;
+mod prompt_attempt;
 pub mod session_manager;
 mod session_naming;
 
@@ -25,3 +26,5 @@ pub use mailbox::{MailboxMessage, MailboxMessageKind};
 pub use session_manager::{
     Session, SessionInsights, SessionManager, SessionNameUpdate, SessionType, SessionUpdateBuilder,
 };
+
+pub use prompt_attempt::PromptAttemptLease;

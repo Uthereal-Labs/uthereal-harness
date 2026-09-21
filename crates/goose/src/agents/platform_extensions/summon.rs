@@ -2802,6 +2802,7 @@ fn resolve_working_dir(parent_dir: &Path, requested: &str) -> Result<PathBuf, an
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ExtensionConfig;
     use crate::conversation::message::Message;
     use futures::StreamExt;
     use serial_test::serial;

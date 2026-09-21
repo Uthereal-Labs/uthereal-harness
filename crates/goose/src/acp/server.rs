@@ -39,7 +39,8 @@ use crate::providers::inventory::{
 use crate::scheduler_trait::SchedulerTrait;
 use crate::session::session_manager::SessionUsageTotals;
 use crate::session::{
-    EnabledExtensionsState, ExtensionData, ExtensionState, Session, SessionManager, SessionType,
+    EnabledExtensionsState, ExtensionData, ExtensionState, PromptAttemptLease, Session,
+    SessionManager, SessionType,
 };
 use crate::source_roots::SourceRoot;
 use crate::utils::sanitize_unicode_tags;
@@ -144,6 +145,7 @@ mod manage_sessions;
 mod message_meta;
 mod new_session;
 mod onboarding;
+mod prompt_attempt;
 mod prompts;
 mod providers;
 mod recipe;
@@ -336,6 +338,8 @@ struct ActiveRunDropGuard {
     session_id: String,
     run_id: String,
     cancel_token: CancellationToken,
+    attempt: Option<PromptAttemptLease>,
+    session_manager: Arc<SessionManager>,
 }
 
 impl Drop for ActiveRunDropGuard {
@@ -344,6 +348,8 @@ impl Drop for ActiveRunDropGuard {
         let registry = self.registry.clone();
         let session_id = std::mem::take(&mut self.session_id);
         let run_id = std::mem::take(&mut self.run_id);
+        let attempt = self.attempt.take();
+        let session_manager = self.session_manager.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let agent = {
@@ -359,6 +365,9 @@ impl Drop for ActiveRunDropGuard {
                 if let Some(agent) = agent {
                     if let Err(error) = agent.shutdown_session(&session_id).await {
                         warn!(session_id, %error, "Failed to shut down dropped ACP run");
+                        // Preserve the lock until process exit if quiescence cannot be proved.
+                        std::mem::forget(attempt);
+                        return;
                     }
                     let mut runs = registry.lock().await;
                     if runs
@@ -369,7 +378,17 @@ impl Drop for ActiveRunDropGuard {
                         runs.remove(&session_id);
                     }
                 }
+                if let Some(attempt) = attempt {
+                    if let Err(error) = session_manager
+                        .finish_prompt_attempt(&attempt, PromptAttemptState::Interrupted, None)
+                        .await
+                    {
+                        warn!(%error, "Failed to reconcile dropped prompt attempt");
+                    }
+                }
             });
+        } else {
+            std::mem::forget(attempt);
         }
     }
 }
@@ -926,7 +945,7 @@ impl GooseAcpAgent {
         run_id: String,
         agent: Arc<Agent>,
     ) -> Result<(), agent_client_protocol::Error> {
-        self.start_active_run(session_id, run_id, CancellationToken::new(), agent)
+        self.start_active_run(session_id, run_id, CancellationToken::new(), agent, true)
             .await
     }
 
@@ -937,6 +956,8 @@ impl GooseAcpAgent {
             session_id: session_id.to_string(),
             run_id: run_id.to_string(),
             cancel_token: CancellationToken::new(),
+            attempt: None,
+            session_manager: self.session_manager.clone(),
         });
     }
 
@@ -1434,6 +1455,7 @@ impl GooseAcpAgent {
                                 None,
                                 use_state_machine,
                                 false,
+                                None,
                             )
                             .await;
                         let failed = match result {
@@ -2130,6 +2152,7 @@ impl GooseAcpAgent {
         run_id: String,
         cancel_token: CancellationToken,
         agent: Arc<Agent>,
+        accepting_steers: bool,
     ) -> Result<(), agent_client_protocol::Error> {
         if self.closed_session_ids.lock().await.contains(session_id) {
             return Err(agent_client_protocol::Error::resource_not_found(Some(
@@ -2159,7 +2182,7 @@ impl GooseAcpAgent {
             ActivePromptRun {
                 run_id,
                 cancel_token,
-                accepting_steers: true,
+                accepting_steers,
                 agent,
             },
         );
@@ -2646,6 +2669,9 @@ impl GooseAcpAgent {
             .and_then(|goose| goose.get("awaitBackgroundTasks"))
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+        let attempt = self
+            .claim_acp_prompt_attempt(&args, use_state_machine, await_background_tasks)
+            .await?;
         let telemetry_session_id = prompt_telemetry_session_id(args.meta.as_ref());
         let message = Self::convert_acp_prompt_to_message(&args.prompt);
         let run = self.run_session_message(
@@ -2654,6 +2680,7 @@ impl GooseAcpAgent {
             Some(message),
             use_state_machine,
             await_background_tasks,
+            attempt,
         );
         let run = crate::session_context::with_telemetry_session_id(telemetry_session_id, run);
         #[cfg(feature = "otel")]
@@ -2675,12 +2702,34 @@ impl GooseAcpAgent {
         user_message: Option<Message>,
         use_state_machine: bool,
         await_background_tasks: bool,
+        attempt: Option<PromptAttemptLease>,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
         // The ACP session_id IS the thread ID.
         let session_id = acp_session_id.0.to_string();
+        if attempt.is_none()
+            && self
+                .session_manager
+                .session_has_prompt_attempt(&session_id)
+                .await
+                .internal_err_ctx("Failed to check durable session ownership")?
+        {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("durable attempt sessions cannot be resumed or prompted again"));
+        }
 
-        let run_id = format!("run_{}", Uuid::new_v4());
+        let run_id = attempt.as_ref().map_or_else(
+            || format!("run_{}", Uuid::new_v4()),
+            |attempt| attempt.run_id.clone(),
+        );
         let cancel_token = CancellationToken::new();
+        let run_guard = ActiveRunDropGuard {
+            registry: self.active_prompt_runs.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            cancel_token: cancel_token.clone(),
+            attempt,
+            session_manager: self.session_manager.clone(),
+        };
 
         // Resolve the agent before claiming the run so the registry can record
         // which agent owns it; registration stays atomic, so the cross-connection
@@ -2691,6 +2740,7 @@ impl GooseAcpAgent {
             run_id.clone(),
             cancel_token.clone(),
             agent.clone(),
+            run_guard.attempt.is_none(),
         )
         .await?;
 
@@ -2701,15 +2751,16 @@ impl GooseAcpAgent {
             }
         }
 
-        // Frees the run if this future is dropped mid-prompt (e.g. the roaming
-        // connection carrying it is revoked or lost); a normal completion's
-        // explicit clear wins and makes the guard's cleanup a no-op.
-        let _run_guard = ActiveRunDropGuard {
-            registry: self.active_prompt_runs.clone(),
-            session_id: session_id.clone(),
-            run_id: run_id.clone(),
-            cancel_token: cancel_token.clone(),
-        };
+        if let Some(attempt) = &run_guard.attempt {
+            if self
+                .session_manager
+                .prompt_attempt_cancel_requested(&attempt.key)
+                .await
+                .internal_err_ctx("Failed to check prompt attempt cancellation")?
+            {
+                cancel_token.cancel();
+            }
+        }
 
         if cancel_token.is_cancelled() {
             self.clear_active_run(&session_id, &run_id).await;
@@ -2731,7 +2782,7 @@ impl GooseAcpAgent {
             return Err(error);
         }
 
-        let stream_result = async {
+        let stream = async {
             let mut outcome = if let Some(user_message) = user_message {
                 self.run_agent_reply(
                     cx,
@@ -2868,8 +2919,32 @@ impl GooseAcpAgent {
                 break;
             }
             Ok(outcome)
-        }
-        .await;
+        };
+        tokio::pin!(stream);
+        let stream_result = if let Some(attempt) = &run_guard.attempt {
+            let cancellation = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    match self
+                        .session_manager
+                        .prompt_attempt_cancel_requested(&attempt.key)
+                        .await
+                    {
+                        Ok(false) => continue,
+                        _ => break,
+                    }
+                }
+            };
+            tokio::select! {
+                result = &mut stream => result,
+                _ = cancellation => {
+                    cancel_token.cancel();
+                    stream.await
+                }
+            }
+        } else {
+            stream.await
+        };
         let should_shutdown = stream_result.as_ref().map_or(true, |outcome| {
             outcome.was_cancelled || outcome.output_token_limit_reached
         });
@@ -2878,24 +2953,49 @@ impl GooseAcpAgent {
                 session.automatic_reports_paused = true;
             }
             if let Err(error) = agent.shutdown_session(&session_id).await {
-                warn!(session_id, %error, "Failed to shut down background tasks after ACP prompt");
+                return Err(agent_client_protocol::Error::internal_error().data(error.to_string()));
             }
         }
-        self.clear_active_run(&session_id, &run_id).await;
-        Self::send_active_run_update(cx, &acp_session_id, None)?;
+        if let (Some(attempt), Err(_)) = (&run_guard.attempt, &stream_result) {
+            self.session_manager
+                .finish_prompt_attempt(attempt, PromptAttemptState::Failed, None)
+                .await
+                .internal_err_ctx("Failed to persist prompt attempt failure")?;
+        }
         let outcome = stream_result?;
-
         let session = self
-            .send_session_usage_updates(cx, &acp_session_id, &session_id, &agent, &mut None)
-            .await?;
-
+            .session_manager
+            .get_session(&session_id, false)
+            .await
+            .internal_err_ctx("Failed to read completed prompt usage")?;
         let stop_reason =
             prompt_stop_reason(outcome.was_cancelled, outcome.output_token_limit_reached);
-
         let mut response = PromptResponse::new(stop_reason);
         if let Some(usage) = build_prompt_usage(&session) {
             response = response.usage(usage);
         }
+        if let Some(attempt) = &run_guard.attempt {
+            let state = if outcome.was_cancelled || cancel_token.is_cancelled() {
+                PromptAttemptState::Cancelled
+            } else {
+                PromptAttemptState::Completed
+            };
+            self.session_manager
+                .finish_prompt_attempt(
+                    attempt,
+                    state,
+                    Some(
+                        serde_json::to_value(&response)
+                            .internal_err_ctx("Failed to serialize prompt result")?,
+                    ),
+                )
+                .await
+                .internal_err_ctx("Failed to persist prompt result")?;
+        }
+        self.clear_active_run(&session_id, &run_id).await;
+        Self::send_active_run_update(cx, &acp_session_id, None)?;
+        self.send_session_usage_updates(cx, &acp_session_id, &session_id, &agent, &mut None)
+            .await?;
         Ok(response)
     }
 
@@ -3398,6 +3498,7 @@ mod tests {
                 "run".to_string(),
                 CancellationToken::new(),
                 agent.clone(),
+                true,
             )
             .await
             .unwrap();

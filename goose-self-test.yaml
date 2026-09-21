@@ -17,6 +17,7 @@ activities:
   - Validate native task steering, parent reports, and specialist capability policies
   - Test multi-turn thinking preservation for providers that reject replayed reasoning_content
   - Validate ACP thinking-effort discovery, forwarding, and provider switching
+  - Validate durable ACP attempt admission, passive recovery, cancellation tombstones, and both agent loops
   - Validate opt-in ACP conversation workspace creation, reuse, and rejection of traversal or symlink paths
   - Validate GDK observability hook lifecycle events and payload opt-in
   - Verify ACP returns after delegation, accepts steering of the same live task, and delivers an automatic main-agent completion
@@ -29,7 +30,7 @@ parameters:
     input_type: string
     requirement: optional
     default: "all"
-    description: "Which test phases to run: all, basic, extensions, delegation, native-parity, reasoning, acp-effort, advanced"
+    description: "Which test phases to run: all, basic, extensions, delegation, native-parity, reasoning, acp-effort, durable-attempts, advanced"
 
   - key: test_depth
     input_type: string
@@ -463,6 +464,21 @@ prompt: |
      managed providers preserve values they support.
 
   Log results to: {{ workspace_dir }}/phase3d_acp_effort.md
+  {% endif %}
+
+  {% if test_phases == "all" or "durable-attempts" in test_phases %}
+  ## Durable ACP Attempts
+
+  Run from this source checkout with Rust available. Do not use real provider calls
+  for the execution-under-test: these suites own deterministic mock providers.
+  Do not modify source files or contact shared services. Keep reports inside workspace_dir.
+  1. Run `cargo test -p goose --test prompt_attempts`.
+  2. Run `cargo test -p goose --test acp_custom_requests_test durable_attempt`.
+  3. Confirm concurrent claims, cancellation-before-start tombstones, abandoned-lock
+     recovery, bounded Unicode transcript reads, and path rejection pass.
+  4. Confirm both agent loops preserve completed results through passive status and
+     reject session/load, ordinary reprompt and reuse of cancelled attempt keys.
+  Record exact commands, counts and failures in {{ workspace_dir }}/durable_attempts.md.
   {% endif %}
 
   {% if test_phases == "all" or "advanced" in test_phases %}
