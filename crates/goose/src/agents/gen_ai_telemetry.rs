@@ -41,7 +41,15 @@ pub(super) fn record_usage(span: &Span, usage: &Usage) {
 }
 
 pub(super) fn record_provider_usage(span: &Span, usage: &ProviderUsage) {
-    span.record("gen_ai.response.model", usage.model.as_str());
+    let canonical_model = usage
+        .model
+        .strip_prefix("gpt-6-luna-")
+        .filter(|suffix| chrono::NaiveDate::parse_from_str(suffix, "%Y-%m-%d").is_ok())
+        .map_or(usage.model.as_str(), |_| "gpt-6-luna");
+    span.record("gen_ai.response.model", canonical_model);
+    if canonical_model != usage.model.as_str() {
+        span.record("gen_ai.response.model.upstream", usage.model.as_str());
+    }
     record_usage(span, &usage.usage);
     if let Some(reasons) = &usage.finish_reasons {
         let reasons_json = serde_json::to_string(reasons).unwrap_or_default();
@@ -443,6 +451,27 @@ mod tests {
         assert_eq!(fields["gen_ai.response.id"], "resp-123");
         assert_eq!(fields["gen_ai.usage.input_tokens"], 10);
         assert_eq!(fields["gen_ai.usage.output_tokens"], 20);
+    }
+
+    #[test]
+    fn record_provider_usage_normalizes_dated_gpt_6_luna_name() {
+        let capture = test_support::SpanFieldCapture::new("test_span");
+        let _guard = capture.clone().set_default();
+        let usage = ProviderUsage::new("gpt-6-luna-2026-09-22".to_string(), Usage::default());
+        let span = tracing::info_span!(
+            "test_span",
+            "gen_ai.response.model" = tracing::field::Empty,
+            "gen_ai.response.model.upstream" = tracing::field::Empty,
+        );
+
+        record_provider_usage(&span, &usage);
+
+        let fields = capture.fields();
+        assert_eq!(fields["gen_ai.response.model"], "gpt-6-luna");
+        assert_eq!(
+            fields["gen_ai.response.model.upstream"],
+            "gpt-6-luna-2026-09-22"
+        );
     }
 
     #[test]

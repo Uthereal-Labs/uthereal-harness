@@ -1923,7 +1923,8 @@ pub(crate) fn openai_reasoning_efforts_for_model(model_name: &str) -> &'static [
     if normalized.contains("gpt-5") || normalized.contains("gpt-6") {
         if normalized.contains("-pro") || normalized.contains("/pro") {
             &["high"]
-        } else if normalized.contains("gpt-5.4")
+        } else if normalized.contains("gpt-6-luna")
+            || normalized.contains("gpt-5.4")
             || normalized.contains("gpt-5-4")
             || normalized.contains("gpt-5.5")
             || normalized.contains("gpt-5-5")
@@ -3310,6 +3311,13 @@ mod tests {
 
         assert_eq!(
             openai_reasoning_effort_for_thinking("gpt-5.6-luna", ThinkingEffort::Off),
+            Some("none".to_string())
+        );
+        assert_eq!(
+            openai_reasoning_effort_for_thinking(
+                "azure_harness_balanced-gpt-6-luna",
+                ThinkingEffort::Off
+            ),
             Some("none".to_string())
         );
         assert_eq!(

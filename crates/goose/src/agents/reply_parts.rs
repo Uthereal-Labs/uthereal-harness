@@ -328,6 +328,7 @@ pub(crate) fn prepare_tools_for_provider(
         gen_ai.request.temperature = tracing::field::Empty,
         gen_ai.request.max_tokens = tracing::field::Empty,
         gen_ai.response.model = tracing::field::Empty,
+        gen_ai.response.model.upstream = tracing::field::Empty,
         gen_ai.response.finish_reasons = tracing::field::Empty,
         gen_ai.response.id = tracing::field::Empty,
         gen_ai.usage.input_tokens = tracing::field::Empty,
@@ -565,6 +566,7 @@ pub(crate) async fn stream_response_from_provider_in_span(
             let mut first_content_at: Option<std::time::Instant> = None;
             let mut active_mergeable_assistant_id: Option<String> = None;
             let mut output_message: Option<Message> = None;
+            let mut output_recorded = false;
             while let Some(result) = stream.next().await {
                 let (message, mut usage) = result?;
 
@@ -580,6 +582,18 @@ pub(crate) async fn stream_response_from_provider_in_span(
                 if capture_message_content {
                     if let Some(message) = message.as_ref() {
                         gen_ai_telemetry::append_message(&mut output_message, message);
+                        if !output_recorded
+                            || message
+                                .content
+                                .iter()
+                                .any(|part| matches!(part, MessageContent::ToolRequest(_)))
+                        {
+                            let output_message = output_message.as_ref().unwrap();
+                            let output_messages =
+                                gen_ai_telemetry::output_message_json(output_message);
+                            span.record("gen_ai.output.messages", output_messages.as_str());
+                            output_recorded = true;
+                        }
                     }
                 }
 
@@ -981,6 +995,36 @@ mod tests {
             serde_json::from_str(fields["gen_ai.output.messages"].as_str().unwrap()).unwrap();
         assert_eq!(output[0]["finish_reason"], "stop");
         assert_eq!(output[0]["parts"][0]["content"], "hello world");
+    }
+
+    #[tokio::test]
+    async fn provider_stream_records_output_before_consumer_drops_it() {
+        use futures::StreamExt;
+        use goose_test_support::otel::clear_otel_env;
+
+        let _env = clear_otel_env(&[(gen_ai_telemetry::CAPTURE_MESSAGE_CONTENT_ENV, "true")]);
+        let capture = SpanFieldCapture::new("stream_response_from_provider");
+        let _subscriber = capture.clone().set_default();
+        let messages = vec![Message::user().with_text("Say hello")];
+
+        let mut stream = stream_response_from_provider(
+            Arc::new(GenAiTracingProvider),
+            ModelConfig::new("requested-model"),
+            "test-session",
+            "system",
+            &messages,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        stream.next().await.unwrap().unwrap();
+        drop(stream);
+
+        let fields = capture.fields();
+        let output: Value =
+            serde_json::from_str(fields["gen_ai.output.messages"].as_str().unwrap()).unwrap();
+        assert_eq!(output[0]["parts"][0]["content"], "hello ");
     }
 
     #[tokio::test]
