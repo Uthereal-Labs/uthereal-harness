@@ -4080,6 +4080,34 @@ print(\"hello, world\")
             .any(|content| matches!(content, MessageContent::Image(_))));
     }
 
+    #[test]
+    fn convert_acp_prompt_keeps_assistant_context_private_and_instruction_visible() {
+        let prompt = vec![
+            ContentBlock::Resource(
+                EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
+                    TextResourceContents::new(
+                        "# Prior assistant context\nThe earlier answer used **€10m**.",
+                        "uthereal://cortex/assistant-context/interaction-1",
+                    ),
+                ))
+                .annotations(Annotations::new().audience(vec![AcpRole::Assistant])),
+            ),
+            ContentBlock::Text(TextContent::new(
+                "Investigate this answer further using the available sources.",
+            )),
+        ];
+
+        let message = GooseAcpAgent::convert_acp_prompt_to_message(&prompt);
+        let user_content = message.user_visible_content().as_concat_text();
+        let agent_content = message.agent_visible_content().as_concat_text();
+
+        assert!(!user_content.contains("€10m"));
+        assert!(user_content.contains("Investigate this answer further"));
+        assert!(agent_content.contains("uthereal://cortex/assistant-context/interaction-1"));
+        assert!(agent_content.contains("The earlier answer used **€10m**"));
+        assert!(agent_content.contains("Investigate this answer further"));
+    }
+
     #[test_case(
         RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(PermissionOptionId::from("allow_once".to_string()))),
         PermissionConfirmation { principal_type: PrincipalType::Tool, permission: Permission::AllowOnce };
