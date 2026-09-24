@@ -1277,11 +1277,27 @@ impl Agent {
 
     /// Save current extension state to session by session_id
     pub async fn persist_extension_state(&self, session_id: &str) -> Result<()> {
-        self.persist_extension_configs(
-            session_id,
-            self.extension_manager.get_extension_configs().await,
-        )
-        .await
+        let mut extensions = self.extension_manager.get_extension_configs().await;
+        let session = self
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await?;
+        if session.session_type != crate::session::SessionType::SubAgent {
+            for extension in EnabledExtensionsState::extensions_or_default(
+                Some(&session.extension_data),
+                Config::global(),
+            ) {
+                if crate::config::is_delegate_only_extension(&extension.name())
+                    && !extensions
+                        .iter()
+                        .any(|loaded| loaded.name() == extension.name())
+                {
+                    extensions.push(extension);
+                }
+            }
+        }
+        self.persist_extension_configs(session_id, extensions).await
     }
 
     /// Save the provided extension configuration to session metadata.
