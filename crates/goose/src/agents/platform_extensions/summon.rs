@@ -2804,7 +2804,7 @@ impl McpClientTrait for SummonClient {
         }
     }
 
-    async fn get_moim(&self, _session_id: &str) -> Option<String> {
+    async fn get_moim(&self, session_id: &str) -> Option<String> {
         self.cleanup_completed_tasks().await;
         let refreshed_turns = self.refresh_running_task_turns().await;
 
@@ -2863,10 +2863,13 @@ impl McpClientTrait for SummonClient {
         }
 
         if !running.is_empty() {
-            lines.push(
+            lines.push(if self.event_driven_parents.lock().await.contains(session_id) {
+                "\n→ Reports arrive automatically. Finish your reply when no independent work remains; the coordinator will resume for an actionable message or terminal result. Use send only when a running specialist needs new guidance."
+                    .to_string()
+            } else {
                 "\n→ Reports arrive automatically. Do not poll or sleep; finish your reply when no independent work remains. Use send to steer an existing task, load(source: \"<id>\", peek: true) for requested status, or load(source: \"<id>\", cancel: true) to stop it"
-                    .to_string(),
-            );
+                    .to_string()
+            });
         }
 
         Some(lines.join("\n"))
@@ -5245,6 +5248,14 @@ You review code."#;
         let moim = client.get_moim("test").await.unwrap();
         assert!(moim.contains("Do not poll or sleep"));
         assert!(!moim.contains("to wait for a task"));
+        client
+            .event_driven_parents
+            .lock()
+            .await
+            .insert("test".to_string());
+        let event_driven_moim = client.get_moim("test").await.unwrap();
+        assert!(event_driven_moim.contains("coordinator will resume"));
+        assert!(!event_driven_moim.contains("load(source:"));
         assert!(client.background_tasks.lock().await.contains_key(task_id));
     }
 
