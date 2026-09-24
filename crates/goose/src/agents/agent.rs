@@ -1255,33 +1255,44 @@ impl Agent {
     /// Save current extension state to session metadata
     /// Should be called after any extension add/remove operation
     pub async fn save_extension_state(&self, session: &SessionConfig) -> Result<()> {
-        let extensions_state =
-            EnabledExtensionsState::new(self.extension_manager.get_extension_configs().await);
-
-        let session_manager = self.config.session_manager.clone();
-        let mut session_data = session_manager.get_session(&session.id, false).await?;
-
-        if let Err(e) = extensions_state.to_extension_data(&mut session_data.extension_data) {
-            warn!("Failed to serialize extension state: {}", e);
-            return Err(anyhow!("Extension state serialization failed: {}", e));
-        }
-
-        session_manager
-            .update(&session.id)
-            .extension_data(session_data.extension_data)
-            .apply()
-            .await?;
-
-        Ok(())
+        self.persist_extension_state(&session.id).await
     }
 
     /// Save current extension state to session by session_id
     pub async fn persist_extension_state(&self, session_id: &str) -> Result<()> {
-        self.persist_extension_configs(
-            session_id,
-            self.extension_manager.get_extension_configs().await,
-        )
-        .await
+        self.persist_extension_state_with_config(session_id, Vec::new(), Config::global())
+            .await
+    }
+
+    async fn persist_extension_state_with_config(
+        &self,
+        session_id: &str,
+        skipped_delegate_only: Vec<ExtensionConfig>,
+        config: &Config,
+    ) -> Result<()> {
+        let mut extensions = self.extension_manager.get_extension_configs().await;
+        let session = self
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await?;
+        if session.session_type != SessionType::SubAgent {
+            let persisted = EnabledExtensionsState::from_extension_data(&session.extension_data)
+                .map(|state| state.extensions)
+                .unwrap_or_default();
+            for extension in persisted.into_iter().chain(skipped_delegate_only) {
+                if crate::config::extensions::is_delegate_only_extension_with_config(
+                    config,
+                    &extension.name(),
+                ) {
+                    extensions.retain(|loaded| {
+                        name_to_key(&loaded.name()) != name_to_key(&extension.name())
+                    });
+                    extensions.push(extension);
+                }
+            }
+        }
+        self.persist_extension_configs(session_id, extensions).await
     }
 
     /// Save the provided extension configuration to session metadata.
@@ -1429,13 +1440,23 @@ impl Agent {
     /// the container lock once upfront to prevent serialisation of the parallel futures.
     ///
     /// State is persisted once every extension has settled, even when all of them
-    /// fail: the session's enabled list records what actually loaded, so failed
-    /// extensions are dropped instead of staying marked as enabled and being
-    /// retried on every subsequent resume.
+    /// fail. Failed loads are dropped to avoid retries on resume. Delegate-only
+    /// configurations remain in the session for child agents, without loading
+    /// their tools into the parent.
     pub async fn add_extensions_bulk(
         self: &Arc<Self>,
         extensions: Vec<ExtensionConfig>,
         session_id: &str,
+    ) -> anyhow::Result<Vec<ExtensionLoadResult>> {
+        self.add_extensions_bulk_with_config(extensions, session_id, Config::global())
+            .await
+    }
+
+    async fn add_extensions_bulk_with_config(
+        self: &Arc<Self>,
+        extensions: Vec<ExtensionConfig>,
+        session_id: &str,
+        config: &Config,
     ) -> anyhow::Result<Vec<ExtensionLoadResult>> {
         let session = self
             .config
@@ -1454,7 +1475,11 @@ impl Agent {
             .is_ok_and(|session| session.session_type == crate::session::SessionType::SubAgent);
         let (extensions, skipped_configs): (Vec<_>, Vec<_>) =
             extensions.into_iter().partition(|extension| {
-                allow_delegate_only || !crate::config::is_delegate_only_extension(&extension.name())
+                allow_delegate_only
+                    || !crate::config::extensions::is_delegate_only_extension_with_config(
+                        config,
+                        &extension.name(),
+                    )
             });
         let container = self.container.lock().await.clone();
 
@@ -1492,17 +1517,14 @@ impl Agent {
             .collect::<Vec<_>>();
 
         let mut results = futures::future::join_all(extension_futures).await;
-        results.extend(
-            skipped_configs
-                .into_iter()
-                .map(|extension| ExtensionLoadResult {
-                    name: extension.name(),
-                    success: false,
-                    error: Some("extension is only available to delegated agents".to_string()),
-                }),
-        );
+        results.extend(skipped_configs.iter().map(|extension| ExtensionLoadResult {
+            name: extension.name(),
+            success: false,
+            error: Some("extension is only available to delegated agents".to_string()),
+        }));
 
-        self.persist_extension_state(session_id).await?;
+        self.persist_extension_state_with_config(session_id, skipped_configs, config)
+            .await?;
 
         Ok(results)
     }
@@ -4089,6 +4111,89 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn delegate_only_extension_stays_available_to_summon_after_parent_persistence() {
+        let data_dir = TempDir::new().unwrap();
+        let config = Config::new_with_file_secrets(
+            data_dir.path().join("config.yaml"),
+            data_dir.path().join("secrets.yaml"),
+        )
+        .unwrap();
+        config
+            .set_param("delegate_only_extensions", vec!["scoped-document"])
+            .unwrap();
+        let session_manager = Arc::new(SessionManager::new(data_dir.path().join("sessions")));
+        let agent = Arc::new(Agent::with_config(AgentConfig::new(
+            Arc::clone(&session_manager),
+            Arc::new(PermissionManager::new(data_dir.path().join("permissions"))),
+            None,
+            GooseMode::default(),
+            false,
+            GoosePlatform::GooseCli,
+        )));
+        let session = session_manager
+            .create_session(
+                data_dir.path().to_path_buf(),
+                "delegate-extension-persistence".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+        let mut scoped = ExtensionConfig::streamable_http(
+            "scoped-document",
+            "http://localhost/mcp",
+            "Owned document tools",
+            60_u64,
+        );
+        if let ExtensionConfig::StreamableHttp { headers, .. } = &mut scoped {
+            headers.insert(
+                "Authorization".to_string(),
+                "Bearer scoped-test-token".to_string(),
+            );
+        }
+        let results = agent
+            .add_extensions_bulk_with_config(
+                vec![persisted_builtin("todo"), scoped.clone()],
+                &session.id,
+                &config,
+            )
+            .await
+            .unwrap();
+        assert!(results
+            .iter()
+            .any(|result| result.name == "todo" && result.success));
+        assert!(results.iter().any(|result| {
+            result.name == "scoped-document"
+                && !result.success
+                && result.error.as_deref()
+                    == Some("extension is only available to delegated agents")
+        }));
+        assert!(
+            !agent
+                .extension_manager
+                .is_extension_enabled("scoped-document")
+                .await
+        );
+
+        agent
+            .persist_extension_state_with_config(&session.id, Vec::new(), &config)
+            .await
+            .unwrap();
+        let persisted = session_manager
+            .get_session(&session.id, false)
+            .await
+            .unwrap();
+        let enabled = EnabledExtensionsState::from_extension_data(&persisted.extension_data)
+            .unwrap()
+            .extensions;
+        assert_eq!(enabled.len(), 2);
+        assert!(enabled.iter().any(|extension| extension.name() == "todo"));
+        assert!(enabled.iter().any(|extension| {
+            serde_json::to_value(extension).unwrap() == serde_json::to_value(&scoped).unwrap()
+        }));
+    }
 
     fn persisted_builtin(name: &str) -> ExtensionConfig {
         ExtensionConfig::Builtin {
