@@ -24,7 +24,7 @@ use rmcp::model::{
     MetaObject, Role, ServerCapabilities, ServerNotification, Tool,
 };
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -80,6 +80,9 @@ fn kind_plural(kind: SourceType) -> &'static str {
 pub struct DelegateParams {
     pub instructions: Option<String>,
     pub source: Option<String>,
+    pub artifact_key: Option<String>,
+    pub artifact_title: Option<String>,
+    pub previous_task_id: Option<String>,
     pub parameters: Option<HashMap<String, serde_json::Value>>,
     pub extensions: Option<Vec<String>>,
     pub provider: Option<String>,
@@ -101,6 +104,7 @@ struct SendParams {
 #[derive(Debug, Deserialize)]
 struct MessageParentParams {
     message: String,
+    kind: Option<String>,
 }
 
 pub struct BackgroundTask {
@@ -624,6 +628,9 @@ pub struct SummonClient {
     source_cache: Mutex<Option<(Instant, PathBuf, Vec<SourceEntry>)>>,
     background_tasks: Mutex<HashMap<String, BackgroundTask>>,
     completed_tasks: Mutex<HashMap<String, CompletedTask>>,
+    artifact_tasks: Mutex<HashMap<(String, String), String>>,
+    event_driven_parents: Mutex<HashSet<String>>,
+    event_driven_children: Mutex<HashSet<String>>,
 }
 
 impl Drop for SummonClient {
@@ -648,6 +655,9 @@ impl SummonClient {
             source_cache: Mutex::new(None),
             background_tasks: Mutex::new(HashMap::new()),
             completed_tasks: Mutex::new(HashMap::new()),
+            artifact_tasks: Mutex::new(HashMap::new()),
+            event_driven_parents: Mutex::new(HashSet::new()),
+            event_driven_children: Mutex::new(HashSet::new()),
         })
     }
 
@@ -777,6 +787,18 @@ impl SummonClient {
                     "type": "string",
                     "description": "Name of a recipe or agent to run."
                 },
+                "artifact_key": {
+                    "type": "string",
+                    "description": "Stable document key for an artifact-owning agent: document:<saved ID> for a revision, or new:<role>:<requested title> for a new artifact."
+                },
+                "artifact_title": {
+                    "type": "string",
+                    "description": "Current saved or requested title of the artifact. Required for Office specialists to link new-artifact and saved-document keys."
+                },
+                "previous_task_id": {
+                    "type": "string",
+                    "description": "For a follow-up on the same artifact, the finished specialist task whose result you reviewed."
+                },
                 "parameters": {
                     "type": "object",
                     "additionalProperties": true,
@@ -860,12 +882,13 @@ impl SummonClient {
     fn create_message_parent_tool(&self) -> Tool {
         Tool::new(
             "message_parent",
-            "Send an interim progress update or finding to the parent task without ending this task. Final results are delivered automatically.".to_string(),
+            "Send a question, blocker, or decision needing parent action without ending this task. For event-driven parents, kind is required; progress stays local. Final results are delivered automatically.".to_string(),
             serde_json::json!({
                 "type": "object",
                 "required": ["message"],
                 "properties": {
-                    "message": {"type": "string", "description": "Update for the parent task."}
+                    "message": {"type": "string", "description": "Update for the parent task."},
+                    "kind": {"type": "string", "enum": ["question", "blocker", "decision", "progress"], "description": "Why the parent needs this message. Progress does not wake event-driven parents."}
                 }
             })
             .as_object()
@@ -1078,6 +1101,12 @@ impl SummonClient {
             .and_then(|args| args.get("peek"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        if self.event_driven_parents.lock().await.contains(session_id)
+            && !(cancel && source_name.is_some_and(is_session_id))
+        {
+            return Err("This coordinator receives specialist messages and terminal reports automatically. Finish the reply to wait; use send to steer an active task.".to_string());
+        }
 
         let working_dir = self.get_working_dir(session_id).await;
 
@@ -2245,6 +2274,7 @@ impl SummonClient {
 
         // Keep the same lock order as task lookup so the running -> completed
         // transition is atomic from callers' perspective.
+        let mut artifact_tasks = self.artifact_tasks.lock().await;
         let mut completed = self.completed_tasks.lock().await;
         let mut tasks = self.background_tasks.lock().await;
         for (id, _) in finished {
@@ -2291,6 +2321,12 @@ impl SummonClient {
         completed.retain(|_id, task| {
             task.completion_delivery_error.is_some() || task.completed_at.elapsed() <= ttl
         });
+        artifact_tasks
+            .retain(|_, task_id| tasks.contains_key(task_id) || completed.contains_key(task_id));
+        self.event_driven_children
+            .lock()
+            .await
+            .retain(|task_id| tasks.contains_key(task_id));
     }
 
     fn get_task_description(params: &DelegateParams) -> String {
@@ -2324,14 +2360,55 @@ impl SummonClient {
             .map_err(|e| format!("Failed to get session: {}", e))?;
 
         let working_dir = session.working_dir.clone();
-        let non_blocking = if let Some(source_name) = params.source.as_deref() {
+        let source = if let Some(source_name) = params.source.as_deref() {
             self.resolve_source(session_id, source_name, &working_dir)
                 .await?
-                .and_then(|source| source.properties.get("non_blocking").cloned())
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false)
         } else {
-            false
+            None
+        };
+        let source_flag = |name: &str| {
+            source
+                .as_ref()
+                .and_then(|source| source.properties.get(name))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+        let non_blocking = source_flag("non_blocking");
+        let event_driven_parent = source_flag("event_driven_parent");
+        let artifact_keys = if source_flag("artifact_guard") {
+            let role = params
+                .source
+                .as_deref()
+                .and_then(|name| name.strip_prefix("cortex-"))
+                .ok_or_else(|| "Artifact-guarded sources must have a cortex role".to_string())?;
+            let new_prefix = format!("new:{role}:");
+            let key = params
+                .artifact_key
+                .as_deref()
+                .map(|key| key.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
+                .filter(|key| {
+                    key.strip_prefix("document:").is_some_and(|id| !id.is_empty())
+                        || key.strip_prefix(new_prefix.as_str()).is_some_and(|title| !title.is_empty())
+                })
+                .filter(|key| key.len() <= 300)
+                .ok_or_else(|| format!("Office delegation requires artifact_key: document:<saved ID> or {new_prefix}<title>"))?;
+            let title = params
+                .artifact_title
+                .as_deref()
+                .map(|title| {
+                    title
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_lowercase()
+                })
+                .filter(|title| !title.is_empty() && title.len() <= 240)
+                .ok_or_else(|| {
+                    "Office delegation requires the artifact's current title".to_string()
+                })?;
+            vec![key, format!("title:{role}:{title}")]
+        } else {
+            Vec::new()
         };
         let recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
@@ -2358,11 +2435,44 @@ impl SummonClient {
         .with_use_login_shell_path(self.context.use_login_shell_path);
         agent_config.is_subagent = true;
 
+        let mut artifact_tasks = self.artifact_tasks.lock().await;
+        for key in &artifact_keys {
+            if let Some(existing) = artifact_tasks.get(&(session_id.to_string(), key.clone())) {
+                if self.background_tasks.lock().await.contains_key(existing) {
+                    return Err(format!("Artifact {key} already has active specialist task {existing}. Steer that task with send."));
+                }
+                if !self.completed_tasks.lock().await.contains_key(existing) {
+                    return Err(format!("The previous specialist task {existing} is unavailable; wait for its terminal report."));
+                }
+                if params.previous_task_id.as_deref() != Some(existing.as_str()) {
+                    return Err(format!("Review the terminal result of task {existing} and the saved artifact before delegating a follow-up with previous_task_id."));
+                }
+            }
+        }
+        if let Some(previous) = params.previous_task_id.as_deref() {
+            if !artifact_keys.iter().any(|key| {
+                artifact_tasks
+                    .get(&(session_id.to_string(), key.clone()))
+                    .map(String::as_str)
+                    == Some(previous)
+            }) {
+                return Err(
+                    "previous_task_id does not refer to an earlier task for this artifact"
+                        .to_string(),
+                );
+            }
+        }
         let subagent_session = self
             .create_subagent_session(&task_config, description.clone())
             .await?;
 
         let task_id = subagent_session.id.clone();
+        if event_driven_parent {
+            self.event_driven_children
+                .lock()
+                .await
+                .insert(task_id.clone());
+        }
         let completion_session_manager = Arc::clone(&self.context.session_manager);
         let completion_delivery_error = Arc::new(Mutex::new(None));
         let task_completion_delivery_error = Arc::clone(&completion_delivery_error);
@@ -2460,8 +2570,20 @@ impl SummonClient {
             .lock()
             .await
             .insert(task_id.clone(), task);
+        for key in artifact_keys {
+            artifact_tasks.insert((session_id.to_string(), key), task_id.clone());
+        }
+        drop(artifact_tasks);
+        if event_driven_parent {
+            self.event_driven_parents
+                .lock()
+                .await
+                .insert(session_id.to_string());
+        }
 
-        let retrieval = if non_blocking {
+        let retrieval = if event_driven_parent {
+            "It will report back automatically. Finish your reply to wait for an actionable message or terminal report; do not call load.".to_string()
+        } else if non_blocking {
             format!(
                 "It will report back automatically. Do not poll or sleep; finish your reply when no independent work remains. Use load(source: \"{task_id}\", peek: true) only for requested status."
             )
@@ -2496,7 +2618,10 @@ impl McpClientTrait for SummonClient {
             .map(|s| s.session_type == SessionType::SubAgent)
             .unwrap_or(false);
 
-        let mut tools = vec![self.create_load_tool()];
+        let mut tools = Vec::new();
+        if is_subagent || !self.event_driven_parents.lock().await.contains(session_id) {
+            tools.push(self.create_load_tool());
+        }
 
         if is_subagent {
             tools.push(self.create_message_parent_tool());
@@ -2601,22 +2726,32 @@ impl McpClientTrait for SummonClient {
                     .map(|params| {
                         params.unwrap_or(MessageParentParams {
                             message: String::new(),
+                            kind: None,
                         })
                     });
                 match params {
-                    Ok(params) => match self
-                        .context
-                        .session_manager
-                        .send_to_parent(session_id, &params.message)
-                        .await
-                    {
-                        Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                            "Update queued for the parent task.",
-                        )])),
-                        Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                            "Error: {error}"
-                        ))])),
-                    },
+                    Ok(params) => {
+                        if self.event_driven_children.lock().await.contains(session_id) {
+                            match params.kind.as_deref() {
+                                Some("progress") => return Ok(CallToolResult::success(vec![ContentBlock::text("Progress remains within this task; the parent was not awakened.")])),
+                                Some("question" | "blocker" | "decision") => {}
+                                _ => return Ok(CallToolResult::error(vec![ContentBlock::text("Event-driven specialists must set kind to question, blocker, or decision for parent messages.")])),
+                            }
+                        }
+                        match self
+                            .context
+                            .session_manager
+                            .send_to_parent(session_id, &params.message)
+                            .await
+                        {
+                            Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                                "Update queued for the parent task.",
+                            )])),
+                            Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                                format!("Error: {error}"),
+                            )])),
+                        }
+                    }
                     Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "Error: Invalid parameters: {error}"
                     ))])),
