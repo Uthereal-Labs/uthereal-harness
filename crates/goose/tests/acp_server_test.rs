@@ -1823,3 +1823,127 @@ fn test_shell_terminal_false() {
 fn test_shell_terminal_true() {
     run_test(async { run_shell_terminal_true::<AcpServerConnection>().await });
 }
+
+#[test]
+fn automatic_typed_task_outcome_precedes_parent_reply_in_both_loops() {
+    run_test(async {
+        use goose_sdk_types::custom_requests::TaskTerminalStatus;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        for use_state_machine in [false, true] {
+            let openai =
+                OpenAiFixture::new(vec![], Arc::new(goose_test_support::IgnoreSessionId)).await;
+            let reported = Arc::new(AtomicBool::new(false));
+            let report_seen = Arc::clone(&reported);
+            openai
+                .mount_responder(move |request: &wiremock::Request| {
+                    if String::from_utf8_lossy(&request.body).contains("automatic typed terminal") {
+                        report_seen.store(true, Ordering::SeqCst);
+                    }
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(include_str!("acp_test_data/openai_basic.txt"))
+                        .set_delay(std::time::Duration::from_millis(150))
+                })
+                .await;
+            let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+            let SessionData { session, .. } = conn.new_session().await.unwrap();
+            let manager = SessionManager::new(conn.data_root());
+            let key = uuid::Uuid::new_v4().to_string();
+            let parent = session.session_id().0.to_string();
+            let prompt = conn.cx().send_request(PromptRequest::new(session.session_id().clone(),
+                vec![ContentBlock::Text(TextContent::new("start work"))]).meta(
+                    serde_json::from_value::<agent_client_protocol::schema::v1::Meta>(serde_json::json!({"goose": {
+                        "attemptKey":key, "awaitBackgroundTasks":true, "unrolledAgentLoop":use_state_machine,
+                    }})).unwrap())).block_task();
+            let publish = async {
+                let child = manager
+                    .create_session(
+                        session.work_dir(),
+                        "specialist".into(),
+                        SessionType::SubAgent,
+                        GooseMode::Auto,
+                    )
+                    .await
+                    .unwrap();
+                let admission = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let admission = manager
+                            .capture_task_admission(&parent, &child.id, "inline")
+                            .await
+                            .unwrap();
+                        if admission.attempt_key.as_deref() == Some(&key) {
+                            break admission;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let mut data = child.extension_data;
+                data.set_extension_state(
+                    "summon",
+                    "task_admission_v1",
+                    serde_json::to_value(&admission).unwrap(),
+                );
+                manager
+                    .update(&child.id)
+                    .parent_session_id(Some(parent.clone()))
+                    .extension_data(data)
+                    .apply()
+                    .await
+                    .unwrap();
+                manager
+                    .enqueue_task_outcome(
+                        &child.id,
+                        "automatic typed terminal",
+                        TaskTerminalStatus::Completed,
+                    )
+                    .await
+                    .unwrap();
+                admission
+            };
+            let (response, admission) = tokio::join!(prompt, publish);
+            assert_eq!(response.unwrap().stop_reason, StopReason::EndTurn);
+            assert!(
+                reported.load(Ordering::SeqCst),
+                "parent must receive report without an explicit load"
+            );
+            let updates = session.session_updates();
+            let outcome_position = updates
+                .iter()
+                .position(|update| {
+                    let SessionUpdate::SessionInfoUpdate(info) = update else {
+                        return false;
+                    };
+                    info.meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("goose"))
+                        .and_then(|goose| goose.get("taskOutcome"))
+                        .is_some_and(|outcome| {
+                            outcome["taskId"] == admission.task_id
+                                && outcome["status"] == "completed"
+                        })
+                })
+                .expect("automatic standard typed update");
+            let reply_position = updates
+                .iter()
+                .rposition(|update| matches!(update, SessionUpdate::AgentMessageChunk(_)))
+                .unwrap();
+            assert!(
+                outcome_position < reply_position,
+                "outcome must arrive before the parent report reply"
+            );
+            let evidence = send_custom(
+                conn.cx(),
+                "_goose/unstable/attempt/task-evidence",
+                serde_json::json!({"attemptKey":key,"toolNames":[]}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(evidence["tasks"][0]["outcome"]["taskId"], admission.task_id);
+            assert_eq!(evidence["tasks"][0]["outcome"]["status"], "completed");
+            assert_eq!(evidence["evidenceComplete"], true);
+        }
+    });
+}

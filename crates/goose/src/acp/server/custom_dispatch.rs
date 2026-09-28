@@ -125,6 +125,17 @@ impl GooseAcpAgent {
         self.on_set_session_system_prompt(req).await
     }
 
+    #[custom_method(TaskEvidenceRequest)]
+    async fn dispatch_task_evidence(
+        &self,
+        req: TaskEvidenceRequest,
+    ) -> Result<TaskEvidenceResponse, agent_client_protocol::Error> {
+        self.session_manager
+            .task_evidence(&req)
+            .await
+            .internal_err_ctx("Failed to read task evidence")
+    }
+
     #[custom_method(PromptAttemptTranscriptRequest)]
     async fn dispatch_prompt_attempt_transcript(
         &self,

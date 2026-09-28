@@ -299,6 +299,82 @@ pub struct PromptAttemptTranscriptResponse {
     pub done: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAdmission {
+    pub task_id: String,
+    pub parent_session_id: String,
+    pub parent_run_id: Option<String>,
+    pub attempt_key: Option<String>,
+    pub source_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTerminalStatus {
+    Completed,
+    Failed,
+    Panicked,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskOutcome {
+    #[serde(flatten)]
+    pub admission: TaskAdmission,
+    pub status: TaskTerminalStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolReceiptTransportStatus {
+    Success,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskToolReceipt {
+    pub task_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    pub transport_status: ToolReceiptTransportStatus,
+    pub is_error: Option<bool>,
+    pub structured_result: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskEvidence {
+    pub admission: TaskAdmission,
+    pub outcome: Option<TaskOutcome>,
+    pub receipts: Vec<TaskToolReceipt>,
+    pub evidence_complete: bool,
+}
+
+/// Read scoped outcomes and selected canonical tool receipts without activating an agent.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/attempt/task-evidence", response = TaskEvidenceResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskEvidenceRequest {
+    pub attempt_key: String,
+    #[serde(default)]
+    pub tool_names: Vec<String>,
+    pub after_task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskEvidenceResponse {
+    pub attempt_key: String,
+    pub parent_session_id: String,
+    pub parent_run_id: String,
+    pub tasks: Vec<TaskEvidence>,
+    pub next_task_id: Option<String>,
+    pub evidence_complete: bool,
+}
+
 /// Get a diagnostic report for a session.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
 #[request(

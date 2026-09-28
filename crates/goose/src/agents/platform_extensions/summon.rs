@@ -18,7 +18,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::FutureExt;
 use goose_agent::operation::messages_since_kickoff;
-use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
+use goose_sdk_types::custom_requests::{SourceEntry, SourceType, TaskTerminalStatus};
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, InitializeResult, JsonObject, ListToolsResult,
     MetaObject, Role, ServerCapabilities, ServerNotification, Tool,
@@ -129,6 +129,7 @@ pub struct BackgroundTask {
     pub parent_session_id: String,
     pub non_blocking: bool,
     pub completion_delivery_error: Arc<Mutex<Option<String>>>,
+    terminal_status: Arc<Mutex<Option<TaskTerminalStatus>>>,
     pub description: String,
     pub started_at: Instant,
     pub turns: Arc<AtomicU32>,
@@ -152,10 +153,49 @@ where
     (handle, completion_token)
 }
 
+async fn task_execution_outcome<F>(
+    future: F,
+    cancellation: &CancellationToken,
+) -> (Result<String>, TaskTerminalStatus)
+where
+    F: Future<Output = Result<String>>,
+{
+    let (result, status) = match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+        Ok(result) => {
+            let status = if result.is_ok() {
+                TaskTerminalStatus::Completed
+            } else {
+                TaskTerminalStatus::Failed
+            };
+            (result, status)
+        }
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            (
+                Err(anyhow::anyhow!("Task panicked: {detail}")),
+                TaskTerminalStatus::Panicked,
+            )
+        }
+    };
+    (
+        result,
+        if cancellation.is_cancelled() {
+            TaskTerminalStatus::Cancelled
+        } else {
+            status
+        },
+    )
+}
+
 pub struct CompletedTask {
     pub id: String,
     pub parent_session_id: String,
     pub completion_delivery_error: Option<String>,
+    terminal_status: TaskTerminalStatus,
     pub description: String,
     pub result: Result<String, String>,
     pub turns_taken: u32,
@@ -693,6 +733,7 @@ impl SummonClient {
         task_config: &TaskConfig,
         name: String,
         policy: Option<&SummonTaskPolicy>,
+        source_name: &str,
     ) -> Result<crate::session::Session, String> {
         let session = self
             .context
@@ -713,6 +754,21 @@ impl SummonClient {
                     "summon",
                     "v1",
                     serde_json::to_value(policy).map_err(|error| error.to_string())?,
+                );
+                let admission = self
+                    .context
+                    .session_manager
+                    .capture_task_admission(
+                        &task_config.parent_session_id,
+                        &session.id,
+                        source_name,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                extension_data.set_extension_state(
+                    "summon",
+                    "task_admission_v1",
+                    serde_json::to_value(admission).map_err(|error| error.to_string())?,
                 );
             }
             self.context
@@ -870,21 +926,24 @@ impl SummonClient {
         manager: &crate::session::SessionManager,
         task_id: &str,
         result: &anyhow::Result<String>,
-        cancelled: bool,
+        terminal_status: TaskTerminalStatus,
     ) -> anyhow::Result<()> {
-        let status = if cancelled {
-            "was cancelled"
-        } else if result.is_ok() {
-            "completed successfully"
-        } else {
-            "failed"
+        let status = match terminal_status {
+            TaskTerminalStatus::Completed => "completed successfully",
+            TaskTerminalStatus::Cancelled => "was cancelled",
+            TaskTerminalStatus::Failed => "failed",
+            TaskTerminalStatus::Panicked => "panicked",
         };
         let output = match result {
             Ok(output) => output.clone(),
             Err(error) => error.to_string(),
         };
         manager
-            .enqueue_completion_to_parent(task_id, &format!("Task {task_id} {status}.\n\n{output}"))
+            .enqueue_task_outcome(
+                task_id,
+                &format!("Task {task_id} {status}.\n\n{output}"),
+                terminal_status,
+            )
             .await?;
         Ok(())
     }
@@ -898,19 +957,13 @@ impl SummonClient {
             .and_then(|task| {
                 task.completion_delivery_error
                     .as_ref()
-                    .map(|error| (task.result.clone(), error.clone()))
+                    .map(|error| (task.result.clone(), task.terminal_status, error.clone()))
             });
-        let Some((result, original_error)) = pending else {
+        let Some((result, status, original_error)) = pending else {
             return Ok(());
         };
-        let report = match result {
-            Ok(output) => format!("Task {task_id} completed successfully.\n\n{output}"),
-            Err(error) if error.starts_with("Task was cancelled:") => {
-                format!("Task {task_id} was cancelled.\n\n{error}")
-            }
-            Err(error) => format!("Task {task_id} failed.\n\n{error}"),
-        };
-        self.context.session_manager.enqueue_completion_to_parent(task_id, &report).await
+        let result = result.map_err(anyhow::Error::msg);
+        Self::enqueue_task_completion(&self.context.session_manager, task_id, &result, status).await
             .map_err(|error| format!("Failed to deliver background task completion: {original_error}; recovery failed: {error}"))?;
         if let Some(task) = self.completed_tasks.lock().await.get_mut(task_id) {
             task.completion_delivery_error = None;
@@ -1623,9 +1676,10 @@ impl SummonClient {
                     if let Err(error) = self
                         .context
                         .session_manager
-                        .enqueue_completion_to_parent(
+                        .enqueue_task_outcome(
                             task_id,
                             &format!("Task {task_id} was cancelled.\n\n{output}"),
+                            TaskTerminalStatus::Cancelled,
                         )
                         .await
                     {
@@ -1868,10 +1922,22 @@ impl SummonClient {
                 "subagent_session_id".to_string(),
                 serde_json::Value::String(task_id.clone()),
             );
+            let admission = self
+                .context
+                .session_manager
+                .task_admission(&task_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Async task has no immutable admission".to_string())?;
+            meta.0.insert(
+                "taskAdmission".to_string(),
+                serde_json::to_value(&admission).map_err(|error| error.to_string())?,
+            );
             let mut result = CallToolResult::success(content).with_meta(Some(meta));
             result.structured_content = Some(serde_json::json!({
                 "subagent_session_id": task_id,
-                "task_status": "running"
+                "task_status": "running",
+                "taskAdmission": admission,
             }));
             return Ok(result);
         }
@@ -1901,7 +1967,7 @@ impl SummonClient {
         agent_config.is_subagent = true;
 
         let subagent_session = self
-            .create_subagent_session(&task_config, "Delegated task".to_string(), None)
+            .create_subagent_session(&task_config, "Delegated task".to_string(), None, "inline")
             .await?;
 
         let subagent_session_id = subagent_session.id.clone();
@@ -2553,7 +2619,13 @@ impl SummonClient {
                 .unwrap_or_else(|| task.turns.load(Ordering::Relaxed));
             let duration = task.started_at.elapsed();
 
-            let result = match task.handle.await {
+            let joined = task.handle.await;
+            let join_status = match &joined {
+                Err(error) if error.is_panic() => Some(TaskTerminalStatus::Panicked),
+                Err(error) if error.is_cancelled() => Some(TaskTerminalStatus::Cancelled),
+                _ => None,
+            };
+            let result = match joined {
                 Ok(Ok(output)) => {
                     info!("Background task {} completed successfully", id);
                     Ok(output)
@@ -2568,29 +2640,36 @@ impl SummonClient {
                 }
             };
 
-            let cancelled = if task.cancellation_token.is_cancelled() {
-                let canonical = if task.parent_session_id.is_empty() {
-                    None
-                } else {
-                    self.context
-                        .session_manager
-                        .terminal_report_for_child(&task.parent_session_id, &id)
-                        .await
-                        .ok()
-                        .flatten()
-                };
-                // A later cancellation request cannot change an already published
-                // terminal outcome while notification attachment was yielding.
-                !canonical.is_some_and(|report| {
-                    report
-                        .body
-                        .starts_with(&format!("Task {id} completed successfully."))
-                        || report.body.starts_with(&format!("Task {id} failed."))
-                })
+            let canonical = if task.parent_session_id.is_empty() {
+                None
             } else {
-                false
+                self.context
+                    .session_manager
+                    .terminal_report_for_child(&task.parent_session_id, &id)
+                    .await
+                    .ok()
+                    .flatten()
             };
-            let result = if cancelled {
+            let native_status = task
+                .terminal_status
+                .lock()
+                .await
+                .or(join_status)
+                .unwrap_or_else(|| {
+                    if task.cancellation_token.is_cancelled() {
+                        TaskTerminalStatus::Cancelled
+                    } else if result.is_ok() {
+                        TaskTerminalStatus::Completed
+                    } else {
+                        TaskTerminalStatus::Failed
+                    }
+                });
+            let status = canonical
+                .as_ref()
+                .and_then(|report| report.task_outcome().ok().flatten())
+                .map(|outcome| outcome.status)
+                .unwrap_or(native_status);
+            let result = if status == TaskTerminalStatus::Cancelled {
                 Err(format!(
                     "Task was cancelled: {}",
                     result.unwrap_or_else(|error| error)
@@ -2598,12 +2677,27 @@ impl SummonClient {
             } else {
                 result
             };
+            let mut delivery_error = task.completion_delivery_error.lock().await.clone();
+            if canonical.is_none() && !task.parent_session_id.is_empty() {
+                let native_result = result.clone().map_err(anyhow::Error::msg);
+                if let Err(error) = Self::enqueue_task_completion(
+                    &self.context.session_manager,
+                    &id,
+                    &native_result,
+                    status,
+                )
+                .await
+                {
+                    delivery_error = Some(error.to_string());
+                }
+            }
             completed.insert(
                 id.clone(),
                 CompletedTask {
                     id,
                     parent_session_id: task.parent_session_id,
-                    completion_delivery_error: task.completion_delivery_error.lock().await.clone(),
+                    completion_delivery_error: delivery_error,
+                    terminal_status: status,
                     description: task.description,
                     result,
                     turns_taken,
@@ -2715,13 +2809,23 @@ impl SummonClient {
             return Err("Maximum background tasks already running".to_string());
         }
         let subagent_session = self
-            .create_subagent_session(&task_config, description.clone(), Some(&policy))
+            .create_subagent_session(
+                &task_config,
+                description.clone(),
+                Some(&policy),
+                source
+                    .as_ref()
+                    .map(|source| source.name.as_str())
+                    .unwrap_or("inline"),
+            )
             .await?;
 
         let task_id = subagent_session.id.clone();
         let completion_session_manager = Arc::clone(&self.context.session_manager);
         let completion_delivery_error = Arc::new(Mutex::new(None));
         let task_completion_delivery_error = Arc::clone(&completion_delivery_error);
+        let terminal_status = Arc::new(Mutex::new(None));
+        let task_terminal_status = Arc::clone(&terminal_status);
 
         let turns = Arc::new(AtomicU32::new(0));
         let last_activity = Arc::new(AtomicU64::new(0));
@@ -2756,29 +2860,24 @@ impl SummonClient {
                 parent_span,
                 telemetry_session_id,
             };
-            let result = std::panic::AssertUnwindSafe(Self::run_subagent_with_notifications(
-                task_notification_sink,
-                move |notification_tx| {
-                    let mut params = params;
-                    params.notification_tx = Some(notification_tx);
-                    run_subagent_task(params)
-                },
-            ))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|panic| {
-                let detail = panic
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-                    .unwrap_or("unknown panic");
-                Err(anyhow::anyhow!("Task panicked: {detail}"))
-            });
+            let (result, status) = task_execution_outcome(
+                Self::run_subagent_with_notifications(
+                    task_notification_sink,
+                    move |notification_tx| {
+                        let mut params = params;
+                        params.notification_tx = Some(notification_tx);
+                        run_subagent_task(params)
+                    },
+                ),
+                &completion_cancellation_token,
+            )
+            .await;
+            *task_terminal_status.lock().await = Some(status);
             if let Err(error) = Self::enqueue_task_completion(
                 &completion_session_manager,
                 &completion_task_id,
                 &result,
-                completion_cancellation_token.is_cancelled(),
+                status,
             )
             .await
             {
@@ -2796,6 +2895,7 @@ impl SummonClient {
             parent_session_id: session_id.to_string(),
             non_blocking,
             completion_delivery_error,
+            terminal_status,
             description: description.clone(),
             started_at: Instant::now(),
             turns,
@@ -3313,6 +3413,7 @@ mod tests {
                     artifact_key: Some(key.to_string()),
                     previous_task_id: previous.map(str::to_string),
                 }),
+                "inline",
             )
             .await
             .unwrap()
@@ -3331,6 +3432,7 @@ mod tests {
             parent_session_id: parent.to_string(),
             non_blocking: true,
             completion_delivery_error: Arc::new(Mutex::new(None)),
+            terminal_status: Arc::new(Mutex::new(None)),
             description: "Specialist".to_string(),
             started_at: Instant::now(),
             turns: Arc::new(AtomicU32::new(0)),
@@ -3350,6 +3452,35 @@ mod tests {
             source.properties["event_driven_parent"],
             serde_json::json!(true)
         );
+    }
+
+    #[tokio::test]
+    async fn typed_task_status_comes_from_execution_not_output_prose() {
+        let token = CancellationToken::new();
+        let (output, status) =
+            task_execution_outcome(async { Ok("failed and cancelled".to_string()) }, &token).await;
+        assert!(output.is_ok());
+        assert_eq!(status, TaskTerminalStatus::Completed);
+        let (_, status) = task_execution_outcome(
+            async { Err(anyhow::anyhow!("completed successfully")) },
+            &token,
+        )
+        .await;
+        assert_eq!(status, TaskTerminalStatus::Failed);
+        let (_, status) = task_execution_outcome(
+            async {
+                panic!("native panic");
+                #[allow(unreachable_code)]
+                Ok(String::new())
+            },
+            &token,
+        )
+        .await;
+        assert_eq!(status, TaskTerminalStatus::Panicked);
+        token.cancel();
+        let (_, status) =
+            task_execution_outcome(async { Ok("saved partial result".to_string()) }, &token).await;
+        assert_eq!(status, TaskTerminalStatus::Cancelled);
     }
 
     #[tokio::test]
@@ -3400,6 +3531,13 @@ mod tests {
             first.structured_content.as_ref().unwrap()["task_status"],
             serde_json::json!("running")
         );
+        let structured_admission = &first.structured_content.as_ref().unwrap()["taskAdmission"];
+        assert_eq!(
+            first.meta.as_ref().unwrap().0["taskAdmission"],
+            *structured_admission
+        );
+        assert_eq!(structured_admission["sourceName"], "cortex-slides");
+        assert_eq!(structured_admission["parentSessionId"], parent);
         let id = first.structured_content.unwrap()["subagent_session_id"]
             .as_str()
             .unwrap()
@@ -3423,6 +3561,36 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        let inline = client
+            .handle_delegate(
+                &parent,
+                Some(
+                    serde_json::json!({
+                        "instructions":"Perform a generic task.","extensions":[],"async":true,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let admission = &inline.structured_content.as_ref().unwrap()["taskAdmission"];
+        assert_eq!(admission["sourceName"], "inline");
+        assert_eq!(admission["parentSessionId"], parent);
+        assert!(admission["attemptKey"].is_null() && admission["parentRunId"].is_null());
+        assert_eq!(inline.meta.as_ref().unwrap().0["taskAdmission"], *admission);
+        assert_eq!(
+            manager
+                .task_admission(admission["taskId"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .source_name,
+            "inline"
         );
         client.shutdown_session(&parent).await.unwrap();
     }
@@ -3528,6 +3696,7 @@ mod tests {
                 id: last.clone(),
                 parent_session_id: parent.clone(),
                 completion_delivery_error: None,
+                terminal_status: TaskTerminalStatus::Completed,
                 description: "Translation".to_string(),
                 result: Ok("Partial".to_string()),
                 turns_taken: 1,
@@ -3747,6 +3916,7 @@ mod tests {
                 id: child.clone(),
                 parent_session_id: parent.clone(),
                 completion_delivery_error: Some("temporary database outage".to_string()),
+                terminal_status: TaskTerminalStatus::Failed,
                 description: "Translation".to_string(),
                 result: Err("Saved checkpoint; final validation failed".to_string()),
                 turns_taken: 2,
@@ -3850,9 +4020,14 @@ mod tests {
                 Ok(output) => output.clone(),
                 Err(error) => error.to_string(),
             };
-            SummonClient::enqueue_task_completion(&manager, &child, &result, true)
-                .await
-                .unwrap();
+            SummonClient::enqueue_task_completion(
+                &manager,
+                &child,
+                &result,
+                TaskTerminalStatus::Cancelled,
+            )
+            .await
+            .unwrap();
             let report = manager
                 .terminal_report_for_child(&parent, &child)
                 .await
@@ -3867,7 +4042,7 @@ mod tests {
                 &manager,
                 &child,
                 &Ok("later retry".into()),
-                false,
+                TaskTerminalStatus::Completed,
             )
             .await
             .unwrap();
@@ -3904,9 +4079,14 @@ mod tests {
         let (handle, completion) = spawn_background_task(async move {
             finished.await.unwrap();
             let result = Ok("Saved final revision 8".to_string());
-            SummonClient::enqueue_task_completion(&task_manager, &task_id, &result, false)
-                .await
-                .unwrap();
+            SummonClient::enqueue_task_completion(
+                &task_manager,
+                &task_id,
+                &result,
+                TaskTerminalStatus::Completed,
+            )
+            .await
+            .unwrap();
             result
         });
         let token = CancellationToken::new();
@@ -5372,6 +5552,7 @@ You review code."#;
                 id: task_id.to_string(),
                 parent_session_id: String::new(),
                 completion_delivery_error: None,
+                terminal_status: TaskTerminalStatus::Completed,
                 description: "Completed task".to_string(),
                 result: Ok("done".to_string()),
                 turns_taken: 1,
@@ -5423,6 +5604,7 @@ You review code."#;
                 id: task_id.to_string(),
                 parent_session_id: String::new(),
                 completion_delivery_error: None,
+                terminal_status: TaskTerminalStatus::Completed,
                 description: "Completed task".to_string(),
                 result: Ok("done".to_string()),
                 turns_taken: 1,
@@ -5497,6 +5679,7 @@ You review code."#;
                 id: task_id.to_string(),
                 parent_session_id: String::new(),
                 completion_delivery_error: None,
+                terminal_status: TaskTerminalStatus::Completed,
                 description: "Completed task".to_string(),
                 result: Ok("done".to_string()),
                 turns_taken: 1,
@@ -5549,6 +5732,7 @@ You review code."#;
                     parent_session_id: String::new(),
                     non_blocking: false,
                     completion_delivery_error: Arc::new(Mutex::new(None)),
+                    terminal_status: Arc::new(Mutex::new(None)),
                     description: "Running task".to_string(),
                     started_at: Instant::now(),
                     turns: Arc::new(AtomicU32::new(2)),
@@ -5591,6 +5775,7 @@ You review code."#;
                     id: "20260204_2".to_string(),
                     parent_session_id: String::new(),
                     completion_delivery_error: None,
+                    terminal_status: TaskTerminalStatus::Completed,
                     description: "Successful task".to_string(),
                     result: Ok("Task completed successfully with output".to_string()),
                     turns_taken: 5,
@@ -5605,6 +5790,7 @@ You review code."#;
                     id: "20260204_3".to_string(),
                     parent_session_id: String::new(),
                     completion_delivery_error: None,
+                    terminal_status: TaskTerminalStatus::Completed,
                     description: "Failed task".to_string(),
                     result: Err("Something went wrong".to_string()),
                     turns_taken: 3,
@@ -5706,6 +5892,7 @@ You review code."#;
                 parent_session_id: String::new(),
                 non_blocking: false,
                 completion_delivery_error: Arc::new(Mutex::new(None)),
+                terminal_status: Arc::new(Mutex::new(None)),
                 description: "Inspect the project".to_string(),
                 started_at: Instant::now(),
                 // Simulate hundreds of streamed message events for two durable turns.
@@ -5842,6 +6029,7 @@ You review code."#;
                     parent_session_id: String::new(),
                     non_blocking: false,
                     completion_delivery_error: Arc::new(Mutex::new(None)),
+                    terminal_status: Arc::new(Mutex::new(None)),
                     description: "Cancellable task".to_string(),
                     started_at: Instant::now(),
                     // This stale event count must be replaced after cancellation.
@@ -5888,6 +6076,7 @@ You review code."#;
                 parent_session_id: String::new(),
                 non_blocking: false,
                 completion_delivery_error: Arc::new(Mutex::new(None)),
+                terminal_status: Arc::new(Mutex::new(None)),
                 description: "Finished task".to_string(),
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
@@ -5946,6 +6135,7 @@ You review code."#;
                 parent_session_id: "parent".to_string(),
                 non_blocking: false,
                 completion_delivery_error: Arc::new(Mutex::new(None)),
+                terminal_status: Arc::new(Mutex::new(None)),
                 description: "Cancellable task".to_string(),
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(0)),
@@ -5984,6 +6174,7 @@ You review code."#;
                 parent_session_id: String::new(),
                 non_blocking: false,
                 completion_delivery_error: Arc::new(Mutex::new(None)),
+                terminal_status: Arc::new(Mutex::new(None)),
                 description: "Cancellable task".to_string(),
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
@@ -6049,6 +6240,7 @@ You review code."#;
                 parent_session_id: String::new(),
                 non_blocking: false,
                 completion_delivery_error: Arc::new(Mutex::new(None)),
+                terminal_status: Arc::new(Mutex::new(None)),
                 description: "Running task".to_string(),
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
@@ -6127,6 +6319,7 @@ You review code."#;
                 parent_session_id: String::new(),
                 non_blocking: false,
                 completion_delivery_error: Arc::new(Mutex::new(None)),
+                terminal_status: Arc::new(Mutex::new(None)),
                 description: "Finished task".to_string(),
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
@@ -6198,6 +6391,7 @@ You review code."#;
                     parent_session_id: String::new(),
                     non_blocking: false,
                     completion_delivery_error: Arc::new(Mutex::new(None)),
+                    terminal_status: Arc::new(Mutex::new(None)),
                     description: "Long running analysis".to_string(),
                     started_at: Instant::now(),
                     // Simulate the old stream-event counter after seven fragments.
@@ -6282,6 +6476,7 @@ You review code."#;
                 parent_session_id: String::new(),
                 non_blocking: true,
                 completion_delivery_error: Arc::new(Mutex::new(None)),
+                terminal_status: Arc::new(Mutex::new(None)),
                 description: "Non-blocking task".to_string(),
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(0)),
@@ -6331,6 +6526,7 @@ You review code."#;
                     id: "20260204_1".to_string(),
                     parent_session_id: String::new(),
                     completion_delivery_error: None,
+                    terminal_status: TaskTerminalStatus::Completed,
                     description: "Finished task".to_string(),
                     result: Ok("final output".to_string()),
                     turns_taken: 4,
@@ -6372,6 +6568,7 @@ You review code."#;
                 id: "20260204_1".to_string(),
                 parent_session_id: "parent".to_string(),
                 completion_delivery_error: Some("database unavailable".to_string()),
+                terminal_status: TaskTerminalStatus::Completed,
                 description: "Finished task".to_string(),
                 result: Ok("final output".to_string()),
                 turns_taken: 1,
