@@ -15,6 +15,7 @@ activities:
   - Test load tool for knowledge injection and discovery
   - Test delegate tool for task delegation (sync and async)
   - Validate native task steering, parent reports, and specialist capability policies
+  - Validate artifact ownership recovery and event-driven specialist cancellation
   - Test multi-turn thinking preservation for providers that reject replayed reasoning_content
   - Validate ACP thinking-effort discovery, forwarding, and provider switching
   - Validate durable ACP attempt admission, passive recovery, cancellation tombstones, and both agent loops
@@ -104,6 +105,14 @@ instructions: |
     load reports running status, and the final result is delivered automatically
   - Verify delegate_only extensions and skills stay out of the parent while
     a specialist receives its configured required extensions and skills
+  - Validate an event_driven_parent specialist: progress stays within the child,
+    questions reach the parent, routine load polling is rejected, and cancellation
+    and terminal-result recovery remain available
+  - Validate artifact_guard with distinct saved IDs sharing a title, a stable new
+    artifact key through follow-ups, and ownership restored after compaction and
+    completed-task cache expiry; never infer a saved ID from titles or prose
+  - Simulate failed terminal notification delivery, recover its canonical result,
+    and verify cancellation retains ownership until the child stops
   - In a separate headless CLI run, verify background children finish before
     process exit and that JSON output contains only one final result
 

@@ -348,6 +348,7 @@ pub(crate) struct SessionListPageQuery<'a> {
 #[derive(Debug, Default)]
 struct SessionListQuery<'a> {
     filters: SessionListFilters<'a>,
+    parent_session_id: Option<&'a str>,
     cursor: Option<&'a SessionListCursor>,
     limit: Option<usize>,
 }
@@ -479,6 +480,19 @@ impl SessionManager {
 
     pub async fn list_sessions_by_types(&self, types: &[SessionType]) -> Result<Vec<Session>> {
         self.storage.list_sessions_by_types(Some(types)).await
+    }
+
+    pub async fn list_subagent_sessions(&self, parent_session_id: &str) -> Result<Vec<Session>> {
+        self.storage
+            .list_sessions_matching(SessionListQuery {
+                filters: SessionListFilters {
+                    types: Some(&[SessionType::SubAgent]),
+                    ..Default::default()
+                },
+                parent_session_id: Some(parent_session_id),
+                ..Default::default()
+            })
+            .await
     }
 
     pub(crate) async fn list_sessions_paged(
@@ -2084,6 +2098,9 @@ impl SessionStorage {
         if filters.working_dir.is_some() {
             where_clauses.push("s.working_dir = ?".to_string());
         }
+        if query.parent_session_id.is_some() {
+            where_clauses.push("s.parent_session_id = ?".to_string());
+        }
         if !keywords.is_empty() {
             where_clauses.push(message_keyword_clause(keywords.len()));
         }
@@ -2159,6 +2176,9 @@ impl SessionStorage {
         }
         if let Some(working_dir) = filters.working_dir {
             q = q.bind(working_dir.to_string_lossy().to_string());
+        }
+        if let Some(parent_session_id) = query.parent_session_id {
+            q = q.bind(parent_session_id);
         }
         for term in keywords {
             q = q.bind(term);
@@ -2249,6 +2269,7 @@ impl SessionStorage {
                 filters: query.filters,
                 cursor: query.cursor,
                 limit: Some(page_size + 1),
+                parent_session_id: None,
             })
             .await?;
         let has_next_page = sessions.len() > page_size;
