@@ -19,6 +19,7 @@ activities:
   - Test multi-turn thinking preservation for providers that reject replayed reasoning_content
   - Validate ACP thinking-effort discovery, forwarding, and provider switching
   - Validate durable ACP attempt admission, passive recovery, cancellation tombstones, and both agent loops
+  - Validate typed asynchronous task outcomes and bounded passive structured receipt evidence
   - Validate opt-in ACP conversation workspace creation, reuse, and rejection of traversal or symlink paths
   - Validate GDK observability hook lifecycle events and payload opt-in
   - Verify ACP returns after delegation, accepts steering of the same live task, and delivers an automatic main-agent completion
@@ -481,12 +482,24 @@ prompt: |
   Run from this source checkout with Rust available. Do not use real provider calls
   for the execution-under-test: these suites own deterministic mock providers.
   Do not modify source files or contact shared services. Keep reports inside workspace_dir.
+  For each cargo command below, remove inherited provider overrides from that test
+  process with `env -u GOOSE_PROVIDER -u GOOSE_MODEL -u OPENAI_HOST -u OPENAI_BASE_PATH
+  -u OPENAI_API_KEY -u OPENAI_TIMEOUT -u GOOSE_MODE -u GOOSE_PATH_ROOT cargo ...`.
+  This keeps the recipe's provider separate from the fixtures' mocked configuration
+  and isolated state. Keep raw command output in a log separate from the final report.
   1. Run `cargo test -p goose --test prompt_attempts`.
   2. Run `cargo test -p goose --test acp_custom_requests_test durable_attempt`.
   3. Confirm concurrent claims, cancellation-before-start tombstones, abandoned-lock
      recovery, bounded Unicode transcript reads, and path rejection pass.
   4. Confirm both agent loops preserve completed results through passive status and
      reject session/load, ordinary reprompt and reuse of cancelled attempt keys.
+  5. Run `cargo test -p goose --test task_evidence_test`,
+     `cargo test -p goose --lib typed_task`, and
+     `cargo test -p goose --test acp_server_test automatic_typed_task_outcome`.
+     Confirm native completion, failure, cancellation and panic statuses are typed;
+     passive evidence remains scoped and bounded, preserves receipt execution order,
+     and never exposes tool arguments or text. Confirm both loops emit the typed
+     automatic outcome before the parent reply. Old untyped reports stay unknown.
   Record exact commands, counts and failures in {{ workspace_dir }}/durable_attempts.md.
   {% endif %}
 

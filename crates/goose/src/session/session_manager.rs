@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 18;
+pub const CURRENT_SCHEMA_VERSION: i32 = 19;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
@@ -1115,6 +1115,7 @@ impl SessionStorage {
                 recipient_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                 kind TEXT NOT NULL,
                 body TEXT NOT NULL,
+                outcome_json TEXT,
                 dedupe_key TEXT,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 delivered_at TIMESTAMP,
@@ -1673,6 +1674,16 @@ impl SessionStorage {
                     .await?;
                 sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_attempt_session ON prompt_attempts(session_id) WHERE session_id IS NOT NULL")
                     .execute(&mut **tx).await?;
+            }
+            19 => {
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_mailbox') WHERE name = 'outcome_json')",
+                ).fetch_one(&mut **tx).await?;
+                if !exists {
+                    sqlx::query("ALTER TABLE session_mailbox ADD COLUMN outcome_json TEXT")
+                        .execute(&mut **tx)
+                        .await?;
+                }
             }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);
@@ -4628,6 +4639,63 @@ mod tests {
 
         let reloaded = sm.get_session(&session.id, false).await.unwrap();
         assert_eq!(reloaded.goose_mode, GooseMode::default());
+    }
+
+    #[tokio::test]
+    async fn test_task_outcome_migration_preserves_untyped_mailbox_rows() {
+        let directory = TempDir::new().unwrap();
+        let manager = SessionManager::new(directory.path().to_path_buf());
+        let parent = manager
+            .create_session(
+                directory.path().to_path_buf(),
+                "parent".into(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let child = manager
+            .create_session(
+                directory.path().to_path_buf(),
+                "child".into(),
+                SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        manager
+            .update(&child.id)
+            .parent_session_id(Some(parent.id.clone()))
+            .apply()
+            .await
+            .unwrap();
+        manager
+            .enqueue_completion_to_parent(&child.id, "old completion without typed evidence")
+            .await
+            .unwrap();
+        let pool = manager.storage().pool().await.unwrap();
+        sqlx::query("ALTER TABLE session_mailbox DROP COLUMN outcome_json")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE schema_version SET version = 18")
+            .execute(pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let reconstructed = SessionManager::new(directory.path().to_path_buf());
+        let report = reconstructed
+            .terminal_report_for_child(&parent.id, &child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.body, "old completion without typed evidence");
+        assert!(report.task_outcome().unwrap().is_none());
+        let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(reconstructed.storage().pool().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
     }
 
     #[tokio::test]

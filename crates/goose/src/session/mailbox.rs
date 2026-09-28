@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
+use goose_sdk_types::custom_requests::TaskOutcome;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
@@ -23,10 +24,18 @@ pub struct MailboxMessage {
     pub recipient_session_id: String,
     pub kind: MailboxMessageKind,
     pub body: String,
+    pub outcome_json: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 impl MailboxMessage {
+    pub fn task_outcome(&self) -> Result<Option<TaskOutcome>> {
+        self.outcome_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(Into::into)
+    }
     pub fn parent_envelope(messages: &[Self]) -> Option<Message> {
         if messages.is_empty() {
             return None;
@@ -242,7 +251,7 @@ impl SessionManager {
         let pool = self.storage().pool().await?;
         Ok(sqlx::query_as(
             r#"
-            SELECT id, sender_session_id, recipient_session_id, kind, body, created_at
+            SELECT id, sender_session_id, recipient_session_id, kind, body, outcome_json, created_at
             FROM session_mailbox
             WHERE recipient_session_id = ? AND delivered_at IS NULL
             ORDER BY id
@@ -264,7 +273,7 @@ impl SessionManager {
         }
         Ok(sqlx::query_as(
             r#"
-            SELECT id, sender_session_id, recipient_session_id, kind, body, created_at
+            SELECT id, sender_session_id, recipient_session_id, kind, body, outcome_json, created_at
             FROM session_mailbox
             WHERE recipient_session_id = ? AND sender_session_id = ? AND kind = 'completion'
             ORDER BY id LIMIT 1

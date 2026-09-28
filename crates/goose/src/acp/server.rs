@@ -2343,6 +2343,54 @@ impl GooseAcpAgent {
         ))
     }
 
+    fn task_outcome_update(
+        session_id: &SessionId,
+        run_id: &str,
+        attempt_key: Option<&str>,
+        report: &crate::session::MailboxMessage,
+    ) -> Option<SessionUpdate> {
+        let outcome = match report.task_outcome() {
+            Ok(outcome) => outcome?,
+            Err(_) => {
+                tracing::warn!(task_id = %report.sender_session_id, "Ignoring malformed optional task outcome");
+                return None;
+            }
+        };
+        let admission = &outcome.admission;
+        if admission.task_id != report.sender_session_id
+            || admission.parent_session_id != report.recipient_session_id
+            || admission.parent_session_id != session_id.to_string()
+            || admission.parent_run_id.as_deref() != Some(run_id)
+            || admission.attempt_key.as_deref() != attempt_key
+        {
+            return None;
+        }
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "goose".to_string(),
+            serde_json::json!({"taskOutcome": outcome}),
+        );
+        Some(SessionUpdate::SessionInfoUpdate(
+            SessionInfoUpdate::new().meta(meta),
+        ))
+    }
+
+    fn send_task_outcomes(
+        cx: &ConnectionTo<Client>,
+        session_id: &SessionId,
+        run_id: &str,
+        attempt_key: Option<&str>,
+        reports: &[crate::session::MailboxMessage],
+    ) -> Result<(), agent_client_protocol::Error> {
+        for report in reports {
+            if let Some(update) = Self::task_outcome_update(session_id, run_id, attempt_key, report)
+            {
+                cx.send_notification(SessionNotification::new(session_id.clone(), update))?;
+            }
+        }
+        Ok(())
+    }
+
     fn send_queued_steer_update(
         cx: &ConnectionTo<Client>,
         session_id: &SessionId,
@@ -2804,6 +2852,21 @@ impl GooseAcpAgent {
                 return Ok(outcome);
             }
             if outcome.completed_visible_response {
+                let reports = self
+                    .session_manager
+                    .pending_session_messages(&session_id)
+                    .await
+                    .internal_err_ctx("Failed to load task outcomes")?;
+                Self::send_task_outcomes(
+                    cx,
+                    &acp_session_id,
+                    &run_id,
+                    run_guard
+                        .attempt
+                        .as_ref()
+                        .map(|attempt| attempt.key.as_str()),
+                    &reports,
+                )?;
                 self.session_manager
                     .acknowledge_loaded_task_completions(&session_id)
                     .await
@@ -2846,6 +2909,16 @@ impl GooseAcpAgent {
                     .await
                     .internal_err_ctx("Failed to load background task reports")?;
                 if let Some(last) = reports.last() {
+                    Self::send_task_outcomes(
+                        cx,
+                        &acp_session_id,
+                        &run_id,
+                        run_guard
+                            .attempt
+                            .as_ref()
+                            .map(|attempt| attempt.key.as_str()),
+                        &reports,
+                    )?;
                     let through_id = last.id;
                     let envelope = crate::session::MailboxMessage::parent_envelope(&reports)
                         .expect("nonempty reports have an envelope");
@@ -3395,6 +3468,83 @@ pub async fn run(builtins: Vec<String>, enable_scheduler: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_task_update_uses_captured_scope_and_contains_no_private_report() {
+        use goose_sdk_types::custom_requests::{TaskAdmission, TaskOutcome, TaskTerminalStatus};
+        let session_id = SessionId::new("parent");
+        for status in [
+            TaskTerminalStatus::Completed,
+            TaskTerminalStatus::Failed,
+            TaskTerminalStatus::Panicked,
+            TaskTerminalStatus::Cancelled,
+        ] {
+            let outcome = TaskOutcome {
+                admission: TaskAdmission {
+                    task_id: "child".into(),
+                    parent_session_id: "parent".into(),
+                    parent_run_id: Some("run_original".into()),
+                    attempt_key: Some("attempt".into()),
+                    source_name: "specialist".into(),
+                },
+                status,
+            };
+            let mut report = crate::session::MailboxMessage {
+                id: 1,
+                sender_session_id: "child".into(),
+                recipient_session_id: "parent".into(),
+                kind: crate::session::MailboxMessageKind::Completion,
+                body: "private narrative and instructions".into(),
+                outcome_json: Some(serde_json::to_string(&outcome).unwrap()),
+                created_at: chrono::Utc::now(),
+            };
+            let update = GooseAcpAgent::task_outcome_update(
+                &session_id,
+                "run_original",
+                Some("attempt"),
+                &report,
+            )
+            .unwrap();
+            let SessionUpdate::SessionInfoUpdate(info) = update else {
+                panic!("expected standard ACP update");
+            };
+            assert_eq!(
+                info.meta.as_ref().unwrap()["goose"]["taskOutcome"],
+                serde_json::to_value(outcome).unwrap()
+            );
+            assert!(!serde_json::to_string(&info).unwrap().contains("private"));
+            assert!(GooseAcpAgent::task_outcome_update(
+                &session_id,
+                "run_newer",
+                Some("attempt"),
+                &report
+            )
+            .is_none());
+            assert!(GooseAcpAgent::task_outcome_update(
+                &session_id,
+                "run_original",
+                Some("other"),
+                &report
+            )
+            .is_none());
+            report.outcome_json = Some("malformed optional JSON".into());
+            assert!(GooseAcpAgent::task_outcome_update(
+                &session_id,
+                "run_original",
+                Some("attempt"),
+                &report
+            )
+            .is_none());
+            report.outcome_json = None;
+            assert!(GooseAcpAgent::task_outcome_update(
+                &session_id,
+                "run_original",
+                Some("attempt"),
+                &report
+            )
+            .is_none());
+        }
+    }
+
     #[test]
     fn prompt_telemetry_session_id_requires_bounded_string() {
         let meta = serde_json::Map::from_iter([(
