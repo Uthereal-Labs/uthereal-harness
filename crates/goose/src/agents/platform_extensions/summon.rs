@@ -2568,7 +2568,29 @@ impl SummonClient {
                 }
             };
 
-            let result = if task.cancellation_token.is_cancelled() {
+            let cancelled = if task.cancellation_token.is_cancelled() {
+                let canonical = if task.parent_session_id.is_empty() {
+                    None
+                } else {
+                    self.context
+                        .session_manager
+                        .terminal_report_for_child(&task.parent_session_id, &id)
+                        .await
+                        .ok()
+                        .flatten()
+                };
+                // A later cancellation request cannot change an already published
+                // terminal outcome while notification attachment was yielding.
+                !canonical.is_some_and(|report| {
+                    report
+                        .body
+                        .starts_with(&format!("Task {id} completed successfully."))
+                        || report.body.starts_with(&format!("Task {id} failed."))
+                })
+            } else {
+                false
+            };
+            let result = if cancelled {
                 Err(format!(
                     "Task was cancelled: {}",
                     result.unwrap_or_else(|error| error)
@@ -3868,6 +3890,81 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn reliability_late_cancel_preserves_published_completion_in_cache_and_recovery() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let client = Arc::new(client);
+        let child =
+            reliability_child(&client, &parent, "document:finished-before-cancel", None).await;
+        let task_id = child.clone();
+        let task_manager = Arc::clone(&manager);
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let (handle, completion) = spawn_background_task(async move {
+            finished.await.unwrap();
+            let result = Ok("Saved final revision 8".to_string());
+            SummonClient::enqueue_task_completion(&task_manager, &task_id, &result, false)
+                .await
+                .unwrap();
+            result
+        });
+        let token = CancellationToken::new();
+        let task = reliability_running(&child, &parent, token.clone(), handle, completion.clone());
+        let sink = Arc::clone(&task.notification_sink);
+        let attachment = sink.lock().await;
+        client
+            .background_tasks
+            .lock()
+            .await
+            .insert(child.clone(), task);
+        let cancel_client = Arc::clone(&client);
+        let cancel_child = child.clone();
+        let (emitter, _notifications) = notification_channel();
+        let cancel = tokio::spawn(async move {
+            cancel_client
+                .handle_load_task_result(&cancel_child, true, false, Some(emitter))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!token.is_cancelled());
+        finish.send(()).unwrap();
+        client
+            .wait_for_background_task_completion(&child, &completion)
+            .await;
+        drop(attachment);
+        let requested = cancel.await.unwrap().unwrap();
+        assert_eq!(requested.status, "cancellation_requested");
+        assert!(token.is_cancelled());
+        let cached = client
+            .handle_load_task_result(&child, false, true, None)
+            .await
+            .unwrap();
+        assert_eq!(cached.status, "completed");
+        assert!(extract_text(&cached.content[0]).contains("Saved final revision 8"));
+        client
+            .completed_tasks
+            .lock()
+            .await
+            .get_mut(&child)
+            .unwrap()
+            .completed_at = Instant::now() - Duration::from_secs(3600);
+        client.cleanup_completed_tasks().await;
+        assert!(!client.completed_tasks.lock().await.contains_key(&child));
+        let recovered = client.recovered_task_result(&parent, &child).await.unwrap();
+        assert_eq!(recovered.status, cached.status);
+        assert_eq!(
+            extract_text(&recovered.content[0]),
+            format!("Task {child} completed successfully.\n\nSaved final revision 8")
+        );
+        assert_eq!(
+            manager
+                .pending_session_messages(&parent)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
