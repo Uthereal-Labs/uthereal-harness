@@ -23,7 +23,7 @@ use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, InitializeResult, JsonObject, ListToolsResult,
     MetaObject, Role, ServerCapabilities, ServerNotification, Tool,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -105,6 +105,23 @@ struct SendParams {
 struct MessageParentParams {
     message: String,
     kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct SummonTaskPolicy {
+    #[serde(default)]
+    event_driven_parent: bool,
+    artifact_key: Option<String>,
+    previous_task_id: Option<String>,
+}
+
+impl SummonTaskPolicy {
+    fn from_session(session: &crate::session::Session) -> Option<Self> {
+        session
+            .extension_data
+            .get_extension_state("summon", "v1")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
 }
 
 pub struct BackgroundTask {
@@ -241,6 +258,10 @@ struct AgentMetadata {
     #[serde(default)]
     non_blocking: bool,
     #[serde(default)]
+    artifact_guard: bool,
+    #[serde(default)]
+    event_driven_parent: bool,
+    #[serde(default)]
     delegate_only: bool,
 }
 
@@ -291,6 +312,14 @@ fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
     properties.insert(
         "delegate_only".to_string(),
         serde_json::json!(metadata.delegate_only),
+    );
+    properties.insert(
+        "artifact_guard".to_string(),
+        serde_json::json!(metadata.artifact_guard),
+    );
+    properties.insert(
+        "event_driven_parent".to_string(),
+        serde_json::json!(metadata.event_driven_parent),
     );
 
     Some(SourceEntry {
@@ -630,7 +659,6 @@ pub struct SummonClient {
     completed_tasks: Mutex<HashMap<String, CompletedTask>>,
     artifact_tasks: Mutex<HashMap<(String, String), String>>,
     event_driven_parents: Mutex<HashSet<String>>,
-    event_driven_children: Mutex<HashSet<String>>,
 }
 
 impl Drop for SummonClient {
@@ -657,7 +685,6 @@ impl SummonClient {
             completed_tasks: Mutex::new(HashMap::new()),
             artifact_tasks: Mutex::new(HashMap::new()),
             event_driven_parents: Mutex::new(HashSet::new()),
-            event_driven_children: Mutex::new(HashSet::new()),
         })
     }
 
@@ -665,6 +692,7 @@ impl SummonClient {
         &self,
         task_config: &TaskConfig,
         name: String,
+        policy: Option<&SummonTaskPolicy>,
     ) -> Result<crate::session::Session, String> {
         let session = self
             .context
@@ -679,10 +707,19 @@ impl SummonClient {
             .map_err(|e| format!("Failed to create subagent session: {}", e))?;
 
         if !task_config.parent_session_id.is_empty() {
+            let mut extension_data = session.extension_data.clone();
+            if let Some(policy) = policy {
+                extension_data.set_extension_state(
+                    "summon",
+                    "v1",
+                    serde_json::to_value(policy).map_err(|error| error.to_string())?,
+                );
+            }
             self.context
                 .session_manager
                 .update(&session.id)
                 .parent_session_id(Some(task_config.parent_session_id.clone()))
+                .extension_data(extension_data)
                 .apply()
                 .await
                 .map_err(|e| format!("Failed to link subagent to parent session: {}", e))?;
@@ -696,6 +733,229 @@ impl SummonClient {
             Some(emitter) => NotificationSink::Emitter(emitter),
             None => NotificationSink::Buffer(Vec::new()),
         }))
+    }
+
+    fn artifact_key(params: &DelegateParams) -> Result<String, String> {
+        let role = params
+            .source
+            .as_deref()
+            .and_then(|name| name.strip_prefix("cortex-"))
+            .ok_or_else(|| "Artifact-guarded sources must have a cortex role".to_string())?;
+        let new_prefix = format!("new:{role}:");
+        let key = params
+                .artifact_key
+                .as_deref()
+                .map(|key| key.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
+                .filter(|key| {
+                    key.strip_prefix("document:").is_some_and(|id| !id.is_empty())
+                        || key.strip_prefix(new_prefix.as_str()).is_some_and(|title| !title.is_empty())
+                })
+                .filter(|key| key.len() <= 300)
+                .ok_or_else(|| format!("Office delegation requires artifact_key: document:<saved ID> or {new_prefix}<title>"))?;
+        if params
+            .artifact_title
+            .as_ref()
+            .is_some_and(|title| title.trim().is_empty() || title.len() > 240)
+        {
+            return Err("Artifact titles must be nonempty labels of at most 240 bytes".to_string());
+        }
+        Ok(key)
+    }
+
+    async fn check_artifact_owners(
+        &self,
+        session_id: &str,
+        artifact_keys: &[String],
+        previous_task_id: Option<&str>,
+        artifact_tasks: &HashMap<(String, String), String>,
+    ) -> Result<(), String> {
+        for key in artifact_keys {
+            if let Some(existing) = artifact_tasks.get(&(session_id.to_string(), key.clone())) {
+                if self.background_tasks.lock().await.contains_key(existing) {
+                    return Err(format!("Artifact {key} already has active specialist task {existing}. Steer that task with send."));
+                }
+                self.recover_completion_delivery(existing).await?;
+                if self
+                    .context
+                    .session_manager
+                    .terminal_report_for_child(session_id, existing)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+                {
+                    return Err(format!("The previous task {existing} has an interrupted or unknown outcome, without canonical terminal evidence. Inspect the saved artifact before recovery; no replacement task was started."));
+                }
+                if previous_task_id != Some(existing.as_str()) {
+                    return Err(format!("Review the terminal result of task {existing} and the saved artifact before delegating a follow-up with previous_task_id."));
+                }
+            }
+        }
+        if let Some(previous) = previous_task_id {
+            if !artifact_keys.iter().any(|key| {
+                artifact_tasks
+                    .get(&(session_id.to_string(), key.clone()))
+                    .map(String::as_str)
+                    == Some(previous)
+            }) {
+                return Err(
+                    "previous_task_id does not refer to an earlier task for this artifact"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn task_policy(&self, task_id: &str) -> Result<Option<SummonTaskPolicy>, String> {
+        let session = self
+            .context
+            .session_manager
+            .get_session(task_id, false)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(SummonTaskPolicy::from_session(&session))
+    }
+
+    async fn reconstruct_artifact_tasks(
+        &self,
+        session_id: &str,
+        owners: &mut HashMap<(String, String), String>,
+        requested: &[String],
+    ) -> Result<(), String> {
+        let children = self
+            .context
+            .session_manager
+            .list_subagent_sessions(session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut artifacts: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+        for child in &children {
+            let Some(policy) = SummonTaskPolicy::from_session(child) else {
+                continue;
+            };
+            if policy.event_driven_parent {
+                self.event_driven_parents
+                    .lock()
+                    .await
+                    .insert(session_id.to_string());
+            }
+            if let Some(key) = policy.artifact_key {
+                artifacts
+                    .entry(key)
+                    .or_default()
+                    .push((child.id.clone(), policy.previous_task_id));
+            }
+        }
+        for (key, tasks) in artifacts {
+            if !requested.contains(&key) {
+                continue;
+            }
+            let predecessors: HashSet<_> = tasks
+                .iter()
+                .filter_map(|(_, previous)| previous.as_deref())
+                .collect();
+            let heads: Vec<_> = tasks
+                .iter()
+                .filter(|(id, _)| !predecessors.contains(id.as_str()))
+                .collect();
+            let [head] = heads.as_slice() else {
+                return Err(format!("Artifact {key} has ambiguous task ownership. Inspect its saved state before continuing."));
+            };
+            owners.insert((session_id.to_string(), key), head.0.clone());
+        }
+        Ok(())
+    }
+
+    async fn enqueue_task_completion(
+        manager: &crate::session::SessionManager,
+        task_id: &str,
+        result: &anyhow::Result<String>,
+        cancelled: bool,
+    ) -> anyhow::Result<()> {
+        let status = if cancelled {
+            "was cancelled"
+        } else if result.is_ok() {
+            "completed successfully"
+        } else {
+            "failed"
+        };
+        let output = match result {
+            Ok(output) => output.clone(),
+            Err(error) => error.to_string(),
+        };
+        manager
+            .enqueue_completion_to_parent(task_id, &format!("Task {task_id} {status}.\n\n{output}"))
+            .await?;
+        Ok(())
+    }
+
+    async fn recover_completion_delivery(&self, task_id: &str) -> Result<(), String> {
+        let pending = self
+            .completed_tasks
+            .lock()
+            .await
+            .get(task_id)
+            .and_then(|task| {
+                task.completion_delivery_error
+                    .as_ref()
+                    .map(|error| (task.result.clone(), error.clone()))
+            });
+        let Some((result, original_error)) = pending else {
+            return Ok(());
+        };
+        let report = match result {
+            Ok(output) => format!("Task {task_id} completed successfully.\n\n{output}"),
+            Err(error) if error.starts_with("Task was cancelled:") => {
+                format!("Task {task_id} was cancelled.\n\n{error}")
+            }
+            Err(error) => format!("Task {task_id} failed.\n\n{error}"),
+        };
+        self.context.session_manager.enqueue_completion_to_parent(task_id, &report).await
+            .map_err(|error| format!("Failed to deliver background task completion: {original_error}; recovery failed: {error}"))?;
+        if let Some(task) = self.completed_tasks.lock().await.get_mut(task_id) {
+            task.completion_delivery_error = None;
+        }
+        Ok(())
+    }
+
+    async fn recovered_task_result(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> Result<TaskLoadResult, String> {
+        let report = self
+            .context
+            .session_manager
+            .terminal_report_for_child(session_id, task_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(report) = report else {
+            return Ok(TaskLoadResult {
+                content: vec![ContentBlock::text(format!("Task {task_id} has no canonical terminal report. Its outcome is interrupted or unknown; inspect the saved artifact before recovery. No replacement task was started."))],
+                status: "unknown", turns: None, duration_secs: None,
+            });
+        };
+        let status = if report
+            .body
+            .starts_with(&format!("Task {task_id} completed successfully."))
+        {
+            "completed"
+        } else if report
+            .body
+            .starts_with(&format!("Task {task_id} was cancelled."))
+        {
+            "cancelled"
+        } else if report.body.starts_with(&format!("Task {task_id} failed.")) {
+            "failed"
+        } else {
+            "terminal"
+        };
+        Ok(TaskLoadResult {
+            content: vec![ContentBlock::text(report.body)],
+            status,
+            turns: None,
+            duration_secs: None,
+        })
     }
 
     async fn attach_notification_emitter(
@@ -789,11 +1049,11 @@ impl SummonClient {
                 },
                 "artifact_key": {
                     "type": "string",
-                    "description": "Stable document key for an artifact-owning agent: document:<saved ID> for a revision, or new:<role>:<requested title> for a new artifact."
+                    "description": "Stable artifact key: document:<saved ID> or new:<role>:<requested title>. Keep the same new key throughout the originating turn, including follow-ups after saving."
                 },
                 "artifact_title": {
                     "type": "string",
-                    "description": "Current saved or requested title of the artifact. Required for Office specialists to link new-artifact and saved-document keys."
+                    "description": "Current saved or requested title, used only as a display label. Titles do not establish artifact identity."
                 },
                 "previous_task_id": {
                     "type": "string",
@@ -1102,12 +1362,6 @@ impl SummonClient {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        if self.event_driven_parents.lock().await.contains(session_id)
-            && !(cancel && source_name.is_some_and(is_session_id))
-        {
-            return Err("This coordinator receives specialist messages and terminal reports automatically. Finish the reply to wait; use send to steer an active task.".to_string());
-        }
-
         let working_dir = self.get_working_dir(session_id).await;
 
         if source_name.is_none() {
@@ -1138,9 +1392,25 @@ impl SummonClient {
             {
                 return Err(format!("Task '{name}' does not belong to this session"));
             }
-            let task_result = self
-                .handle_load_task_result(name, cancel, peek, notification_emitter)
-                .await?;
+            let running = self.background_tasks.lock().await.contains_key(name);
+            let cached = self.completed_tasks.lock().await.contains_key(name);
+            if running
+                && !cancel
+                && (self.event_driven_parents.lock().await.contains(session_id)
+                    || self
+                        .task_policy(name)
+                        .await?
+                        .is_some_and(|policy| policy.event_driven_parent))
+            {
+                return Err("This task reports automatically. Finish the reply to wait; use send to steer it or load(cancel: true) to stop it.".to_string());
+            }
+            let task_result = if running || cached {
+                self.recover_completion_delivery(name).await?;
+                self.handle_load_task_result(name, cancel, peek, notification_emitter)
+                    .await?
+            } else {
+                self.recovered_task_result(session_id, name).await?
+            };
             let mut meta = MetaObject::new();
             meta.0.insert(
                 "subagent_session_id".to_string(),
@@ -1217,11 +1487,13 @@ impl SummonClient {
             let status_key = match &result {
                 Ok(_) => "completed",
                 Err(e) if e.starts_with("Task panicked:") => "panicked",
+                Err(e) if e.starts_with("Task was cancelled:") => "cancelled",
                 Err(_) => "failed",
             };
             let status = match status_key {
                 "completed" => "✓ Completed",
                 "panicked" => "✗ Panicked",
+                "cancelled" => "⊘ Cancelled",
                 _ => "✗ Failed",
             };
             let output = match result {
@@ -1248,10 +1520,10 @@ impl SummonClient {
             });
         }
 
-        let mut running = self.background_tasks.lock().await;
+        let running = self.background_tasks.lock().await;
         drop(completed);
         if running.contains_key(task_id) {
-            if peek || (running.get(task_id).unwrap().non_blocking && !cancel) {
+            if !cancel && (peek || running.get(task_id).unwrap().non_blocking) {
                 let task = running.get(task_id).unwrap();
                 let elapsed = task.started_at.elapsed();
                 let turns = Arc::clone(&task.turns);
@@ -1310,31 +1582,44 @@ impl SummonClient {
                     ))
                     .await;
                 }
-                let notification_sink =
-                    Arc::clone(&running.get(task_id).unwrap().notification_sink);
-                Self::attach_notification_emitter(&notification_sink, notification_emitter).await;
-                let task = running.remove(task_id).unwrap();
+                let task = running.get(task_id).unwrap();
+                let notification_sink = Arc::clone(&task.notification_sink);
+                let completion_token = task.completion_token.clone();
+                let cancellation_token = task.cancellation_token.clone();
                 drop(running);
-                task.cancellation_token.cancel();
-
-                let mut handle = task.handle;
-                let output = tokio::select! {
-                    result = &mut handle => {
-                        match result {
-                            Ok(Ok(s)) => s,
-                            Ok(Err(e)) => format!("Error: {}", e),
-                            Err(e) => format!("Task panicked: {}", e),
-                        }
+                Self::attach_notification_emitter(&notification_sink, notification_emitter).await;
+                cancellation_token.cancel();
+                let aborted = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.wait_for_background_task_completion(task_id, &completion_token),
+                )
+                .await
+                .is_err();
+                if aborted {
+                    if let Some(task) = self.background_tasks.lock().await.get(task_id) {
+                        task.handle.abort();
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                        handle.abort();
-                        let _ = handle.await;
-                        "Task did not stop in time (aborted)".to_string()
-                    }
+                    self.wait_for_background_task_completion(task_id, &completion_token)
+                        .await;
+                }
+                self.cleanup_completed_tasks().await;
+                let completed = self.completed_tasks.lock().await;
+                let Some(task) = completed.get(task_id) else {
+                    return Err(format!("Cancelled task '{task_id}' has no terminal result"));
                 };
-                let duration = task.started_at.elapsed();
-                let turns_taken = self.refresh_task_turns(task_id, &task.turns).await;
-                if !task.parent_session_id.is_empty() {
+                let output = if aborted {
+                    "Task did not stop in time (aborted)".to_string()
+                } else {
+                    task.result
+                        .clone()
+                        .unwrap_or_else(|error| format!("Error: {error}"))
+                };
+                let parent = task.parent_session_id.clone();
+                let description = task.description.clone();
+                let duration = task.duration;
+                let turns_taken = task.turns_taken;
+                drop(completed);
+                if !parent.is_empty() {
                     if let Err(error) = self
                         .context
                         .session_manager
@@ -1345,48 +1630,21 @@ impl SummonClient {
                         .await
                     {
                         let error = error.to_string();
-                        *task.completion_delivery_error.lock().await = Some(error.clone());
-                        warn!(
-                            "Failed to enqueue cancellation for background task {}: {}",
-                            task_id, error
-                        );
-                        self.completed_tasks.lock().await.insert(
-                            task_id.to_string(),
-                            CompletedTask {
-                                id: task_id.to_string(),
-                                parent_session_id: task.parent_session_id.clone(),
-                                completion_delivery_error: Some(error.clone()),
-                                description: task.description.clone(),
-                                result: Err(format!("Task was cancelled: {output}")),
-                                turns_taken,
-                                duration,
-                                completed_at: Instant::now(),
-                                notification_sink: Arc::clone(&task.notification_sink),
-                            },
-                        );
-                        return Err(format!(
-                            "Task '{task_id}' was cancelled, but its parent report could not be delivered: {error}"
-                        ));
+                        if let Some(task) = self.completed_tasks.lock().await.get_mut(task_id) {
+                            task.completion_delivery_error = Some(error.clone());
+                        }
+                        return Err(format!("Task '{task_id}' was cancelled, but its parent report could not be delivered: {error}"));
+                    }
+                    if let Some(task) = self.completed_tasks.lock().await.get_mut(task_id) {
+                        task.completion_delivery_error = None;
                     }
                 }
-
                 return Ok(TaskLoadResult {
                     content: vec![ContentBlock::text(format!(
-                        "# Background Task Result: {}\n\n\
-                         **Task:** {}\n\
-                         **Status:** ⊘ Cancellation requested\n\
-                         **Duration:** {} ({} turns)\n\
-                         Cancellation was requested and the task stopped. If the task finished concurrently, its automatic completion report is authoritative.\n\n\
-                         ## Output\n\n{}",
-                        task_id,
-                        task.description,
-                        round_duration(duration),
-                        turns_taken,
-                        output
+                        "# Background Task Result: {task_id}\n\n**Task:** {description}\n**Status:** ⊘ Cancellation requested\n**Duration:** {} ({} turns)\n\nCancellation was requested and the task stopped. If the task finished concurrently, its automatic completion report is authoritative.\n\n## Output\n\n{output}",
+                        round_duration(duration), turns_taken,
                     ))],
-                    status: "cancellation_requested",
-                    turns: Some(turns_taken),
-                    duration_secs: Some(duration.as_secs()),
+                    status: "cancellation_requested", turns: Some(turns_taken), duration_secs: Some(duration.as_secs()),
                 });
             }
 
@@ -1588,6 +1846,16 @@ impl SummonClient {
                 .unwrap_or(false)
                 || source
                     .properties
+                    .get("artifact_guard")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                || source
+                    .properties
+                    .get("event_driven_parent")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                || source
+                    .properties
                     .get("non_blocking")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
@@ -1633,7 +1901,7 @@ impl SummonClient {
         agent_config.is_subagent = true;
 
         let subagent_session = self
-            .create_subagent_session(&task_config, "Delegated task".to_string())
+            .create_subagent_session(&task_config, "Delegated task".to_string(), None)
             .await?;
 
         let subagent_session_id = subagent_session.id.clone();
@@ -2274,7 +2542,6 @@ impl SummonClient {
 
         // Keep the same lock order as task lookup so the running -> completed
         // transition is atomic from callers' perspective.
-        let mut artifact_tasks = self.artifact_tasks.lock().await;
         let mut completed = self.completed_tasks.lock().await;
         let mut tasks = self.background_tasks.lock().await;
         for (id, _) in finished {
@@ -2301,6 +2568,14 @@ impl SummonClient {
                 }
             };
 
+            let result = if task.cancellation_token.is_cancelled() {
+                Err(format!(
+                    "Task was cancelled: {}",
+                    result.unwrap_or_else(|error| error)
+                ))
+            } else {
+                result
+            };
             completed.insert(
                 id.clone(),
                 CompletedTask {
@@ -2321,12 +2596,6 @@ impl SummonClient {
         completed.retain(|_id, task| {
             task.completion_delivery_error.is_some() || task.completed_at.elapsed() <= ttl
         });
-        artifact_tasks
-            .retain(|_, task_id| tasks.contains_key(task_id) || completed.contains_key(task_id));
-        self.event_driven_children
-            .lock()
-            .await
-            .retain(|task_id| tasks.contains_key(task_id));
     }
 
     fn get_task_description(params: &DelegateParams) -> String {
@@ -2376,37 +2645,7 @@ impl SummonClient {
         let non_blocking = source_flag("non_blocking");
         let event_driven_parent = source_flag("event_driven_parent");
         let artifact_keys = if source_flag("artifact_guard") {
-            let role = params
-                .source
-                .as_deref()
-                .and_then(|name| name.strip_prefix("cortex-"))
-                .ok_or_else(|| "Artifact-guarded sources must have a cortex role".to_string())?;
-            let new_prefix = format!("new:{role}:");
-            let key = params
-                .artifact_key
-                .as_deref()
-                .map(|key| key.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
-                .filter(|key| {
-                    key.strip_prefix("document:").is_some_and(|id| !id.is_empty())
-                        || key.strip_prefix(new_prefix.as_str()).is_some_and(|title| !title.is_empty())
-                })
-                .filter(|key| key.len() <= 300)
-                .ok_or_else(|| format!("Office delegation requires artifact_key: document:<saved ID> or {new_prefix}<title>"))?;
-            let title = params
-                .artifact_title
-                .as_deref()
-                .map(|title| {
-                    title
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .to_lowercase()
-                })
-                .filter(|title| !title.is_empty() && title.len() <= 240)
-                .ok_or_else(|| {
-                    "Office delegation requires the artifact's current title".to_string()
-                })?;
-            vec![key, format!("title:{role}:{title}")]
+            vec![Self::artifact_key(&params)?]
         } else {
             Vec::new()
         };
@@ -2435,44 +2674,29 @@ impl SummonClient {
         .with_use_login_shell_path(self.context.use_login_shell_path);
         agent_config.is_subagent = true;
 
+        let policy = SummonTaskPolicy {
+            event_driven_parent,
+            artifact_key: artifact_keys.first().cloned(),
+            previous_task_id: params.previous_task_id.clone(),
+        };
         let mut artifact_tasks = self.artifact_tasks.lock().await;
-        for key in &artifact_keys {
-            if let Some(existing) = artifact_tasks.get(&(session_id.to_string(), key.clone())) {
-                if self.background_tasks.lock().await.contains_key(existing) {
-                    return Err(format!("Artifact {key} already has active specialist task {existing}. Steer that task with send."));
-                }
-                if !self.completed_tasks.lock().await.contains_key(existing) {
-                    return Err(format!("The previous specialist task {existing} is unavailable; wait for its terminal report."));
-                }
-                if params.previous_task_id.as_deref() != Some(existing.as_str()) {
-                    return Err(format!("Review the terminal result of task {existing} and the saved artifact before delegating a follow-up with previous_task_id."));
-                }
-            }
-        }
-        if let Some(previous) = params.previous_task_id.as_deref() {
-            if !artifact_keys.iter().any(|key| {
-                artifact_tasks
-                    .get(&(session_id.to_string(), key.clone()))
-                    .map(String::as_str)
-                    == Some(previous)
-            }) {
-                return Err(
-                    "previous_task_id does not refer to an earlier task for this artifact"
-                        .to_string(),
-                );
-            }
+        self.reconstruct_artifact_tasks(session_id, &mut artifact_tasks, &artifact_keys)
+            .await?;
+        self.check_artifact_owners(
+            session_id,
+            &artifact_keys,
+            params.previous_task_id.as_deref(),
+            &artifact_tasks,
+        )
+        .await?;
+        if self.background_tasks.lock().await.len() >= max_background_tasks() {
+            return Err("Maximum background tasks already running".to_string());
         }
         let subagent_session = self
-            .create_subagent_session(&task_config, description.clone())
+            .create_subagent_session(&task_config, description.clone(), Some(&policy))
             .await?;
 
         let task_id = subagent_session.id.clone();
-        if event_driven_parent {
-            self.event_driven_children
-                .lock()
-                .await
-                .insert(task_id.clone());
-        }
         let completion_session_manager = Arc::clone(&self.context.session_manager);
         let completion_delivery_error = Arc::new(Mutex::new(None));
         let task_completion_delivery_error = Arc::clone(&completion_delivery_error);
@@ -2528,19 +2752,13 @@ impl SummonClient {
                     .unwrap_or("unknown panic");
                 Err(anyhow::anyhow!("Task panicked: {detail}"))
             });
-            let completion = if completion_cancellation_token.is_cancelled() {
-                format!("Task {completion_task_id} was cancelled.")
-            } else {
-                match &result {
-                    Ok(output) => {
-                        format!("Task {completion_task_id} completed successfully.\n\n{output}")
-                    }
-                    Err(error) => format!("Task {completion_task_id} failed.\n\n{error}"),
-                }
-            };
-            if let Err(error) = completion_session_manager
-                .enqueue_completion_to_parent(&completion_task_id, &completion)
-                .await
+            if let Err(error) = Self::enqueue_task_completion(
+                &completion_session_manager,
+                &completion_task_id,
+                &result,
+                completion_cancellation_token.is_cancelled(),
+            )
+            .await
             {
                 *task_completion_delivery_error.lock().await = Some(error.to_string());
                 warn!(
@@ -2618,10 +2836,7 @@ impl McpClientTrait for SummonClient {
             .map(|s| s.session_type == SessionType::SubAgent)
             .unwrap_or(false);
 
-        let mut tools = Vec::new();
-        if is_subagent || !self.event_driven_parents.lock().await.contains(session_id) {
-            tools.push(self.create_load_tool());
-        }
+        let mut tools = vec![self.create_load_tool()];
 
         if is_subagent {
             tools.push(self.create_message_parent_tool());
@@ -2731,7 +2946,13 @@ impl McpClientTrait for SummonClient {
                     });
                 match params {
                     Ok(params) => {
-                        if self.event_driven_children.lock().await.contains(session_id) {
+                        let policy = match self.task_policy(session_id).await {
+                            Ok(policy) => policy,
+                            Err(error) => {
+                                return Ok(CallToolResult::error(vec![ContentBlock::text(error)]))
+                            }
+                        };
+                        if policy.is_some_and(|policy| policy.event_driven_parent) {
                             match params.kind.as_deref() {
                                 Some("progress") => return Ok(CallToolResult::success(vec![ContentBlock::text("Progress remains within this task; the parent was not awakened.")])),
                                 Some("question" | "blocker" | "decision") => {}
@@ -2876,6 +3097,22 @@ impl McpClientTrait for SummonClient {
     }
 
     async fn has_active_tasks(&self, session_id: &str) -> anyhow::Result<bool> {
+        self.cleanup_completed_tasks().await;
+        let deliveries: Vec<_> = self
+            .completed_tasks
+            .lock()
+            .await
+            .values()
+            .filter(|task| {
+                task.parent_session_id == session_id && task.completion_delivery_error.is_some()
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        for task_id in deliveries {
+            self.recover_completion_delivery(&task_id)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        }
         let running = self
             .background_tasks
             .lock()
@@ -2988,6 +3225,729 @@ mod tests {
                 .unwrap();
         }
         session.id
+    }
+
+    async fn reliability_fixture() -> (
+        TempDir,
+        Arc<crate::session::SessionManager>,
+        String,
+        SummonClient,
+    ) {
+        let directory = TempDir::new().unwrap();
+        let manager = Arc::new(crate::session::SessionManager::new(
+            directory.path().join("sessions"),
+        ));
+        let parent = manager
+            .create_session(
+                directory.path().to_path_buf(),
+                "Coordinator".to_string(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let client = SummonClient::new(create_test_context_with_session_manager(Arc::clone(
+            &manager,
+        )))
+        .unwrap();
+        (directory, manager, parent.id, client)
+    }
+
+    async fn reliability_child(
+        client: &SummonClient,
+        parent: &str,
+        key: &str,
+        previous: Option<&str>,
+    ) -> String {
+        let session = client
+            .context
+            .session_manager
+            .get_session(parent, false)
+            .await
+            .unwrap();
+        let provider = Arc::new(
+            crate::providers::testprovider::TestProvider::new_replaying(
+                session
+                    .working_dir
+                    .join("unused-records.json")
+                    .display()
+                    .to_string(),
+            )
+            .unwrap(),
+        );
+        let config = TaskConfig::new(
+            provider,
+            goose_providers::model::ModelConfig::new("test-model"),
+            parent,
+            &session.working_dir,
+            Vec::new(),
+        );
+        client
+            .create_subagent_session(
+                &config,
+                "Specialist".to_string(),
+                Some(&SummonTaskPolicy {
+                    event_driven_parent: true,
+                    artifact_key: Some(key.to_string()),
+                    previous_task_id: previous.map(str::to_string),
+                }),
+            )
+            .await
+            .unwrap()
+            .id
+    }
+
+    fn reliability_running(
+        task_id: &str,
+        parent: &str,
+        token: CancellationToken,
+        handle: JoinHandle<Result<String>>,
+        completion_token: CancellationToken,
+    ) -> BackgroundTask {
+        BackgroundTask {
+            id: task_id.to_string(),
+            parent_session_id: parent.to_string(),
+            non_blocking: true,
+            completion_delivery_error: Arc::new(Mutex::new(None)),
+            description: "Specialist".to_string(),
+            started_at: Instant::now(),
+            turns: Arc::new(AtomicU32::new(0)),
+            last_activity: Arc::new(AtomicU64::new(0)),
+            handle,
+            cancellation_token: token,
+            completion_token,
+            notification_sink: buffered_notification_sink(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn reliability_frontmatter_preserves_guard_and_event_policy() {
+        let source = parse_agent_content("---\nname: cortex-slides\nartifact_guard: true\nevent_driven_parent: true\n---\nCreate slides.", Path::new("slides.md")).unwrap();
+        assert_eq!(source.properties["artifact_guard"], serde_json::json!(true));
+        assert_eq!(
+            source.properties["event_driven_parent"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reliability_real_delegation_activates_frontmatter_guard_and_forces_async() {
+        let (directory, manager, parent, _client) = reliability_fixture().await;
+        let agents = directory.path().join(".goose/agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("cortex-slides.md"), "---\nname: cortex-slides\nartifact_guard: true\nevent_driven_parent: true\n---\nCreate slides.").unwrap();
+        let provider: Arc<dyn crate::providers::base::Provider> = Arc::new(
+            crate::providers::testprovider::TestProvider::new_replaying(
+                directory
+                    .path()
+                    .join("unused-records.json")
+                    .display()
+                    .to_string(),
+            )
+            .unwrap(),
+        );
+        let extensions = Arc::new(
+            crate::agents::extension_manager::ExtensionManager::new_without_provider(
+                directory.path().to_path_buf(),
+            ),
+        );
+        *extensions.get_provider().lock().await = Some(provider);
+        let mut context = extensions.get_context().clone();
+        context.session_manager = Arc::clone(&manager);
+        context.extension_manager = Some(Arc::downgrade(&extensions));
+        manager
+            .update(&parent)
+            .provider_name("test".to_string())
+            .model_config(goose_providers::model::ModelConfig::new("test-model"))
+            .apply()
+            .await
+            .unwrap();
+        let client = SummonClient::new(context).unwrap();
+        let arguments = serde_json::json!({"source":"cortex-slides","artifact_key":"new:slides:quarterly","artifact_title":"Quarterly","instructions":"Create the report.","extensions":[],"async":false}).as_object().unwrap().clone();
+        let first = client
+            .handle_delegate(
+                &parent,
+                Some(arguments.clone()),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.structured_content.as_ref().unwrap()["task_status"],
+            serde_json::json!("running")
+        );
+        let id = first.structured_content.unwrap()["subagent_session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let policy = client.task_policy(&id).await.unwrap().unwrap();
+        assert!(policy.event_driven_parent);
+        assert_eq!(policy.artifact_key.as_deref(), Some("new:slides:quarterly"));
+        let duplicate = client
+            .handle_delegate(&parent, Some(arguments), CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            duplicate.contains("active specialist")
+                || duplicate.contains("Review the terminal result"),
+            "{duplicate}"
+        );
+        assert_eq!(
+            manager
+                .list_sessions_by_types(&[SessionType::SubAgent])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        client.shutdown_session(&parent).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reliability_child_owns_policy_and_progress_does_not_wake_parent() {
+        let (_directory, manager, parent, coordinator) = reliability_fixture().await;
+        let child = reliability_child(&coordinator, &parent, "new:slides:quarterly", None).await;
+        let policy = coordinator.task_policy(&child).await.unwrap().unwrap();
+        assert_eq!(policy.artifact_key.as_deref(), Some("new:slides:quarterly"));
+        assert!(policy.event_driven_parent);
+        let specialist = SummonClient::new(create_test_context_with_session_manager(Arc::clone(
+            &manager,
+        )))
+        .unwrap();
+        let context = ToolCallContext::new(child.clone(), None, None);
+        let call = |kind: Option<&str>| {
+            let mut arguments = serde_json::json!({"message":"Evidence retrieved"})
+                .as_object()
+                .unwrap()
+                .clone();
+            if let Some(kind) = kind {
+                arguments.insert("kind".to_string(), serde_json::json!(kind));
+            }
+            arguments
+        };
+        let progress = specialist
+            .call_tool(
+                &context,
+                "message_parent",
+                Some(call(Some("progress"))),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(progress.is_error, Some(true));
+        assert!(manager
+            .pending_session_messages(&parent)
+            .await
+            .unwrap()
+            .is_empty());
+        let missing = specialist
+            .call_tool(
+                &context,
+                "message_parent",
+                Some(call(None)),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.is_error, Some(true));
+        for kind in ["question", "blocker", "decision"] {
+            let result = specialist
+                .call_tool(
+                    &context,
+                    "message_parent",
+                    Some(call(Some(kind))),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(result.is_error, Some(true));
+        }
+        assert_eq!(
+            manager
+                .pending_session_messages(&parent)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn reliability_ownership_survives_compaction_acknowledgement_and_cache_expiry() {
+        let (_directory, manager, parent, original) = reliability_fixture().await;
+        let key = "new:slides:quarterly".to_string();
+        let first = reliability_child(&original, &parent, &key, None).await;
+        manager
+            .enqueue_completion_to_parent(
+                &first,
+                &format!("Task {first} completed successfully.\n\nCreated deck."),
+            )
+            .await
+            .unwrap();
+        let last = reliability_child(&original, &parent, &key, Some(&first)).await;
+        let report = format!("Task {last} completed successfully.\n\nPartial: saved translation; one unsupported claim remains.");
+        manager
+            .enqueue_completion_to_parent(&last, &report)
+            .await
+            .unwrap();
+        manager
+            .acknowledge_session_messages(&parent, i64::MAX)
+            .await
+            .unwrap();
+        manager
+            .replace_conversation(&parent, &crate::conversation::Conversation::default())
+            .await
+            .unwrap();
+        original.completed_tasks.lock().await.insert(
+            last.clone(),
+            CompletedTask {
+                id: last.clone(),
+                parent_session_id: parent.clone(),
+                completion_delivery_error: None,
+                description: "Translation".to_string(),
+                result: Ok("Partial".to_string()),
+                turns_taken: 1,
+                duration: Duration::from_secs(1),
+                completed_at: Instant::now() - Duration::from_secs(3600),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+        original.cleanup_completed_tasks().await;
+        assert!(original.completed_tasks.lock().await.is_empty());
+        drop(original);
+        let recovered = SummonClient::new(create_test_context_with_session_manager(Arc::clone(
+            &manager,
+        )))
+        .unwrap();
+        let mut owners = HashMap::from([((parent.clone(), key.clone()), first.clone())]);
+        recovered
+            .reconstruct_artifact_tasks(&parent, &mut owners, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert_eq!(owners[&(parent.clone(), key.clone())], last);
+        recovered
+            .check_artifact_owners(&parent, std::slice::from_ref(&key), Some(&last), &owners)
+            .await
+            .unwrap();
+        assert!(recovered
+            .check_artifact_owners(&parent, std::slice::from_ref(&key), Some(&first), &owners)
+            .await
+            .unwrap_err()
+            .contains("Review the terminal result"));
+        let result = recovered
+            .recovered_task_result(&parent, &last)
+            .await
+            .unwrap();
+        assert_eq!(extract_text(&result.content[0]), report);
+        assert!(recovered
+            .check_artifact_owners(
+                &parent,
+                &["document:saved-id".to_string()],
+                Some(&last),
+                &owners
+            )
+            .await
+            .unwrap_err()
+            .contains("does not refer"));
+        assert!(manager
+            .pending_session_messages(&parent)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn reliability_saved_ids_allow_distinct_documents_with_the_same_title() {
+        let (_directory, _manager, parent, client) = reliability_fixture().await;
+        let params = |id: &str| DelegateParams {
+            source: Some("cortex-slides".to_string()),
+            artifact_key: Some(format!("document:{id}")),
+            artifact_title: Some("Quarterly report".to_string()),
+            ..Default::default()
+        };
+        let first_key = SummonClient::artifact_key(&params("one")).unwrap();
+        let second_key = SummonClient::artifact_key(&params("two")).unwrap();
+        assert_ne!(first_key, second_key);
+        let first = reliability_child(&client, &parent, &first_key, None).await;
+        let owners = HashMap::from([((parent.clone(), first_key), first)]);
+        client
+            .check_artifact_owners(&parent, &[second_key], None, &owners)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reliability_missing_terminal_evidence_is_unknown_and_does_not_replace_owner() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let key = "document:existing".to_string();
+        let child = reliability_child(&client, &parent, &key, None).await;
+        let mut owners = HashMap::new();
+        client
+            .reconstruct_artifact_tasks(&parent, &mut owners, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert!(client
+            .check_artifact_owners(&parent, std::slice::from_ref(&key), Some(&child), &owners)
+            .await
+            .unwrap_err()
+            .contains("unknown outcome"));
+        let result = client.recovered_task_result(&parent, &child).await.unwrap();
+        assert_eq!(result.status, "unknown");
+        assert!(extract_text(&result.content[0]).contains("No replacement task"));
+        assert_eq!(owners[&(parent.clone(), key)], child);
+        assert!(manager
+            .pending_session_messages(&parent)
+            .await
+            .unwrap()
+            .is_empty());
+        client
+            .check_artifact_owners(
+                &parent,
+                &["document:independent".to_string()],
+                None,
+                &owners,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reliability_unknown_owner_is_scoped_to_its_parent_turn() {
+        let (directory, manager, first_parent, client) = reliability_fixture().await;
+        let key = "document:existing".to_string();
+        let first = reliability_child(&client, &first_parent, &key, None).await;
+        let next_parent = manager
+            .create_session(
+                directory.path().to_path_buf(),
+                "Next user turn".into(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let mut owners = HashMap::new();
+        client
+            .reconstruct_artifact_tasks(&first_parent, &mut owners, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        client
+            .reconstruct_artifact_tasks(&next_parent.id, &mut owners, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        client
+            .check_artifact_owners(&next_parent.id, std::slice::from_ref(&key), None, &owners)
+            .await
+            .unwrap();
+        let next = reliability_child(&client, &next_parent.id, &key, None).await;
+        let children = manager
+            .list_subagent_sessions(&next_parent.id)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, next);
+        assert_eq!(
+            SummonTaskPolicy::from_session(&children[0])
+                .unwrap()
+                .artifact_key
+                .as_deref(),
+            Some(key.as_str())
+        );
+        assert!(client
+            .check_artifact_owners(&first_parent, std::slice::from_ref(&key), None, &owners)
+            .await
+            .unwrap_err()
+            .contains("unknown outcome"));
+        client
+            .check_artifact_owners(&next_parent.id, std::slice::from_ref(&key), None, &owners)
+            .await
+            .unwrap();
+        client
+            .reconstruct_artifact_tasks(&next_parent.id, &mut owners, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert_eq!(owners[&(first_parent, key.clone())], first);
+        assert_eq!(owners[&(next_parent.id, key)], next);
+    }
+
+    #[tokio::test]
+    async fn reliability_terminal_lookup_authorizes_parent_even_after_acknowledgement() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let child = reliability_child(&client, &parent, "document:existing", None).await;
+        manager
+            .enqueue_completion_to_parent(
+                &child,
+                &format!("Task {child} failed.\n\nThe saved deck is unchanged."),
+            )
+            .await
+            .unwrap();
+        manager
+            .acknowledge_session_messages(&parent, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .recovered_task_result(&parent, &child)
+                .await
+                .unwrap()
+                .status,
+            "failed"
+        );
+        let unrelated = manager
+            .create_session(
+                manager
+                    .get_session(&parent, false)
+                    .await
+                    .unwrap()
+                    .working_dir,
+                "Other parent".to_string(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .terminal_report_for_child(&unrelated.id, &child)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not belong"));
+    }
+
+    #[tokio::test]
+    async fn reliability_delivery_recovery_preserves_failure_and_queues_one_canonical_report() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let child = reliability_child(&client, &parent, "document:existing", None).await;
+        client.completed_tasks.lock().await.insert(
+            child.clone(),
+            CompletedTask {
+                id: child.clone(),
+                parent_session_id: parent.clone(),
+                completion_delivery_error: Some("temporary database outage".to_string()),
+                description: "Translation".to_string(),
+                result: Err("Saved checkpoint; final validation failed".to_string()),
+                turns_taken: 2,
+                duration: Duration::from_secs(1),
+                completed_at: Instant::now(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+        assert!(!client.has_active_tasks(&parent).await.unwrap());
+        client.recover_completion_delivery(&child).await.unwrap();
+        let reports = manager.pending_session_messages(&parent).await.unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].body,
+            format!("Task {child} failed.\n\nSaved checkpoint; final validation failed")
+        );
+        client.completed_tasks.lock().await.clear();
+        assert_eq!(
+            client
+                .recovered_task_result(&parent, &child)
+                .await
+                .unwrap()
+                .status,
+            "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reliability_event_coordinator_can_discover_cancel_and_recover_without_polling() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let child = reliability_child(&client, &parent, "document:existing", None).await;
+        let token = CancellationToken::new();
+        let future_token = token.clone();
+        let (handle, completion) = spawn_background_task(async move {
+            future_token.cancelled().await;
+            Ok("Stopped".to_string())
+        });
+        client.background_tasks.lock().await.insert(
+            child.clone(),
+            reliability_running(&child, &parent, token, handle, completion),
+        );
+        client
+            .event_driven_parents
+            .lock()
+            .await
+            .insert(parent.clone());
+        let tools = client
+            .list_tools(&parent, None, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(tools.tools.iter().any(|tool| tool.name == "load"));
+        client.handle_load(&parent, None, None).await.unwrap();
+        let args = |cancel: bool| {
+            serde_json::json!({"source":child,"peek":true,"cancel":cancel})
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        assert!(client
+            .handle_load(&parent, Some(args(false)), None)
+            .await
+            .unwrap_err()
+            .contains("reports automatically"));
+        let result = client
+            .handle_load(&parent, Some(args(true)), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.meta.unwrap().0["task_status"],
+            serde_json::json!("cancellation_requested")
+        );
+        assert!(manager
+            .terminal_report_for_child(&parent, &child)
+            .await
+            .unwrap()
+            .unwrap()
+            .body
+            .contains("was cancelled"));
+    }
+
+    #[tokio::test]
+    async fn reliability_cancelled_canonical_reports_retain_partial_results_after_reconstruction() {
+        let (_directory, manager, parent, original) = reliability_fixture().await;
+        for (index, result) in [
+            Ok("Saved revision 7; remaining work: translate the final slide".to_string()),
+            Err(anyhow::anyhow!(
+                "Saved checkpoint 3; stopped before final save"
+            )),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let child = reliability_child(
+                &original,
+                &parent,
+                &format!("document:cancelled-{index}"),
+                None,
+            )
+            .await;
+            let expected = match &result {
+                Ok(output) => output.clone(),
+                Err(error) => error.to_string(),
+            };
+            SummonClient::enqueue_task_completion(&manager, &child, &result, true)
+                .await
+                .unwrap();
+            let report = manager
+                .terminal_report_for_child(&parent, &child)
+                .await
+                .unwrap()
+                .unwrap();
+            manager
+                .acknowledge_session_messages(&parent, report.id)
+                .await
+                .unwrap();
+            // A retry must retain the first durable terminal outcome.
+            SummonClient::enqueue_task_completion(
+                &manager,
+                &child,
+                &Ok("later retry".into()),
+                false,
+            )
+            .await
+            .unwrap();
+            let reconstructed = SummonClient::new(create_test_context_with_session_manager(
+                Arc::clone(&manager),
+            ))
+            .unwrap();
+            let loaded = reconstructed
+                .recovered_task_result(&parent, &child)
+                .await
+                .unwrap();
+            assert_eq!(loaded.status, "cancelled");
+            assert_eq!(
+                extract_text(&loaded.content[0]),
+                format!("Task {child} was cancelled.\n\n{expected}")
+            );
+            assert!(manager
+                .pending_session_messages(&parent)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reliability_abort_before_first_poll_signals_completion() {
+        let (_directory, _manager, parent, client) = reliability_fixture().await;
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&polled);
+        let (handle, completion) = spawn_background_task(async move {
+            observed.store(true, Ordering::Relaxed);
+            std::future::pending::<Result<String>>().await
+        });
+        handle.abort();
+        client.background_tasks.lock().await.insert(
+            "unpolled".to_string(),
+            reliability_running(
+                "unpolled",
+                &parent,
+                CancellationToken::new(),
+                handle,
+                completion.clone(),
+            ),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client.wait_for_background_task_completion("unpolled", &completion),
+        )
+        .await
+        .unwrap();
+        assert!(completion.is_cancelled());
+        assert!(!polled.load(Ordering::Relaxed));
+        assert!(client.background_tasks.lock().await["unpolled"]
+            .handle
+            .is_finished());
+    }
+
+    #[tokio::test]
+    async fn reliability_cancelling_execution_keeps_artifact_reserved_until_it_stops() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let key = "document:existing".to_string();
+        let child = reliability_child(&client, &parent, &key, None).await;
+        let token = CancellationToken::new();
+        let future_token = token.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (handle, completion) = spawn_background_task(async move {
+            future_token.cancelled().await;
+            released.await.unwrap();
+            Ok("Stopped".to_string())
+        });
+        client.background_tasks.lock().await.insert(
+            child.clone(),
+            reliability_running(&child, &parent, token.clone(), handle, completion),
+        );
+        let client = Arc::new(client);
+        let cancelling_client = Arc::clone(&client);
+        let cancelling_id = child.clone();
+        let cancellation = tokio::spawn(async move {
+            cancelling_client
+                .handle_load_task_result(&cancelling_id, true, false, None)
+                .await
+        });
+        token.cancelled().await;
+        let owners = HashMap::from([((parent.clone(), key.clone()), child.clone())]);
+        assert!(client.background_tasks.lock().await.contains_key(&child));
+        assert!(client
+            .check_artifact_owners(&parent, std::slice::from_ref(&key), Some(&child), &owners)
+            .await
+            .unwrap_err()
+            .contains("active specialist"));
+        release.send(()).unwrap();
+        cancellation.await.unwrap().unwrap();
+        assert!(!client.background_tasks.lock().await.contains_key(&child));
+        assert!(manager
+            .terminal_report_for_child(&parent, &child)
+            .await
+            .unwrap()
+            .is_some());
+        client
+            .check_artifact_owners(&parent, &[key], Some(&child), &owners)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -4761,6 +5721,21 @@ You review code."#;
         let task_token = token.clone();
         let task_notification_id = task_id.clone();
 
+        let (handle, completion_token) = spawn_background_task(async move {
+            task_token.cancelled().await;
+            task_session_manager
+                .add_message(
+                    &task_notification_id,
+                    &Message::assistant().with_text("Partial result"),
+                )
+                .await
+                .unwrap();
+            task_notification_sink
+                .lock()
+                .await
+                .route(test_tool_notification("cancel", &task_notification_id));
+            Ok("cancelled gracefully".to_string())
+        });
         {
             let mut running = client.background_tasks.lock().await;
             running.insert(
@@ -4775,23 +5750,9 @@ You review code."#;
                     // This stale event count must be replaced after cancellation.
                     turns: Arc::new(AtomicU32::new(3)),
                     last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
-                    handle: tokio::spawn(async move {
-                        task_token.cancelled().await;
-                        task_session_manager
-                            .add_message(
-                                &task_notification_id,
-                                &Message::assistant().with_text("Partial result"),
-                            )
-                            .await
-                            .unwrap();
-                        task_notification_sink
-                            .lock()
-                            .await
-                            .route(test_tool_notification("cancel", &task_notification_id));
-                        Ok("cancelled gracefully".to_string())
-                    }),
+                    handle,
                     cancellation_token: token.clone(),
-                    completion_token: CancellationToken::new(),
+                    completion_token,
                     notification_sink,
                 },
             );
@@ -4877,6 +5838,10 @@ You review code."#;
             SummonClient::new(create_test_context_with_session_manager(session_manager)).unwrap();
         let cancellation_token = CancellationToken::new();
         let wait_token = cancellation_token.clone();
+        let (handle, completion_token) = spawn_background_task(async move {
+            wait_token.cancelled().await;
+            Ok("stopped".to_string())
+        });
         client.background_tasks.lock().await.insert(
             task_id.clone(),
             BackgroundTask {
@@ -4888,12 +5853,9 @@ You review code."#;
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(0)),
                 last_activity: Arc::new(AtomicU64::new(0)),
-                handle: tokio::spawn(async move {
-                    wait_token.cancelled().await;
-                    Ok("stopped".to_string())
-                }),
+                handle,
                 cancellation_token,
-                completion_token: CancellationToken::new(),
+                completion_token,
                 notification_sink: buffered_notification_sink(Vec::new()),
             },
         );
@@ -4914,6 +5876,10 @@ You review code."#;
         let task_id = "20260204_1";
         let task_token = token.clone();
 
+        let (handle, completion_token) = spawn_background_task(async move {
+            task_token.cancelled().await;
+            Ok("cancelled gracefully".to_string())
+        });
         client.background_tasks.lock().await.insert(
             task_id.to_string(),
             BackgroundTask {
@@ -4925,12 +5891,9 @@ You review code."#;
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
                 last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
-                handle: tokio::spawn(async move {
-                    task_token.cancelled().await;
-                    Ok("cancelled gracefully".to_string())
-                }),
+                handle,
                 cancellation_token: token.clone(),
-                completion_token: CancellationToken::new(),
+                completion_token,
                 notification_sink: buffered_notification_sink(vec![
                     test_tool_notification("inner-0", task_id),
                     test_tool_notification("inner-1", task_id),

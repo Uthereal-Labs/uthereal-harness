@@ -108,7 +108,16 @@ impl SessionManager {
                                     .and_then(|value| value.as_str());
                                 let status =
                                     meta.0.get("task_status").and_then(|value| value.as_str());
-                                if matches!(status, Some("completed" | "failed" | "panicked")) {
+                                if matches!(
+                                    status,
+                                    Some(
+                                        "completed"
+                                            | "failed"
+                                            | "panicked"
+                                            | "cancelled"
+                                            | "terminal"
+                                    )
+                                ) {
                                     if let Some(child) = child.filter(|child| {
                                         loads.get(response.id.as_str()) == Some(child)
                                     }) {
@@ -241,6 +250,29 @@ impl SessionManager {
         )
         .bind(recipient_session_id)
         .fetch_all(pool)
+        .await?)
+    }
+
+    pub async fn terminal_report_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<Option<MailboxMessage>> {
+        let child = self.get_session(child_session_id, false).await?;
+        if child.parent_session_id.as_deref() != Some(parent_session_id) {
+            bail!("Task '{child_session_id}' does not belong to this session");
+        }
+        Ok(sqlx::query_as(
+            r#"
+            SELECT id, sender_session_id, recipient_session_id, kind, body, created_at
+            FROM session_mailbox
+            WHERE recipient_session_id = ? AND sender_session_id = ? AND kind = 'completion'
+            ORDER BY id LIMIT 1
+            "#,
+        )
+        .bind(parent_session_id)
+        .bind(child_session_id)
+        .fetch_optional(self.storage().pool().await?)
         .await?)
     }
 
