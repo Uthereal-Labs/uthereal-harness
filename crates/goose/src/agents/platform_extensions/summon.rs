@@ -1297,8 +1297,8 @@ impl SummonClient {
         )
     }
 
-    fn create_delegate_tool(&self) -> Tool {
-        let schema = serde_json::json!({
+    fn create_delegate_tool(&self, instructions_required: bool) -> Tool {
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "instructions": {
@@ -1363,6 +1363,11 @@ impl SummonClient {
                 }
             }
         });
+        if instructions_required {
+            // Every available source is a specialist, so no delegation can
+            // start without the complete task.
+            schema["required"] = serde_json::json!(["instructions"]);
+        }
 
         Tool::new(
             "delegate",
@@ -2253,6 +2258,10 @@ impl SummonClient {
             "{queued} The task receives it at its next checkpoint; undelivered messages from you to this task: {waiting}. \
              Finish your reply unless you still have independent work: you are resumed automatically when a task reports or asks for something."
         )
+    }
+
+    fn only_specialist_sources(sources: &[SourceEntry]) -> bool {
+        !sources.is_empty() && sources.iter().all(Self::is_specialist_source)
     }
 
     fn is_specialist_source(source: &SourceEntry) -> bool {
@@ -3269,7 +3278,9 @@ impl McpClientTrait for SummonClient {
         if is_subagent {
             tools.push(self.create_message_parent_tool());
         } else {
-            tools.push(self.create_delegate_tool());
+            let working_dir = self.get_working_dir(session_id).await;
+            let sources = self.get_sources(session_id, &working_dir).await;
+            tools.push(self.create_delegate_tool(Self::only_specialist_sources(&sources)));
             tools.push(self.create_send_tool());
         }
 
@@ -5087,6 +5098,47 @@ You review code."#;
             .await
             .unwrap();
         assert!(result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_delegate_requires_instructions_when_every_source_is_a_specialist() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let source = |specialist: bool| SourceEntry {
+            source_type: SourceType::Agent,
+            name: "cortex-slides".to_string(),
+            description: String::new(),
+            content: String::new(),
+            path: String::new(),
+            global: false,
+            writable: true,
+            supporting_files: Vec::new(),
+            properties: std::collections::HashMap::from([(
+                "event_driven_parent".to_string(),
+                serde_json::json!(specialist),
+            )]),
+        };
+
+        assert!(SummonClient::only_specialist_sources(&[
+            source(true),
+            source(true)
+        ]));
+        assert!(!SummonClient::only_specialist_sources(&[
+            source(true),
+            source(false)
+        ]));
+        assert!(!SummonClient::only_specialist_sources(&[]));
+        assert_eq!(
+            client
+                .create_delegate_tool(true)
+                .input_schema
+                .get("required"),
+            Some(&serde_json::json!(["instructions"]))
+        );
+        assert!(client
+            .create_delegate_tool(false)
+            .input_schema
+            .get("required")
+            .is_none());
     }
 
     #[test]
