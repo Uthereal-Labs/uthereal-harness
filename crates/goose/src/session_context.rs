@@ -66,6 +66,39 @@ fn session_id_request_builder_with_header_name(
             request.headers_mut().insert(session_header, value);
         }
 
+        request.headers_mut().remove("traceparent");
+        request.headers_mut().remove("tracestate");
+        #[cfg(feature = "otel")]
+        {
+            use opentelemetry::trace::TraceContextExt;
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+            let context = tracing::Span::current().context();
+            let span = context.span();
+            let parent = span.span_context();
+            if parent.is_valid() {
+                request.headers_mut().insert(
+                    "traceparent",
+                    HeaderValue::from_str(&format!(
+                        "00-{}-{}-{:02x}",
+                        parent.trace_id(),
+                        parent.span_id(),
+                        parent.trace_flags().to_u8(),
+                    ))?,
+                );
+                // Native chat spans are exported to both backends; replace any
+                // Python ancestor so gateway attempts attach to this generation.
+                if let Ok(state) = parent.trace_state().insert(
+                    "uthlf",
+                    format!("{}-{}", parent.trace_id(), parent.span_id()),
+                ) {
+                    request
+                        .headers_mut()
+                        .insert("tracestate", HeaderValue::from_str(&state.header())?);
+                }
+            }
+        }
+
         Ok(reqwest::RequestBuilder::from_parts(client, request))
     })
 }
@@ -198,5 +231,85 @@ mod tests {
     #[test]
     fn test_session_id_request_builder_rejects_invalid_header_override() {
         assert!(session_id_request_builder_with_header_override(Some("invalid header")).is_err());
+    }
+
+    #[test]
+    fn test_request_without_active_trace_drops_stale_carrier() {
+        let subscriber = tracing::subscriber::NoSubscriber::default();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let request = session_id_request_builder()(
+            reqwest::Client::new()
+                .get("http://localhost")
+                .header("traceparent", "stale")
+                .header("tracestate", "uthlf=stale"),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert!(!request.headers().contains_key("traceparent"));
+        assert!(!request.headers().contains_key("tracestate"));
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn test_concurrent_requests_propagate_current_generation() {
+        use opentelemetry::trace::{
+            SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider,
+        };
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing::instrument::WithSubscriber;
+        use tracing::Instrument;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        use tracing_subscriber::prelude::*;
+
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let decorate = session_id_request_builder();
+        let run = |id: u128| {
+            let dispatch = dispatch.clone();
+            let decorate = decorate.clone();
+            async move {
+                let span = tracing::info_span!("chat");
+                let parent = SpanContext::new(
+                    TraceId::from(id),
+                    SpanId::from(1),
+                    TraceFlags::SAMPLED,
+                    true,
+                    TraceState::from_key_value([("vendor", "kept"), ("uthlf", "stale")]).unwrap(),
+                );
+                span.set_parent(opentelemetry::Context::new().with_remote_span_context(parent))
+                    .unwrap();
+                async move {
+                    tokio::task::yield_now().await;
+                    let context = tracing::Span::current().context();
+                    let current = context.span().span_context().clone();
+                    let request = decorate(reqwest::Client::new().get("http://localhost"))
+                        .unwrap()
+                        .build()
+                        .unwrap();
+                    assert_eq!(
+                        request.headers()["traceparent"],
+                        format!("00-{}-{}-01", current.trace_id(), current.span_id())
+                    );
+                    assert_eq!(
+                        request.headers()["tracestate"],
+                        format!(
+                            "uthlf={}-{},vendor=kept",
+                            current.trace_id(),
+                            current.span_id()
+                        )
+                    );
+                    current.trace_id()
+                }
+                .instrument(span)
+                .await
+            }
+            .with_subscriber(dispatch)
+        };
+        let (first, second) = tokio::join!(run(41), run(42));
+        assert_ne!(first, second);
+        provider.shutdown().unwrap();
     }
 }
