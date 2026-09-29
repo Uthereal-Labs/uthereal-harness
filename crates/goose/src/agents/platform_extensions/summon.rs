@@ -6,6 +6,7 @@ use crate::agents::tool_execution::{ToolCallContext, ToolCallNotificationEmitter
 use crate::agents::AgentConfig;
 use crate::config::paths::Paths;
 use crate::config::{Config, GooseMode};
+use crate::conversation::message::{Message, MessageContent};
 use crate::providers;
 use crate::recipe::build_recipe::build_recipe_from_template;
 use crate::recipe::local_recipes::load_local_recipe_file;
@@ -113,6 +114,8 @@ struct SummonTaskPolicy {
     event_driven_parent: bool,
     artifact_key: Option<String>,
     previous_task_id: Option<String>,
+    #[serde(default)]
+    artifact_result_tools: Vec<String>,
 }
 
 impl SummonTaskPolicy {
@@ -303,6 +306,8 @@ struct AgentMetadata {
     event_driven_parent: bool,
     #[serde(default)]
     delegate_only: bool,
+    #[serde(default)]
+    artifact_result_tools: Vec<String>,
 }
 
 fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
@@ -360,6 +365,10 @@ fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
     properties.insert(
         "event_driven_parent".to_string(),
         serde_json::json!(metadata.event_driven_parent),
+    );
+    properties.insert(
+        "artifact_result_tools".to_string(),
+        serde_json::json!(metadata.artifact_result_tools),
     );
 
     Some(SourceEntry {
@@ -637,6 +646,20 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
         ));
     }
 
+    let event_driven = subagents.iter().any(|source| {
+        source
+            .properties
+            .get("event_driven_parent")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    });
+    let waiting = if event_driven {
+        "After delegating, tell the user what is underway and finish your reply. Finishing your reply \
+         does not end the request: you are resumed automatically for each terminal report and for each \
+         specialist question, blocker, or decision."
+    } else {
+        "Use load(source: task_id, peek: true) for requested status."
+    };
     out.push_str(&format!(
         "\n\nWhen to call a subagent (one of [{names}]):\n\
          • `@<name>` in the user's message — always call that subagent.\n\
@@ -644,11 +667,13 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
          context whether they want it invoked, and if so, call it.\n\
          • The user's request strongly matches a subagent's description — \
          call it.\n\n\
-         Call delegate(source: \"<name>\", instructions: ...) with the complete handoff. \
+         Call delegate(source: \"<name>\", instructions: ...) and put the complete task in instructions: \
+         the requested outcome and every user requirement for that specialist's deliverable. \
          Specialists marked always_async or non_blocking run in the background: return control \
-         after delegation without waiting, polling, or sleeping. Briefly tell the user which specialist owns the work. Use the returned task ID for send(task_id: ..., message: ...) \
-         to steer the existing task instead of starting a replacement. Use load(source: task_id, peek: true) \
-         for requested status. Questions and terminal reports arrive automatically as internal evidence. \
+         after delegation without waiting, polling, or sleeping. Briefly tell the user which specialist owns the work. \
+         Use the returned task ID for send(task_id: ..., message: ...) only to steer a running task with new guidance \
+         or to answer its question; never use send to hand over the initial task, request status, or ask it to hurry. \
+         {waiting} Questions and terminal reports arrive automatically as internal evidence. \
          Review reports against the latest user instructions, verify requested artifacts, and author \
          the user-facing response yourself. Never claim success when a specialist reports failure.",
     ));
@@ -670,6 +695,189 @@ fn current_epoch_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+const ARTIFACT_RESULTS_HEADING: &str = "## Artifact results";
+const ARTIFACT_TEXT_BUDGET: usize = 400;
+
+fn artifact_assignment(params: &DelegateParams, previous_results: Option<&str>) -> Option<String> {
+    if params.artifact_key.is_none() && params.artifact_title.is_none() {
+        return None;
+    }
+    let mut lines = vec!["Assigned artifact (set by the coordinator for this task):".to_string()];
+    if let Some(key) = params.artifact_key.as_deref() {
+        match key.strip_prefix("document:") {
+            Some(id) => lines.push(format!(
+                "- Existing document ID: {id}. Revise this document; do not create another."
+            )),
+            None => lines.push(format!(
+                "- Artifact key: {key} (a new artifact requested in this turn)"
+            )),
+        }
+    }
+    if let Some(title) = params.artifact_title.as_deref() {
+        lines.push(format!("- Title: {title}"));
+    }
+    if let Some(previous) = params.previous_task_id.as_deref() {
+        lines.push(format!(
+            "- Follow-up to task {previous} for the same artifact."
+        ));
+        match previous_results {
+            Some(results) => {
+                lines.push(format!("- That task's artifact results:\n{results}"));
+                lines.push(
+                    "- If it saved a document, continue that document instead of creating another copy."
+                        .to_string(),
+                );
+            }
+            None => lines.push("- That task reported no artifact results.".to_string()),
+        }
+    }
+    Some(lines.join("\n"))
+}
+
+fn artifact_results_from_report(body: &str) -> Option<&str> {
+    body.split_once(ARTIFACT_RESULTS_HEADING)
+        .map(|(_, results)| results.trim())
+}
+
+fn artifact_target(arguments: Option<&JsonObject>) -> String {
+    let argument = |key: &str| {
+        arguments
+            .and_then(|arguments| arguments.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    match (argument("document_id"), argument("title")) {
+        (Some(id), _) => format!("document {id}"),
+        (None, Some(title)) => format!("a new document titled \"{title}\""),
+        (None, None) => "a new document".to_string(),
+    }
+}
+
+fn tool_result_text(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|content| content.as_text())
+        .map(|text| text.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn editor_result_value(result: &CallToolResult) -> Option<serde_json::Value> {
+    result
+        .structured_content
+        .clone()
+        .or_else(|| {
+            result
+                .content
+                .iter()
+                .filter_map(|content| content.as_text())
+                .find_map(|text| serde_json::from_str(&text.text).ok())
+        })
+        .filter(|value: &serde_json::Value| value.get("document_id").is_some())
+}
+
+fn describe_editor_result(value: &serde_json::Value) -> String {
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    let status = match text("status") {
+        "" => "unknown",
+        status => status,
+    };
+    let revision = value
+        .get("document_revision")
+        .and_then(serde_json::Value::as_i64)
+        .map_or_else(
+            || "no saved revision".to_string(),
+            |revision| format!("saved revision {revision}"),
+        );
+    let mut line = format!(
+        "- Editor job {status}: document {}, {revision}",
+        text("document_id")
+    );
+    for (label, key) in [("Summary", "summary"), ("Remaining work", "remaining_work")] {
+        let field = text(key).trim();
+        if !field.is_empty() {
+            line.push_str(&format!(
+                ". {label}: {}",
+                safe_truncate(field, ARTIFACT_TEXT_BUDGET)
+            ));
+        }
+    }
+    line
+}
+
+fn artifact_result_lines(messages: &[Message], tools: &[String]) -> Vec<String> {
+    let mut calls = Vec::new();
+    let mut responses = HashMap::new();
+    for message in messages {
+        for content in &message.content {
+            match content {
+                MessageContent::ToolRequest(request) => {
+                    if let Ok(call) = &request.tool_call {
+                        if tools.iter().any(|tool| call.name == tool.as_str()) {
+                            calls.push((request.id.as_str(), call.arguments.as_ref()));
+                        }
+                    }
+                }
+                MessageContent::ToolResponse(response) => {
+                    responses.insert(response.id.as_str(), &response.tool_result);
+                }
+                _ => {}
+            }
+        }
+    }
+    calls
+        .into_iter()
+        .map(|(id, arguments)| {
+            let target = artifact_target(arguments);
+            match responses.get(id) {
+                None => format!(
+                    "- Editor job for {target} was still running when this task ended; its saved state is unknown."
+                ),
+                Some(Err(error)) => format!(
+                    "- Editor call for {target} failed: {}",
+                    safe_truncate(&error.message, ARTIFACT_TEXT_BUDGET)
+                ),
+                Some(Ok(result)) => match editor_result_value(result) {
+                    Some(value) => describe_editor_result(&value),
+                    None => format!(
+                        "- Editor call for {target} returned no saved document: {}",
+                        safe_truncate(&tool_result_text(result), ARTIFACT_TEXT_BUDGET)
+                    ),
+                },
+            }
+        })
+        .collect()
+}
+
+async fn artifact_results_section(
+    manager: &crate::session::SessionManager,
+    task_id: &str,
+) -> Option<String> {
+    let session = manager.get_session(task_id, true).await.ok()?;
+    let policy = SummonTaskPolicy::from_session(&session)?;
+    if policy.artifact_result_tools.is_empty() {
+        return None;
+    }
+    let lines = session
+        .conversation
+        .as_ref()
+        .map(|conversation| {
+            artifact_result_lines(conversation.messages(), &policy.artifact_result_tools)
+        })
+        .unwrap_or_default();
+    let body = if lines.is_empty() {
+        "- No editor job was started, so nothing was saved.".to_string()
+    } else {
+        lines.join("\n")
+    };
+    Some(format!("{ARTIFACT_RESULTS_HEADING}\n{body}"))
 }
 
 /// Get maximum number of concurrent background tasks
@@ -938,12 +1146,13 @@ impl SummonClient {
             Ok(output) => output.clone(),
             Err(error) => error.to_string(),
         };
+        let mut body = format!("Task {task_id} {status}.\n\n{output}");
+        if let Some(section) = artifact_results_section(manager, task_id).await {
+            body.push_str("\n\n");
+            body.push_str(&section);
+        }
         manager
-            .enqueue_task_outcome(
-                task_id,
-                &format!("Task {task_id} {status}.\n\n{output}"),
-                terminal_status,
-            )
+            .enqueue_task_outcome(task_id, &body, terminal_status)
             .await?;
         Ok(())
     }
@@ -1094,7 +1303,7 @@ impl SummonClient {
             "properties": {
                 "instructions": {
                     "type": "string",
-                    "description": "Task instructions. Required for ad-hoc tasks."
+                    "description": "The complete task for the delegate: the requested outcome and every requirement it must meet. Required for ad-hoc tasks and for specialist agents. The delegate starts from these instructions; send is only for steering a task that is already running."
                 },
                 "source": {
                     "type": "string",
@@ -1160,12 +1369,12 @@ impl SummonClient {
             "Delegate a task to a subagent that runs independently with its own context.\n\n\
              Modes:\n\
              1. Ad-hoc: Provide `instructions` for a custom task\n\
-             2. Source-based: Provide `source` name to run a subrecipe, recipe, or agent\n\
-             3. Combined: Pair a source with a task (e.g., source: \"deploy\", instructions: \"deploy to staging\")\n\n\
+             2. Recipe: Provide `source` name to run a subrecipe or recipe with its own prompt\n\
+             3. Agent: Pair an agent source with the complete task (e.g., source: \"reviewer\", instructions: \"review the auth changes\"). Specialist agents always need instructions.\n\n\
              Effective Delegation:\n\
-             - Delegates know only instructions + source content\n\
+             - Delegates know only instructions + source content, so put the whole task in instructions\n\
              - Delegates exchange progress with the parent through native task messages; sibling delegates do not communicate directly. Same-file work can still conflict.\n\
-             - Parallel: async: true. Results report back automatically; use send(task_id: task_id, message: \"...\") for follow-up guidance. load(source: task_id) can wait or inspect status. Agents marked non_blocking always return status immediately from load while running. Single: sync.\n\n\
+             - Parallel: async: true. Results report back automatically; use send(task_id: task_id, message: \"...\") only to steer a running task or answer its question. load(source: task_id) can wait or inspect status. Agents marked non_blocking always return status immediately from load while running. Single: sync.\n\n\
              Research (read-only): parallelize freely - delegates explore and report back.\n\
              Work (writes): partition files strictly - no two delegates touch the same file.\n\n\
              Decompose → start async delegates → continue useful work → incorporate automatic reports."
@@ -1672,6 +1881,11 @@ impl SummonClient {
                 let duration = task.duration;
                 let turns_taken = task.turns_taken;
                 drop(completed);
+                let output =
+                    match artifact_results_section(&self.context.session_manager, task_id).await {
+                        Some(section) => format!("{output}\n\n{section}"),
+                        None => output,
+                    };
                 if !parent.is_empty() {
                     if let Err(error) = self
                         .context
@@ -1892,6 +2106,7 @@ impl SummonClient {
         } else {
             None
         };
+        Self::require_specialist_instructions(&params, agent_source.as_ref())?;
         let force_async = agent_source.as_ref().is_some_and(|source| {
             source
                 .properties
@@ -2014,6 +2229,63 @@ impl SummonClient {
         }
     }
 
+    async fn send_acknowledgement(&self, session_id: &str, task_id: &str) -> String {
+        let queued = format!("Message queued for task {task_id}.");
+        if !self.event_driven_parents.lock().await.contains(session_id) {
+            return queued;
+        }
+        let waiting = self
+            .context
+            .session_manager
+            .pending_session_messages(task_id)
+            .await
+            .map(|pending| {
+                pending
+                    .iter()
+                    .filter(|message| {
+                        message.kind == crate::session::MailboxMessageKind::Message
+                            && message.sender_session_id == session_id
+                    })
+                    .count()
+            })
+            .unwrap_or(1);
+        format!(
+            "{queued} The task receives it at its next checkpoint; undelivered messages from you to this task: {waiting}. \
+             Finish your reply unless you still have independent work: you are resumed automatically when a task reports or asks for something."
+        )
+    }
+
+    fn is_specialist_source(source: &SourceEntry) -> bool {
+        ["artifact_guard", "event_driven_parent"]
+            .iter()
+            .any(|flag| {
+                source
+                    .properties
+                    .get(*flag)
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+    }
+
+    fn require_specialist_instructions(
+        params: &DelegateParams,
+        agent_source: Option<&SourceEntry>,
+    ) -> Result<(), String> {
+        let specialist =
+            params.artifact_key.is_some() || agent_source.is_some_and(Self::is_specialist_source);
+        let has_instructions = params
+            .instructions
+            .as_deref()
+            .is_some_and(|instructions| !instructions.trim().is_empty());
+        if specialist && !has_instructions {
+            return Err(format!(
+                "Delegation to {} requires instructions with the complete task: the requested outcome and the user's requirements for this deliverable, plus any Research-dependent and Evidence IDs lines. The specialist starts from these instructions; send is only for steering it after it is running.",
+                params.source.as_deref().unwrap_or("a specialist"),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_delegate_params(&self, params: &DelegateParams) -> Result<(), String> {
         if params.instructions.is_none() && params.source.is_none() {
             return Err("Must provide 'instructions' or 'source' (or both)".to_string());
@@ -2100,6 +2372,27 @@ impl SummonClient {
                 recipe.prompt = Some(format!("{}\n\n{}", current_prompt, extra_instructions));
             } else {
                 recipe.prompt = Some(extra_instructions.clone());
+            }
+        }
+
+        if source.source_type == SourceType::Agent {
+            let previous_results = match params.previous_task_id.as_deref() {
+                Some(previous) => self
+                    .context
+                    .session_manager
+                    .terminal_report_for_child(session_id, previous)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .and_then(|report| {
+                        artifact_results_from_report(&report.body).map(str::to_string)
+                    }),
+                None => None,
+            };
+            if let Some(assignment) = artifact_assignment(params, previous_results.as_deref()) {
+                recipe.prompt = Some(match recipe.prompt.take() {
+                    Some(prompt) => format!("{assignment}\n\n{prompt}"),
+                    None => assignment,
+                });
             }
         }
 
@@ -2790,10 +3083,16 @@ impl SummonClient {
         .with_use_login_shell_path(self.context.use_login_shell_path);
         agent_config.is_subagent = true;
 
+        let artifact_result_tools = source
+            .as_ref()
+            .and_then(|source| source.properties.get("artifact_result_tools"))
+            .and_then(|tools| serde_json::from_value::<Vec<String>>(tools.clone()).ok())
+            .unwrap_or_default();
         let policy = SummonTaskPolicy {
             event_driven_parent,
             artifact_key: artifact_keys.first().cloned(),
             previous_task_id: params.previous_task_id.clone(),
+            artifact_result_tools,
         };
         let mut artifact_tasks = self.artifact_tasks.lock().await;
         self.reconstruct_artifact_tasks(session_id, &mut artifact_tasks, &artifact_keys)
@@ -2921,9 +3220,16 @@ impl SummonClient {
                 .insert(session_id.to_string());
         }
 
-        let retrieval = if event_driven_parent {
-            "It will report back automatically. Finish your reply to wait for an actionable message or terminal report; do not call load.".to_string()
-        } else if non_blocking {
+        if event_driven_parent {
+            let content = vec![ContentBlock::text(format!(
+                "Task {task_id} started in background: \"{description}\"\n\
+                 It already has its complete task and reports back automatically: you are resumed for its terminal report or for a question, blocker, or decision it raises. \
+                 Tell the user what is underway and finish your reply unless you still have independent work. \
+                 Use send(task_id: \"{task_id}\", message: \"...\") only to steer it with new guidance or answer its question."
+            ))];
+            return Ok((content, task_id));
+        }
+        let retrieval = if non_blocking {
             format!(
                 "It will report back automatically. Do not poll or sleep; finish your reply when no independent work remains. Use load(source: \"{task_id}\", peek: true) only for requested status."
             )
@@ -3043,10 +3349,9 @@ impl McpClientTrait for SummonClient {
                     }
                     .await
                     {
-                        Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                            "Message queued for task {}.",
-                            params.task_id
-                        ))])),
+                        Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(
+                            self.send_acknowledgement(session_id, &params.task_id).await,
+                        )])),
                         Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                             "Error: {error}"
                         ))])),
@@ -3151,18 +3456,54 @@ impl McpClientTrait for SummonClient {
         self.cleanup_completed_tasks().await;
         let refreshed_turns = self.refresh_running_task_turns().await;
 
+        let event_driven = self.event_driven_parents.lock().await.contains(session_id);
+        let pending_reports: Option<HashSet<String>> = if event_driven {
+            self.context
+                .session_manager
+                .pending_session_messages(session_id)
+                .await
+                .ok()
+                .map(|pending| {
+                    pending
+                        .into_iter()
+                        .filter(|message| {
+                            message.kind == crate::session::MailboxMessageKind::Completion
+                        })
+                        .map(|message| message.sender_session_id)
+                        .collect()
+                })
+        } else {
+            None
+        };
+
         let completed = self.completed_tasks.lock().await;
         let running = self.background_tasks.lock().await;
+        let belongs = |parent: &str| parent.is_empty() || parent == session_id;
 
-        if running.is_empty() && completed.is_empty() {
+        let mut sorted_running: Vec<_> = running
+            .values()
+            .filter(|task| belongs(task.parent_session_id.as_str()))
+            .collect();
+        sorted_running.sort_by_key(|task| &task.id);
+        let mut sorted_completed: Vec<_> = completed
+            .values()
+            .filter(|task| belongs(task.parent_session_id.as_str()))
+            .filter(|task| match &pending_reports {
+                Some(pending) => {
+                    pending.contains(&task.id) || task.completion_delivery_error.is_some()
+                }
+                None => true,
+            })
+            .collect();
+        sorted_completed.sort_by_key(|task| &task.id);
+
+        if sorted_running.is_empty() && sorted_completed.is_empty() {
             return None;
         }
 
         let mut lines = vec!["Background tasks:".to_string()];
         let now = current_epoch_millis();
-
-        let mut sorted_running: Vec<_> = running.values().collect();
-        sorted_running.sort_by_key(|task| &task.id);
+        let has_running = !sorted_running.is_empty();
 
         for task in sorted_running {
             let elapsed = task.started_at.elapsed();
@@ -3186,28 +3527,32 @@ impl McpClientTrait for SummonClient {
             ));
         }
 
-        let mut sorted_completed: Vec<_> = completed.values().collect();
-        sorted_completed.sort_by_key(|task| &task.id);
-
+        let delivery = if event_driven {
+            "its report is pending"
+        } else {
+            "completion is reported automatically"
+        };
         for task in sorted_completed {
-            let status = if task.result.is_ok() {
-                "completed"
-            } else {
-                "failed"
+            let status = match task.terminal_status {
+                TaskTerminalStatus::Completed if task.result.is_ok() => "completed",
+                TaskTerminalStatus::Completed | TaskTerminalStatus::Failed => "failed",
+                TaskTerminalStatus::Cancelled => "cancelled",
+                TaskTerminalStatus::Panicked => "panicked",
             };
             lines.push(format!(
-                "• {}: \"{}\" - {} in {} ({} turns) - completion is reported automatically",
+                "• {}: \"{}\" - {} in {} ({} turns) - {}",
                 task.id,
                 task.description,
                 status,
                 round_duration(task.duration),
                 task.turns_taken,
+                delivery,
             ));
         }
 
-        if !running.is_empty() {
-            lines.push(if self.event_driven_parents.lock().await.contains(session_id) {
-                "\n→ Reports arrive automatically. Finish your reply when no independent work remains; the coordinator will resume for an actionable message or terminal result. Use send only when a running specialist needs new guidance."
+        if has_running {
+            lines.push(if event_driven {
+                "\n→ Specialists report automatically. Finish your reply now unless you still have independent work: you are resumed for each terminal report and for each specialist question, blocker, or decision. Use send only to give a running specialist new guidance or answer its question."
                     .to_string()
             } else {
                 "\n→ Reports arrive automatically. Do not poll or sleep; finish your reply when no independent work remains. Use send to steer an existing task, load(source: \"<id>\", peek: true) for requested status, or load(source: \"<id>\", cancel: true) to stop it"
@@ -3307,6 +3652,102 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn artifact_result_lines_describe_saved_failed_and_unfinished_editor_jobs() {
+        let tool = "cortex_document__delegate_editor_task";
+        let call = |id: &str, arguments: serde_json::Value| {
+            Message::assistant().with_tool_request(
+                id,
+                Ok(rmcp::model::CallToolRequestParams::new(tool)
+                    .with_arguments(arguments.as_object().unwrap().clone())),
+            )
+        };
+        let mut saved = CallToolResult::success(vec![ContentBlock::text("saved")]);
+        saved.structured_content = Some(serde_json::json!({
+            "job_id": "job-1", "status": "partial", "summary": "Created six sections",
+            "remaining_work": "Add the rubric", "document_id": "doc-1", "document_revision": 2,
+        }));
+        let cancelled = CallToolResult::error(vec![ContentBlock::text(
+            serde_json::json!({"status": "cancelled", "summary": "Stopped", "document_id": "doc-2", "document_revision": null})
+                .to_string(),
+        )]);
+        let messages = vec![
+            call(
+                "c1",
+                serde_json::json!({"editor": "quire", "create_new": true, "title": "Speaker Notes"}),
+            ),
+            Message::user().with_tool_response("c1", Ok(saved)),
+            call(
+                "c2",
+                serde_json::json!({"editor": "quire", "document_id": "doc-2"}),
+            ),
+            Message::user().with_tool_response("c2", Ok(cancelled)),
+            Message::assistant().with_tool_request(
+                "c3",
+                Ok(rmcp::model::CallToolRequestParams::new(
+                    "cortex_document__read_document",
+                )),
+            ),
+            call(
+                "c4",
+                serde_json::json!({"editor": "quire", "document_id": "doc-1"}),
+            ),
+        ];
+
+        let lines = artifact_result_lines(&messages, &[tool.to_string()]);
+
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("partial") && lines[0].contains("document doc-1"));
+        assert!(lines[0].contains("saved revision 2"));
+        assert!(lines[0].contains("Remaining work: Add the rubric"));
+        assert!(lines[1].contains("cancelled") && lines[1].contains("no saved revision"));
+        assert!(lines[2].contains("document doc-1") && lines[2].contains("still running"));
+    }
+
+    #[test]
+    fn artifact_assignment_carries_identity_and_previous_results() {
+        let report = format!(
+            "Task 20260929_14 was cancelled.\n\nNo text content in last message\n\n{ARTIFACT_RESULTS_HEADING}\n- Editor job partial: document doc-1, saved revision 2"
+        );
+        let previous = artifact_results_from_report(&report);
+        assert_eq!(
+            previous,
+            Some("- Editor job partial: document doc-1, saved revision 2")
+        );
+
+        let follow_up = DelegateParams {
+            artifact_key: Some("new:document:Speaker Notes".to_string()),
+            artifact_title: Some("Speaker Notes".to_string()),
+            previous_task_id: Some("20260929_14".to_string()),
+            ..Default::default()
+        };
+        let assignment = artifact_assignment(&follow_up, previous).unwrap();
+        assert!(assignment.contains("Artifact key: new:document:Speaker Notes"));
+        assert!(assignment.contains("Title: Speaker Notes"));
+        assert!(assignment.contains("Follow-up to task 20260929_14"));
+        assert!(assignment.contains("document doc-1, saved revision 2"));
+        assert!(assignment.contains("continue that document"));
+
+        let existing = DelegateParams {
+            artifact_key: Some("document:doc-9".to_string()),
+            ..Default::default()
+        };
+        assert!(artifact_assignment(&existing, None)
+            .unwrap()
+            .contains("Existing document ID: doc-9"));
+        assert!(artifact_assignment(&DelegateParams::default(), None).is_none());
+
+        let source = parse_agent_content(
+            "---\nname: cortex-document\nartifact_result_tools: [cortex_document__delegate_editor_task]\n---\nWrite.",
+            Path::new("document.md"),
+        )
+        .unwrap();
+        assert_eq!(
+            source.properties["artifact_result_tools"],
+            serde_json::json!(["cortex_document__delegate_editor_task"])
+        );
+    }
 
     fn create_test_context() -> PlatformExtensionContext {
         create_test_context_with_session_manager(Arc::new(
@@ -3412,6 +3853,7 @@ mod tests {
                     event_driven_parent: true,
                     artifact_key: Some(key.to_string()),
                     previous_task_id: previous.map(str::to_string),
+                    ..Default::default()
                 }),
                 "inline",
             )
@@ -3517,6 +3959,17 @@ mod tests {
             .await
             .unwrap();
         let client = SummonClient::new(context).unwrap();
+        for instructions in [None, Some("   ")] {
+            let mut missing = serde_json::json!({"source":"cortex-slides","artifact_key":"new:slides:quarterly","artifact_title":"Quarterly","extensions":[],"async":true}).as_object().unwrap().clone();
+            if let Some(instructions) = instructions {
+                missing.insert("instructions".to_string(), serde_json::json!(instructions));
+            }
+            let error = client
+                .handle_delegate(&parent, Some(missing), CancellationToken::new(), None)
+                .await
+                .unwrap_err();
+            assert!(error.contains("requires instructions"), "{error}");
+        }
         let arguments = serde_json::json!({"source":"cortex-slides","artifact_key":"new:slides:quarterly","artifact_title":"Quarterly","instructions":"Create the report.","extensions":[],"async":false}).as_object().unwrap().clone();
         let first = client
             .handle_delegate(
@@ -5801,11 +6254,55 @@ You review code."#;
             );
         }
 
+        client.completed_tasks.lock().await.insert(
+            "20260204_4".to_string(),
+            CompletedTask {
+                id: "20260204_4".to_string(),
+                parent_session_id: "another-parent".to_string(),
+                completion_delivery_error: None,
+                terminal_status: TaskTerminalStatus::Cancelled,
+                description: "Other parent's task".to_string(),
+                result: Err("Task was cancelled".to_string()),
+                turns_taken: 1,
+                duration: Duration::from_secs(10),
+                completed_at: Instant::now(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+        client.completed_tasks.lock().await.insert(
+            "20260204_5".to_string(),
+            CompletedTask {
+                id: "20260204_5".to_string(),
+                parent_session_id: String::new(),
+                completion_delivery_error: None,
+                terminal_status: TaskTerminalStatus::Cancelled,
+                description: "Cancelled task".to_string(),
+                result: Err("Task was cancelled".to_string()),
+                turns_taken: 1,
+                duration: Duration::from_secs(10),
+                completed_at: Instant::now(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+
         let moim = client.get_moim("test").await.unwrap();
         assert!(moim.contains("20260204_2"));
         assert!(moim.contains("20260204_3"));
         assert!(moim.contains("completion is reported automatically"));
         assert!(!moim.contains("to get result"));
+        assert!(moim.contains("\"Cancelled task\" - cancelled in"));
+        assert!(!moim.contains("20260204_4"));
+
+        client
+            .event_driven_parents
+            .lock()
+            .await
+            .insert("test".to_string());
+        assert!(
+            client.get_moim("test").await.is_none(),
+            "delivered reports are not repeated to an event-driven parent"
+        );
+        client.event_driven_parents.lock().await.remove("test");
 
         let discovery = client
             .handle_load_discovery("test", temp_dir.path())
@@ -6509,7 +7006,7 @@ You review code."#;
             .await
             .insert("test".to_string());
         let event_driven_moim = client.get_moim("test").await.unwrap();
-        assert!(event_driven_moim.contains("coordinator will resume"));
+        assert!(event_driven_moim.contains("you are resumed for each terminal report"));
         assert!(!event_driven_moim.contains("load(source:"));
         assert!(client.background_tasks.lock().await.contains_key(task_id));
     }
