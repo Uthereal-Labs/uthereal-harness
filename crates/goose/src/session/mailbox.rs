@@ -44,7 +44,7 @@ impl MailboxMessage {
             .iter()
             .map(|message| {
                 let label = match message.kind {
-                    MailboxMessageKind::Message => "Update",
+                    MailboxMessageKind::Message => "Question",
                     MailboxMessageKind::Completion => "Completion",
                 };
                 format!(

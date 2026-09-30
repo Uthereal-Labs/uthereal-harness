@@ -105,7 +105,6 @@ struct SendParams {
 #[derive(Debug, Deserialize)]
 struct MessageParentParams {
     message: String,
-    kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -581,7 +580,7 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
     };
 
     if session.session_type == SessionType::SubAgent {
-        return "Own the delegated task within your specialist scope. Apply parent guidance at the next checkpoint. Use message_parent(message: ...) for a question, blocker, or important update; only the main agent communicates with the user. This is asynchronous: continue independent work while awaiting guidance. Your final result is delivered automatically, so do not duplicate it with message_parent. Do not delegate further.".to_string();
+        return "Own the delegated task within your specialist scope. Apply parent guidance at the next checkpoint. Only the main agent communicates with the user. Use message_parent(message: ...) only in exceptional cases, to ask one concrete question you cannot resolve yourself and cannot continue without; the parent answers or asks the user and replies through your task. Your final result, including any limitation or warning, is delivered automatically, so never use message_parent for progress, results, or limitations. Do not delegate further.".to_string();
     }
 
     // filter the sources down to what we want even though currently that is what we get
@@ -656,7 +655,7 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
     let waiting = if event_driven {
         "After delegating, tell the user what is underway and finish your reply. Finishing your reply \
          does not end the request: you are resumed automatically for each terminal report and for each \
-         specialist question, blocker, or decision."
+         specialist question."
     } else {
         "Use load(source: task_id, peek: true) for requested status."
     };
@@ -1297,8 +1296,8 @@ impl SummonClient {
         )
     }
 
-    fn create_delegate_tool(&self) -> Tool {
-        let schema = serde_json::json!({
+    fn create_delegate_tool(&self, instructions_required: bool) -> Tool {
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "instructions": {
@@ -1363,6 +1362,11 @@ impl SummonClient {
                 }
             }
         });
+        if instructions_required {
+            // Every available source is a specialist, so no delegation can
+            // start without the complete task.
+            schema["required"] = serde_json::json!(["instructions"]);
+        }
 
         Tool::new(
             "delegate",
@@ -1404,13 +1408,12 @@ impl SummonClient {
     fn create_message_parent_tool(&self) -> Tool {
         Tool::new(
             "message_parent",
-            "Send a question, blocker, or decision needing parent action without ending this task. For event-driven parents, kind is required; progress stays local. Final results are delivered automatically.".to_string(),
+            "Ask the parent one concrete question without ending this task. Use it only in exceptional cases: when you cannot continue without an answer that only the parent or the user can give. The parent replies through your task. Never use it for progress, results, warnings, or limitations; your final report, including any limitation, is delivered automatically.".to_string(),
             serde_json::json!({
                 "type": "object",
                 "required": ["message"],
                 "properties": {
-                    "message": {"type": "string", "description": "Update for the parent task."},
-                    "kind": {"type": "string", "enum": ["question", "blocker", "decision", "progress"], "description": "Why the parent needs this message. Progress does not wake event-driven parents."}
+                    "message": {"type": "string", "description": "The question the parent must answer before you can continue, with the context needed to answer it."}
                 }
             })
             .as_object()
@@ -2253,6 +2256,10 @@ impl SummonClient {
             "{queued} The task receives it at its next checkpoint; undelivered messages from you to this task: {waiting}. \
              Finish your reply unless you still have independent work: you are resumed automatically when a task reports or asks for something."
         )
+    }
+
+    fn only_specialist_sources(sources: &[SourceEntry]) -> bool {
+        !sources.is_empty() && sources.iter().all(Self::is_specialist_source)
     }
 
     fn is_specialist_source(source: &SourceEntry) -> bool {
@@ -3223,7 +3230,7 @@ impl SummonClient {
         if event_driven_parent {
             let content = vec![ContentBlock::text(format!(
                 "Task {task_id} started in background: \"{description}\"\n\
-                 It already has its complete task and reports back automatically: you are resumed for its terminal report or for a question, blocker, or decision it raises. \
+                 It already has its complete task and reports back automatically: you are resumed for its terminal report or for a question it asks. \
                  Tell the user what is underway and finish your reply unless you still have independent work. \
                  Use send(task_id: \"{task_id}\", message: \"...\") only to steer it with new guidance or answer its question."
             ))];
@@ -3269,7 +3276,9 @@ impl McpClientTrait for SummonClient {
         if is_subagent {
             tools.push(self.create_message_parent_tool());
         } else {
-            tools.push(self.create_delegate_tool());
+            let working_dir = self.get_working_dir(session_id).await;
+            let sources = self.get_sources(session_id, &working_dir).await;
+            tools.push(self.create_delegate_tool(Self::only_specialist_sources(&sources)));
             tools.push(self.create_send_tool());
         }
 
@@ -3368,24 +3377,15 @@ impl McpClientTrait for SummonClient {
                     .map(|params| {
                         params.unwrap_or(MessageParentParams {
                             message: String::new(),
-                            kind: None,
                         })
                     });
                 match params {
+                    Ok(params) if params.message.trim().is_empty() => {
+                        Ok(CallToolResult::error(vec![ContentBlock::text(
+                            "Error: message_parent requires the question to ask.",
+                        )]))
+                    }
                     Ok(params) => {
-                        let policy = match self.task_policy(session_id).await {
-                            Ok(policy) => policy,
-                            Err(error) => {
-                                return Ok(CallToolResult::error(vec![ContentBlock::text(error)]))
-                            }
-                        };
-                        if policy.is_some_and(|policy| policy.event_driven_parent) {
-                            match params.kind.as_deref() {
-                                Some("progress") => return Ok(CallToolResult::success(vec![ContentBlock::text("Progress remains within this task; the parent was not awakened.")])),
-                                Some("question" | "blocker" | "decision") => {}
-                                _ => return Ok(CallToolResult::error(vec![ContentBlock::text("Event-driven specialists must set kind to question, blocker, or decision for parent messages.")])),
-                            }
-                        }
                         match self
                             .context
                             .session_manager
@@ -3393,7 +3393,7 @@ impl McpClientTrait for SummonClient {
                             .await
                         {
                             Ok(_) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                                "Update queued for the parent task.",
+                                "Question queued for the parent task. Wait for its reply before depending on the answer.",
                             )])),
                             Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(
                                 format!("Error: {error}"),
@@ -3552,7 +3552,7 @@ impl McpClientTrait for SummonClient {
 
         if has_running {
             lines.push(if event_driven {
-                "\n→ Specialists report automatically. Finish your reply now unless you still have independent work: you are resumed for each terminal report and for each specialist question, blocker, or decision. Use send only to give a running specialist new guidance or answer its question."
+                "\n→ Specialists report automatically. Finish your reply now unless you still have independent work: you are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
                     .to_string()
             } else {
                 "\n→ Reports arrive automatically. Do not poll or sleep; finish your reply when no independent work remains. Use send to steer an existing task, load(source: \"<id>\", peek: true) for requested status, or load(source: \"<id>\", cancel: true) to stop it"
@@ -4049,7 +4049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reliability_child_owns_policy_and_progress_does_not_wake_parent() {
+    async fn reliability_child_owns_policy_and_parent_messages_are_questions() {
         let (_directory, manager, parent, coordinator) = reliability_fixture().await;
         let child = reliability_child(&coordinator, &parent, "new:slides:quarterly", None).await;
         let policy = coordinator.task_policy(&child).await.unwrap().unwrap();
@@ -4060,61 +4060,47 @@ mod tests {
         )))
         .unwrap();
         let context = ToolCallContext::new(child.clone(), None, None);
-        let call = |kind: Option<&str>| {
-            let mut arguments = serde_json::json!({"message":"Evidence retrieved"})
+        let call = |message: &str| {
+            serde_json::json!({ "message": message })
                 .as_object()
                 .unwrap()
-                .clone();
-            if let Some(kind) = kind {
-                arguments.insert("kind".to_string(), serde_json::json!(kind));
-            }
-            arguments
+                .clone()
         };
-        let progress = specialist
+        let blank = specialist
             .call_tool(
                 &context,
                 "message_parent",
-                Some(call(Some("progress"))),
+                Some(call("   ")),
                 CancellationToken::new(),
             )
             .await
             .unwrap();
-        assert_ne!(progress.is_error, Some(true));
+        assert_eq!(blank.is_error, Some(true));
         assert!(manager
             .pending_session_messages(&parent)
             .await
             .unwrap()
             .is_empty());
-        let missing = specialist
+        let question = specialist
             .call_tool(
                 &context,
                 "message_parent",
-                Some(call(None)),
+                Some(call("Should the deck use the 2025 or the 2026 figures?")),
                 CancellationToken::new(),
             )
             .await
             .unwrap();
-        assert_eq!(missing.is_error, Some(true));
-        for kind in ["question", "blocker", "decision"] {
-            let result = specialist
-                .call_tool(
-                    &context,
-                    "message_parent",
-                    Some(call(Some(kind))),
-                    CancellationToken::new(),
-                )
-                .await
-                .unwrap();
-            assert_ne!(result.is_error, Some(true));
-        }
+        assert_ne!(question.is_error, Some(true));
         assert_eq!(
             manager
                 .pending_session_messages(&parent)
                 .await
                 .unwrap()
                 .len(),
-            3
+            1
         );
+        let schema = specialist.create_message_parent_tool().input_schema;
+        assert!(schema["properties"].get("kind").is_none());
     }
 
     #[tokio::test]
@@ -5087,6 +5073,47 @@ You review code."#;
             .await
             .unwrap();
         assert!(result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_delegate_requires_instructions_when_every_source_is_a_specialist() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let source = |specialist: bool| SourceEntry {
+            source_type: SourceType::Agent,
+            name: "cortex-slides".to_string(),
+            description: String::new(),
+            content: String::new(),
+            path: String::new(),
+            global: false,
+            writable: true,
+            supporting_files: Vec::new(),
+            properties: std::collections::HashMap::from([(
+                "event_driven_parent".to_string(),
+                serde_json::json!(specialist),
+            )]),
+        };
+
+        assert!(SummonClient::only_specialist_sources(&[
+            source(true),
+            source(true)
+        ]));
+        assert!(!SummonClient::only_specialist_sources(&[
+            source(true),
+            source(false)
+        ]));
+        assert!(!SummonClient::only_specialist_sources(&[]));
+        assert_eq!(
+            client
+                .create_delegate_tool(true)
+                .input_schema
+                .get("required"),
+            Some(&serde_json::json!(["instructions"]))
+        );
+        assert!(client
+            .create_delegate_tool(false)
+            .input_schema
+            .get("required")
+            .is_none());
     }
 
     #[test]
