@@ -31,6 +31,21 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Tool-result metadata key: the agent ends its turn after this tool result,
+/// without a user-visible message. Only `wait` sets it.
+pub const END_TURN_META_KEY: &str = "goose.endTurn";
+
+/// True when a successful tool result asks the agent to end its turn.
+pub fn tool_result_ends_turn(result: &CallToolResult) -> bool {
+    result.is_error != Some(true)
+        && result
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.0.get(END_TURN_META_KEY))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
 use tokio::sync::Mutex;
 
 use tokio::task::JoinHandle;
@@ -653,9 +668,11 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
             .unwrap_or(false)
     });
     let waiting = if event_driven {
-        "After delegating, tell the user what is underway and finish your reply. Finishing your reply \
-         does not end the request: you are resumed automatically for each terminal report and for each \
-         specialist question."
+        "After delegating, tell the user once what is underway, then call wait. What you write is shown to \
+         the user as an update, so write only when the user learns something new, such as an artifact \
+         finishing or failing; otherwise call wait without writing, for example after answering a specialist's \
+         question. You are resumed automatically for each terminal report and each specialist question. \
+         When the last task has reported, wait is unavailable: write the complete answer."
     } else {
         "Use load(source: task_id, peek: true) for requested status."
     };
@@ -668,8 +685,8 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
          call it.\n\n\
          Call delegate(source: \"<name>\", instructions: ...) and put the complete task in instructions: \
          the requested outcome and every user requirement for that specialist's deliverable. \
-         Specialists marked always_async or non_blocking run in the background: return control \
-         after delegation without waiting, polling, or sleeping. Briefly tell the user which specialist owns the work. \
+         Specialists marked always_async or non_blocking run in the background: never poll or block on them. \
+         Briefly tell the user which specialist owns the work. \
          Use the returned task ID for send(task_id: ..., message: ...) only to steer a running task with new guidance \
          or to answer its question; never use send to hand over the initial task, request status, or ask it to hurry. \
          {waiting} Questions and terminal reports arrive automatically as internal evidence. \
@@ -1405,6 +1422,50 @@ impl SummonClient {
         )
     }
 
+    fn create_wait_tool(&self) -> Tool {
+        Tool::new(
+            "wait",
+            "End your turn without writing to the user and sleep until the next delegated-task report or question arrives. Use it whenever you have nothing new for the user, for example right after answering a specialist's question. Available only while a delegated task is still running or a report is waiting.".to_string(),
+            serde_json::json!({"type": "object", "properties": {}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    }
+
+    /// End the parent's turn silently while its delegated work is outstanding.
+    /// With nothing left to wait for, the agent must answer the user instead.
+    async fn handle_wait(&self, session_id: &str) -> CallToolResult {
+        let running = self
+            .background_tasks
+            .lock()
+            .await
+            .values()
+            .any(|task| task.parent_session_id == session_id && !task.handle.is_finished());
+        let reports_waiting = self
+            .context
+            .session_manager
+            .pending_session_messages(session_id)
+            .await
+            .map(|messages| !messages.is_empty())
+            .unwrap_or(false);
+        if !running && !reports_waiting {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "Error: No delegated task is running and no report is waiting. Every task has reported: write your answer to the user now.",
+            )]);
+        }
+        let mut result = CallToolResult::success(vec![ContentBlock::text(
+            "Waiting. You will be resumed with the next report or question.",
+        )]);
+        result.meta = Some(MetaObject(
+            serde_json::json!({ END_TURN_META_KEY: true })
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+        result
+    }
+
     fn create_message_parent_tool(&self) -> Tool {
         Tool::new(
             "message_parent",
@@ -1667,7 +1728,7 @@ impl SummonClient {
                         .await?
                         .is_some_and(|policy| policy.event_driven_parent))
             {
-                return Err("This task reports automatically. Finish the reply to wait; use send to steer it or load(cancel: true) to stop it.".to_string());
+                return Err("This task reports automatically. Call wait to sleep until it reports; use send to steer it or load(cancel: true) to stop it.".to_string());
             }
             let task_result = if running || cached {
                 self.recover_completion_delivery(name).await?;
@@ -2252,9 +2313,14 @@ impl SummonClient {
                     .count()
             })
             .unwrap_or(1);
+        let next = if self.event_driven_parents.lock().await.contains(session_id) {
+            "Call wait without writing to the user unless you still have independent work or news for them: \
+             you are resumed automatically when a task reports or asks for something."
+        } else {
+            "Finish your reply unless you still have independent work: you are resumed automatically when a task reports or asks for something."
+        };
         format!(
-            "{queued} The task receives it at its next checkpoint; undelivered messages from you to this task: {waiting}. \
-             Finish your reply unless you still have independent work: you are resumed automatically when a task reports or asks for something."
+            "{queued} The task receives it at its next checkpoint; undelivered messages from you to this task: {waiting}. {next}"
         )
     }
 
@@ -3231,7 +3297,7 @@ impl SummonClient {
             let content = vec![ContentBlock::text(format!(
                 "Task {task_id} started in background: \"{description}\"\n\
                  It already has its complete task and reports back automatically: you are resumed for its terminal report or for a question it asks. \
-                 Tell the user what is underway and finish your reply unless you still have independent work. \
+                 Once you have delegated everything and finished any independent work, tell the user what is underway (once), then call wait. \
                  Use send(task_id: \"{task_id}\", message: \"...\") only to steer it with new guidance or answer its question."
             ))];
             return Ok((content, task_id));
@@ -3278,8 +3344,18 @@ impl McpClientTrait for SummonClient {
         } else {
             let working_dir = self.get_working_dir(session_id).await;
             let sources = self.get_sources(session_id, &working_dir).await;
+            let event_driven = sources.iter().any(|source| {
+                source
+                    .properties
+                    .get("event_driven_parent")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            });
             tools.push(self.create_delegate_tool(Self::only_specialist_sources(&sources)));
             tools.push(self.create_send_tool());
+            if event_driven {
+                tools.push(self.create_wait_tool());
+            }
         }
 
         Ok(ListToolsResult {
@@ -3370,6 +3446,7 @@ impl McpClientTrait for SummonClient {
                     ))])),
                 }
             }
+            "wait" => Ok(self.handle_wait(session_id).await),
             "message_parent" => {
                 let params: std::result::Result<MessageParentParams, _> = arguments
                     .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
@@ -3552,7 +3629,7 @@ impl McpClientTrait for SummonClient {
 
         if has_running {
             lines.push(if event_driven {
-                "\n→ Specialists report automatically. Finish your reply now unless you still have independent work: you are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
+                "\n→ Specialists report automatically. Call wait now unless you still have independent work or news for the user: you are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
                     .to_string()
             } else {
                 "\n→ Reports arrive automatically. Do not poll or sleep; finish your reply when no independent work remains. Use send to steer an existing task, load(source: \"<id>\", peek: true) for requested status, or load(source: \"<id>\", cancel: true) to stop it"
@@ -5073,6 +5150,50 @@ You review code."#;
             .await
             .unwrap();
         assert!(result.is_error.unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn test_wait_is_offered_only_to_event_driven_parents_and_needs_outstanding_work() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let result = client
+            .list_tools("test", None, CancellationToken::new())
+            .await
+            .unwrap();
+        // No event-driven specialist source: nothing reports back, so no wait.
+        assert!(!result.tools.iter().any(|tool| tool.name == "wait"));
+
+        // With no running task and no waiting report, wait refuses so the
+        // agent must answer the user instead of sleeping forever.
+        let ctx = ToolCallContext::new("test".to_string(), None, None);
+        let refused = client
+            .call_tool(&ctx, "wait", None, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(refused.is_error.unwrap_or(false));
+        assert!(!tool_result_ends_turn(&refused));
+    }
+
+    #[test]
+    fn test_only_a_successful_result_with_the_end_turn_flag_ends_the_turn() {
+        let flagged = |error: bool| {
+            let mut result = if error {
+                CallToolResult::error(vec![ContentBlock::text("x")])
+            } else {
+                CallToolResult::success(vec![ContentBlock::text("x")])
+            };
+            result.meta = Some(MetaObject(
+                serde_json::json!({ END_TURN_META_KEY: true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ));
+            result
+        };
+        assert!(tool_result_ends_turn(&flagged(false)));
+        assert!(!tool_result_ends_turn(&flagged(true)));
+        assert!(!tool_result_ends_turn(&CallToolResult::success(vec![
+            ContentBlock::text("x")
+        ])));
     }
 
     #[tokio::test]

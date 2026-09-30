@@ -188,6 +188,19 @@ the conversation, and writes the user-facing answer. Reports do not impersonate
 new user requests. Questions from children are asynchronous messages, not
 blocking request/response calls.
 
+A parent whose sources set `event_driven_parent` also gets `summon.wait`. It
+ends the parent's turn without a user-visible message while a delegated task is
+running or a report is waiting, so text is only ever a user update: the parent
+sleeps with `wait`, for example after answering a child's question, and writes
+only when the user learns something new. Its result carries the
+`goose.endTurn` tool-result metadata that the agent loop honors, and the ACP
+server accepts a report turn that ended this way. With no task running and no
+report waiting, `wait` returns an error, so the last report is always answered
+with a message. Both agent loops honor `goose.endTurn`: the default loop ends
+the turn after the tool result, and the state machine's `EndTurnOperation`,
+registered after tool execution, yields to the client instead of calling the
+model again.
+
 The interactive CLI on macOS/Linux checks for reports while its prompt is idle.
 Once the user begins typing, normal line editing owns the terminal until
 submission; reports are handled after the user turn. External-editor prompts,

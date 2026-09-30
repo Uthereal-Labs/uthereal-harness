@@ -23,6 +23,7 @@ pub(super) const ADD_VALUES: &str = "calculator__add_values";
 pub(super) const ADD_WITH_AUDIENCE: &str = "calculator__add_with_audience";
 pub(super) const DIVIDE: &str = "calculator__divide";
 pub(super) const REQUEST_VALUE: &str = "calculator__request_value";
+pub(super) const PAUSE: &str = "calculator__pause";
 const EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub(super) fn value(value: i64) -> Value {
@@ -169,6 +170,11 @@ impl McpClientTrait for CalculatorExtension {
             Tool::new(
                 "request_value",
                 "Ask the user for a value",
+                Arc::new(request_value_schema.clone()),
+            ),
+            Tool::new(
+                "pause",
+                "End the turn without a message, like summon's wait",
                 Arc::new(request_value_schema),
             ),
         ]))
@@ -182,6 +188,16 @@ impl McpClientTrait for CalculatorExtension {
         cancel_token: CancellationToken,
     ) -> Result<CallToolResult, McpError> {
         self.contexts.lock().unwrap().push(ctx.clone());
+        if name == "pause" {
+            let mut result = CallToolResult::success(vec![ContentBlock::text("paused")]);
+            result.meta = Some(rmcp::model::MetaObject(
+                json!({ crate::agents::platform_extensions::summon::END_TURN_META_KEY: true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ));
+            return Ok(result);
+        }
         if name == "request_value" {
             let tool_call_request_id = ctx.tool_call_request_id.clone().ok_or_else(|| {
                 McpError::McpError(ErrorData::invalid_params(
