@@ -285,6 +285,8 @@ struct AgentStreamOutcome {
     was_cancelled: bool,
     output_token_limit_reached: bool,
     completed_visible_response: bool,
+    /// The turn ended through a tool that yields without a message (summon's `wait`).
+    ended_by_wait: bool,
 }
 
 /// Per-session active-run registry, shared by every `GooseAcpAgent` created
@@ -2520,6 +2522,7 @@ impl GooseAcpAgent {
         let mut was_cancelled = false;
         let mut output_token_limit_reached = false;
         let mut completed_visible_response = false;
+        let mut ended_by_wait = false;
         let mut tool_requests = HashMap::new();
         let mut chain_tracker = ToolChainTracker::default();
         let mut context_limit = None;
@@ -2539,10 +2542,19 @@ impl GooseAcpAgent {
                 Ok(crate::agents::AgentEvent::Message(mut message)) => {
                     update_output_token_limit_reached(&mut output_token_limit_reached, &message);
 
+                    if message.content.iter().any(|content| {
+                        matches!(content, MessageContent::ToolResponse(response)
+                        if response.tool_result.as_ref().is_ok_and(
+                            crate::agents::platform_extensions::summon::tool_result_ends_turn,
+                        ))
+                    }) {
+                        ended_by_wait = true;
+                    }
                     if !message.is_user_visible() {
                         continue;
                     }
                     if message.role == Role::Assistant {
+                        ended_by_wait = false;
                         completed_visible_response = !message.is_tool_call()
                             && !message
                                 .content
@@ -2655,6 +2667,7 @@ impl GooseAcpAgent {
             was_cancelled,
             output_token_limit_reached,
             completed_visible_response,
+            ended_by_wait,
         })
     }
 
@@ -2846,12 +2859,13 @@ impl GooseAcpAgent {
                     was_cancelled: false,
                     output_token_limit_reached: false,
                     completed_visible_response: false,
+                    ended_by_wait: false,
                 }
             };
             if outcome.was_cancelled || outcome.output_token_limit_reached {
                 return Ok(outcome);
             }
-            if outcome.completed_visible_response {
+            if outcome.completed_visible_response || outcome.ended_by_wait {
                 let reports = self
                     .session_manager
                     .pending_session_messages(&session_id)
@@ -2942,7 +2956,9 @@ impl GooseAcpAgent {
                         outcome.output_token_limit_reached = true;
                         break;
                     }
-                    if !report_outcome.completed_visible_response {
+                    // A report turn ends with a visible message, or silently
+                    // through wait while other delegated work is outstanding.
+                    if !report_outcome.completed_visible_response && !report_outcome.ended_by_wait {
                         return Err(agent_client_protocol::Error::internal_error()
                             .data("Parent agent did not complete its background report response"));
                     }

@@ -33,12 +33,12 @@ use crate::agents::retry::{RetryManager, RetryResult};
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
     persist_tool_confirmation_decision, run_goose, BangShellOperation, CompactionOperation,
-    DoctorOperation, Emitter, EntryHookOperation, ExitOnErrorOperation, GooseEffect,
-    GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner, MailboxOperation,
-    MaxTurnsOperation, Operation, ProjectOperation, RecipeOperation, RetryOperation,
-    SkillOperation, SlashCommandOperation, StateMachine, StatusOperation, SteerOperation,
-    SteerQueue, Step, StopHookOperation, ToolApprovalOperation, ToolExecutionOperation,
-    ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
+    DoctorOperation, Emitter, EndTurnOperation, EntryHookOperation, ExitOnErrorOperation,
+    GooseEffect, GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner,
+    MailboxOperation, MaxTurnsOperation, Operation, ProjectOperation, RecipeOperation,
+    RetryOperation, SkillOperation, SlashCommandOperation, StateMachine, StatusOperation,
+    SteerOperation, SteerQueue, Step, StopHookOperation, ToolApprovalOperation,
+    ToolExecutionOperation, ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
 };
 use crate::agents::types::{
     SessionConfig, SharedProvider, DEFAULT_ON_FAILURE_TIMEOUT_SECONDS,
@@ -1832,6 +1832,9 @@ impl Agent {
                 self.hook_manager.clone(),
             )),
             Arc::new(UnknownToolOperation::new(self.hook_manager.clone())),
+            // After every tool call has its result: a `wait` result ends the
+            // turn instead of starting another model call.
+            Arc::new(EndTurnOperation),
             Arc::new(RetryOperation::new(
                 &self.goal,
                 &self.grind,
@@ -2859,6 +2862,9 @@ impl Agent {
                 };
 
                 let mut no_tools_called = true;
+                // Set by a tool result (summon's `wait`) that ends the turn
+                // without a user-visible message.
+                let mut end_turn_requested = false;
                 let mut messages_to_add = Conversation::default();
                 let mut tools_updated = false;
                 let mut did_recovery_compact_this_iteration = false;
@@ -3100,6 +3106,9 @@ impl Agent {
                                                             }
                                                             ToolStreamItem::Result(output) => {
                                                                 if let Ok(ref call_result) = output {
+                                                                    if crate::agents::platform_extensions::summon::tool_result_ends_turn(call_result) {
+                                                                        end_turn_requested = true;
+                                                                    }
                                                                     if let Some(ref meta) = call_result.meta {
                                                                         if let Some(notification_data) = meta.0.get("platform_notification") {
                                                                             if let Some(method) = notification_data.get("method").and_then(|v| v.as_str()) {
@@ -3624,6 +3633,8 @@ impl Agent {
                         }
                     }
                 }
+
+                exit_chat |= end_turn_requested;
 
                 if let Some(output) = pending_final_output.take() {
                     preferred_turn_usage_message_id = None;

@@ -3,7 +3,7 @@ use rmcp::model::ElicitationAction;
 use serde_json::json;
 
 use super::calculator_extension::{
-    delayed_value, value, ADD, ADD_WITH_AUDIENCE, APP_ONLY, DIVIDE, REQUEST_VALUE,
+    delayed_value, value, ADD, ADD_WITH_AUDIENCE, APP_ONLY, DIVIDE, PAUSE, REQUEST_VALUE,
 };
 use super::pipeline::MessageKind::{Agent, Confirmation, ToolCall, ToolResponse};
 use super::pipeline::MAX_TURNS;
@@ -28,6 +28,25 @@ async fn basic_tool_calling() -> Result<()> {
     result.assert_message(3, Agent, "The total is 1");
     result.assert_message(-1, Agent, "hi there!");
     assert_eq!(api.call_count(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_tool_result_that_ends_the_turn_stops_without_another_model_call() -> Result<()> {
+    let (pipeline, api) = test_pipeline().await?;
+    api.on("wait for the reports").call(PAUSE, json!({}));
+    api.on("a report arrived").reply("Everything is done");
+
+    let result = pipeline.run(["wait for the reports"]).await?;
+
+    // The turn ends on the tool result: no model call and no message follow it.
+    result.assert_message(-1, ToolResponse, "paused");
+    assert_eq!(api.call_count(), 1);
+
+    let result = pipeline.run(["a report arrived"]).await?;
+
+    result.assert_message(-1, Agent, "Everything is done");
+    assert_eq!(api.call_count(), 2);
     Ok(())
 }
 
