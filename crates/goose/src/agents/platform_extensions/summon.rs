@@ -829,7 +829,65 @@ fn describe_editor_result(value: &serde_json::Value) -> String {
     line
 }
 
-fn artifact_result_lines(messages: &[Message], tools: &[String]) -> Vec<String> {
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EditorArtifactStatus {
+    Completed,
+    Partial,
+    Empty,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Deserialize)]
+struct EditorArtifactReceipt {
+    document_id: String,
+    status: EditorArtifactStatus,
+    document_revision: Option<u64>,
+}
+
+struct ArtifactResultSummary {
+    lines: Vec<String>,
+    current: HashMap<String, Option<EditorArtifactStatus>>,
+}
+
+impl ArtifactResultSummary {
+    fn completion_description(&self) -> &'static str {
+        if self.current.is_empty() || self.current.values().any(|status| status.is_none()) {
+            "ended without a confirmed artifact outcome"
+        } else if self.current.values().any(|status| {
+            matches!(
+                status,
+                Some(
+                    EditorArtifactStatus::Failed
+                        | EditorArtifactStatus::Cancelled
+                        | EditorArtifactStatus::Empty
+                )
+            )
+        }) {
+            "ended with incomplete artifact output"
+        } else if self
+            .current
+            .values()
+            .any(|status| *status == Some(EditorArtifactStatus::Partial))
+        {
+            "ended with partial artifact output"
+        } else {
+            "completed successfully"
+        }
+    }
+
+    fn section(&self) -> String {
+        let body = if self.lines.is_empty() {
+            "- No editor job was started, so nothing was saved.".to_string()
+        } else {
+            self.lines.join("\n")
+        };
+        format!("{ARTIFACT_RESULTS_HEADING}\n{body}")
+    }
+}
+
+fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactResultSummary {
     let mut calls = Vec::new();
     let mut responses = HashMap::new();
     for message in messages {
@@ -849,10 +907,14 @@ fn artifact_result_lines(messages: &[Message], tools: &[String]) -> Vec<String> 
             }
         }
     }
-    calls
+    let mut current = HashMap::new();
+    let lines = calls
         .into_iter()
         .map(|(id, arguments)| {
             let target = artifact_target(arguments);
+            let receipt = responses.get(id).and_then(|response| response.as_ref().ok()).and_then(|result| editor_result_value(result)).and_then(|value| serde_json::from_value::<EditorArtifactReceipt>(value).ok());
+            let identity = receipt.as_ref().map(|receipt| receipt.document_id.clone()).or_else(|| arguments.and_then(|arguments| arguments.get("document_id")).and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_else(|| format!("call:{id}"));
+            current.insert(identity, receipt.and_then(|receipt| match receipt.status { EditorArtifactStatus::Completed | EditorArtifactStatus::Partial if receipt.document_revision.is_none_or(|revision| revision == 0) => None, status => Some(status) }));
             match responses.get(id) {
                 None => format!(
                     "- Editor job for {target} was still running when this task ended; its saved state is unknown."
@@ -870,31 +932,45 @@ fn artifact_result_lines(messages: &[Message], tools: &[String]) -> Vec<String> 
                 },
             }
         })
-        .collect()
+        .collect();
+    ArtifactResultSummary { lines, current }
+}
+
+#[cfg(test)]
+fn artifact_result_lines(messages: &[Message], tools: &[String]) -> Vec<String> {
+    artifact_result_summary(messages, tools).lines
+}
+
+async fn artifact_results(
+    manager: &crate::session::SessionManager,
+    task_id: &str,
+) -> Option<ArtifactResultSummary> {
+    let session = manager.get_session(task_id, true).await.ok()?;
+    let policy = SummonTaskPolicy::from_session(&session)?;
+    if policy.artifact_result_tools.is_empty() {
+        return None;
+    }
+    Some(
+        session
+            .conversation
+            .as_ref()
+            .map(|conversation| {
+                artifact_result_summary(conversation.messages(), &policy.artifact_result_tools)
+            })
+            .unwrap_or_else(|| ArtifactResultSummary {
+                lines: Vec::new(),
+                current: HashMap::new(),
+            }),
+    )
 }
 
 async fn artifact_results_section(
     manager: &crate::session::SessionManager,
     task_id: &str,
 ) -> Option<String> {
-    let session = manager.get_session(task_id, true).await.ok()?;
-    let policy = SummonTaskPolicy::from_session(&session)?;
-    if policy.artifact_result_tools.is_empty() {
-        return None;
-    }
-    let lines = session
-        .conversation
-        .as_ref()
-        .map(|conversation| {
-            artifact_result_lines(conversation.messages(), &policy.artifact_result_tools)
-        })
-        .unwrap_or_default();
-    let body = if lines.is_empty() {
-        "- No editor job was started, so nothing was saved.".to_string()
-    } else {
-        lines.join("\n")
-    };
-    Some(format!("{ARTIFACT_RESULTS_HEADING}\n{body}"))
+    artifact_results(manager, task_id)
+        .await
+        .map(|summary| summary.section())
 }
 
 /// Get maximum number of concurrent background tasks
@@ -1159,8 +1235,12 @@ impl SummonClient {
         result: &anyhow::Result<String>,
         terminal_status: TaskTerminalStatus,
     ) -> anyhow::Result<()> {
+        let artifacts = artifact_results(manager, task_id).await;
         let status = match terminal_status {
-            TaskTerminalStatus::Completed => "completed successfully",
+            TaskTerminalStatus::Completed => artifacts.as_ref().map_or(
+                "completed successfully",
+                ArtifactResultSummary::completion_description,
+            ),
             TaskTerminalStatus::Cancelled => "was cancelled",
             TaskTerminalStatus::Failed => "failed",
             TaskTerminalStatus::Panicked => "panicked",
@@ -1170,9 +1250,9 @@ impl SummonClient {
             Err(error) => error.to_string(),
         };
         let mut body = format!("Task {task_id} {status}.\n\n{output}");
-        if let Some(section) = artifact_results_section(manager, task_id).await {
+        if let Some(artifacts) = artifacts {
             body.push_str("\n\n");
-            body.push_str(&section);
+            body.push_str(&artifacts.section());
         }
         manager
             .enqueue_task_outcome(task_id, &body, terminal_status)
@@ -1220,7 +1300,15 @@ impl SummonClient {
                 status: "unknown", turns: None, duration_secs: None,
             });
         };
-        let status = if report
+        let outcome = report.task_outcome().map_err(|error| error.to_string())?;
+        let status = if let Some(outcome) = outcome {
+            match outcome.status {
+                TaskTerminalStatus::Completed => "completed",
+                TaskTerminalStatus::Cancelled => "cancelled",
+                TaskTerminalStatus::Failed => "failed",
+                TaskTerminalStatus::Panicked => "panicked",
+            }
+        } else if report
             .body
             .starts_with(&format!("Task {task_id} completed successfully."))
         {
@@ -3833,6 +3921,72 @@ mod tests {
     }
 
     #[test]
+    fn artifact_completion_uses_current_receipts_instead_of_specialist_prose() {
+        let tool = "cortex_document__delegate_editor_task";
+        let messages_for = |outcomes: &[(&str, &str, Option<u64>)]| {
+            let mut messages = Vec::new();
+            for (index, (document, status, revision)) in outcomes.iter().enumerate() {
+                let id = format!("call-{index}");
+                messages.push(
+                    Message::assistant().with_tool_request(
+                        &id,
+                        Ok(
+                            rmcp::model::CallToolRequestParams::new(tool).with_arguments(
+                                serde_json::json!({"document_id":document})
+                                    .as_object()
+                                    .unwrap()
+                                    .clone(),
+                            ),
+                        ),
+                    ),
+                );
+                let mut result = CallToolResult::success(vec![ContentBlock::text("All done")]);
+                result.structured_content = Some(
+                    serde_json::json!({"document_id":document,"status":status,"document_revision":revision}),
+                );
+                messages.push(Message::user().with_tool_response(&id, Ok(result)));
+            }
+            messages.push(Message::assistant().with_text("All requested artifacts are complete."));
+            messages
+        };
+        let tools = vec![tool.to_owned()];
+        let partial =
+            artifact_result_summary(&messages_for(&[("doc", "partial", Some(2))]), &tools);
+        assert_eq!(
+            partial.completion_description(),
+            "ended with partial artifact output"
+        );
+        let failed = artifact_result_summary(&messages_for(&[("doc", "failed", Some(2))]), &tools);
+        assert_eq!(
+            failed.completion_description(),
+            "ended with incomplete artifact output"
+        );
+        let retry = artifact_result_summary(
+            &messages_for(&[("doc", "failed", Some(2)), ("doc", "completed", Some(3))]),
+            &tools,
+        );
+        assert_eq!(retry.completion_description(), "completed successfully");
+        assert_eq!(retry.lines.len(), 2);
+        let distinct = artifact_result_summary(
+            &messages_for(&[
+                ("doc-1", "partial", Some(2)),
+                ("doc-2", "completed", Some(2)),
+            ]),
+            &tools,
+        );
+        assert_eq!(
+            distinct.completion_description(),
+            "ended with partial artifact output"
+        );
+        assert_eq!(distinct.current.len(), 2);
+        let unsaved = artifact_result_summary(&messages_for(&[("doc", "completed", None)]), &tools);
+        assert_eq!(
+            unsaved.completion_description(),
+            "ended without a confirmed artifact outcome"
+        );
+    }
+
+    #[test]
     fn artifact_assignment_carries_identity_and_previous_results() {
         let report = format!(
             "Task 20260929_14 was cancelled.\n\nNo text content in last message\n\n{ARTIFACT_RESULTS_HEADING}\n- Editor job partial: document doc-1, saved revision 2"
@@ -4021,6 +4175,74 @@ mod tests {
             source.properties["event_driven_parent"],
             serde_json::json!(true)
         );
+    }
+
+    #[tokio::test]
+    async fn artifact_partial_is_durable_even_when_specialist_claims_completion() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let task = reliability_child(&client, &parent, "document:doc", None).await;
+        let mut session = manager.get_session(&task, false).await.unwrap();
+        let mut policy = SummonTaskPolicy::from_session(&session).unwrap();
+        let tool = "cortex_document__delegate_editor_task";
+        policy.artifact_result_tools = vec![tool.to_owned()];
+        session.extension_data.set_extension_state(
+            "summon",
+            "v1",
+            serde_json::to_value(policy).unwrap(),
+        );
+        manager
+            .update(&task)
+            .extension_data(session.extension_data)
+            .apply()
+            .await
+            .unwrap();
+        let mut result = CallToolResult::success(vec![ContentBlock::text("Saved")]);
+        result.structured_content = Some(
+            serde_json::json!({"document_id":"doc", "status":"partial", "document_revision":3, "remaining_work":"One identified citation concern remains."}),
+        );
+        let messages = vec![
+            Message::assistant()
+                .with_tool_request("edit", Ok(rmcp::model::CallToolRequestParams::new(tool))),
+            Message::user().with_tool_response("edit", Ok(result)),
+        ];
+        manager
+            .replace_conversation(
+                &task,
+                &crate::conversation::Conversation::new_unvalidated(messages),
+            )
+            .await
+            .unwrap();
+        SummonClient::enqueue_task_completion(
+            &manager,
+            &task,
+            &Ok("All requested work is complete.".to_owned()),
+            TaskTerminalStatus::Completed,
+        )
+        .await
+        .unwrap();
+        let report = manager
+            .terminal_report_for_child(&parent, &task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report
+            .body
+            .starts_with(&format!("Task {task} ended with partial artifact output.")));
+        assert!(!report.body.contains("completed successfully"));
+        assert!(report
+            .body
+            .contains("Remaining work: One identified citation concern remains."));
+        assert_eq!(
+            report.task_outcome().unwrap().unwrap().status,
+            TaskTerminalStatus::Completed
+        );
+        let recovered = client.recovered_task_result(&parent, &task).await.unwrap();
+        assert_eq!(recovered.status, "completed");
+        assert!(recovered.content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .contains("ended with partial artifact output"));
     }
 
     #[tokio::test]

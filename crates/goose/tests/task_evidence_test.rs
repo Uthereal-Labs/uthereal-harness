@@ -604,3 +604,67 @@ async fn exact_task_filter_exports_only_persisted_artifact_policy() {
         .tasks
         .is_empty());
 }
+
+#[tokio::test]
+async fn large_native_review_cannot_crowd_out_compact_terminal_proof() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/large-presentation-terminal.json")).unwrap();
+    let review = serde_json::to_string(&fixture["review_response"]).unwrap();
+    assert_eq!(review.len(), 55_832);
+    let proof = fixture["structuredContent"].clone();
+    assert!(serde_json::to_vec(&proof).unwrap().len() <= 8192);
+    let f = Fixture::new().await;
+    let child = f.child().await;
+    let tool = "cortex_presentation__delegate_editor_task";
+    let request = Message::assistant().with_tool_request(
+        "native-call",
+        Ok(CallToolRequestParams::new(tool.to_string())),
+    );
+    let mut response = CallToolResult::success(vec![ContentBlock::text(review.clone())]);
+    response.structured_content = Some(proof.clone());
+    response.is_error = Some(false);
+    f.manager
+        .add_message(&child.task_id, &request)
+        .await
+        .unwrap();
+    f.manager
+        .add_message(
+            &child.task_id,
+            &Message::user().with_tool_response("native-call", Ok(response)),
+        )
+        .await
+        .unwrap();
+    f.manager
+        .enqueue_task_outcome(&child.task_id, "completed", TaskTerminalStatus::Completed)
+        .await
+        .unwrap();
+    let evidence = f.manager.task_evidence(&f.request(&[tool])).await.unwrap();
+    assert!(evidence.evidence_complete);
+    assert!(evidence.tasks[0].evidence_complete);
+    assert_eq!(evidence.tasks[0].receipts[0].structured_result, Some(proof));
+    assert_eq!(
+        evidence.tasks[0].outcome.as_ref().unwrap().status,
+        TaskTerminalStatus::Completed
+    );
+    assert!(!serde_json::to_string(&evidence)
+        .unwrap()
+        .contains("saved_document"));
+
+    // The unchanged generic 32 KiB boundary still rejects the old expanded envelope.
+    let legacy = f.child().await;
+    f.call(
+        &legacy.task_id,
+        "old-call",
+        tool,
+        fixture["review_response"].clone(),
+    )
+    .await;
+    let rejected = f.manager.task_evidence(&f.request(&[tool])).await.unwrap();
+    let legacy_task = rejected
+        .tasks
+        .iter()
+        .find(|task| task.admission.task_id == legacy.task_id)
+        .unwrap();
+    assert!(!legacy_task.evidence_complete);
+    assert!(legacy_task.receipts[0].structured_result.is_none());
+}
