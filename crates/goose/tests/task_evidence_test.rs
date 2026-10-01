@@ -74,6 +74,7 @@ impl Fixture {
     }
     fn request(&self, tools: &[&str]) -> TaskEvidenceRequest {
         TaskEvidenceRequest {
+            task_id: None,
             attempt_key: self.lease.key.clone(),
             tool_names: tools.iter().map(|name| name.to_string()).collect(),
             after_task_id: None,
@@ -554,10 +555,52 @@ async fn ordinary_unbound_async_task_has_typed_outcome_but_no_attempt_evidence()
     );
     assert!(manager
         .task_evidence(&TaskEvidenceRequest {
+            task_id: None,
             attempt_key: uuid::Uuid::new_v4().to_string(),
             tool_names: vec![],
             after_task_id: None
         })
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn exact_task_filter_exports_only_persisted_artifact_policy() {
+    let fixture = Fixture::new().await;
+    let selected = fixture.child().await;
+    let _other = fixture.child().await;
+    let session = fixture
+        .manager
+        .get_session(&selected.task_id, false)
+        .await
+        .unwrap();
+    let mut data = session.extension_data;
+    data.set_extension_state("summon", "v1", json!({"artifact_key": "new:document:numina", "previous_task_id": null, "private_instructions": "must not escape"}));
+    fixture
+        .manager
+        .update(&selected.task_id)
+        .extension_data(data)
+        .apply()
+        .await
+        .unwrap();
+    let mut request = fixture.request(&[]);
+    request.task_id = Some(selected.task_id.clone());
+    let response = fixture.manager.task_evidence(&request).await.unwrap();
+    assert_eq!(response.tasks.len(), 1);
+    assert_eq!(response.tasks[0].admission.task_id, selected.task_id);
+    assert_eq!(
+        response.tasks[0].artifact_key.as_deref(),
+        Some("new:document:numina")
+    );
+    assert!(!serde_json::to_string(&response)
+        .unwrap()
+        .contains("must not escape"));
+    request.task_id = Some("unrelated".into());
+    assert!(fixture
+        .manager
+        .task_evidence(&request)
+        .await
+        .unwrap()
+        .tasks
+        .is_empty());
 }

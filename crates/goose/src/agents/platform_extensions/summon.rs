@@ -979,7 +979,7 @@ impl SummonClient {
                     "v1",
                     serde_json::to_value(policy).map_err(|error| error.to_string())?,
                 );
-                let admission = self
+                let mut admission = self
                     .context
                     .session_manager
                     .capture_task_admission(
@@ -989,6 +989,8 @@ impl SummonClient {
                     )
                     .await
                     .map_err(|error| error.to_string())?;
+                admission.artifact_key = policy.artifact_key.clone();
+                admission.previous_task_id = policy.previous_task_id.clone();
                 extension_data.set_extension_state(
                     "summon",
                     "task_admission_v1",

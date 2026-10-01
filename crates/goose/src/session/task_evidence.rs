@@ -35,6 +35,8 @@ impl SessionManager {
             parent_run_id,
             attempt_key,
             source_name: source_name.to_string(),
+            artifact_key: None,
+            previous_task_id: None,
         })
     }
 
@@ -119,8 +121,8 @@ impl SessionManager {
             }
         }
         let rows = sqlx::query(
-            r#"SELECT id, json_extract(extension_data, '$."summon.task_admission_v1"') AS admission
-             FROM sessions WHERE parent_session_id = ? AND id > ?
+            r#"SELECT id, extension_data, json_extract(extension_data, '$."summon.task_admission_v1"') AS admission
+             FROM sessions WHERE parent_session_id = ? AND id > ? AND (? IS NULL OR id = ?)
               AND json_extract(extension_data, '$."summon.task_admission_v1".parentSessionId') = ?
               AND json_extract(extension_data, '$."summon.task_admission_v1".parentRunId') = ?
               AND json_extract(extension_data, '$."summon.task_admission_v1".attemptKey') = ?
@@ -129,6 +131,8 @@ impl SessionManager {
         )
         .bind(&parent_session_id)
         .bind(request.after_task_id.as_deref().unwrap_or(""))
+        .bind(&request.task_id)
+        .bind(&request.task_id)
         .bind(&parent_session_id)
         .bind(&parent_run_id)
         .bind(&request.attempt_key)
@@ -167,7 +171,12 @@ impl SessionManager {
             if outcome.as_ref().is_some_and(|o| o.admission != admission) {
                 bail!("Task outcome does not match its immutable admission");
             }
+            let extension_data: serde_json::Value =
+                serde_json::from_str(&row.try_get::<String, _>("extension_data")?)?;
+            let policy = &extension_data["summon.v1"];
             let mut task = TaskEvidence {
+                artifact_key: policy["artifact_key"].as_str().map(str::to_owned),
+                previous_task_id: policy["previous_task_id"].as_str().map(str::to_owned),
                 admission,
                 outcome,
                 receipts: Vec::new(),

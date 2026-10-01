@@ -3501,6 +3501,8 @@ mod tests {
                     parent_run_id: Some("run_original".into()),
                     attempt_key: Some("attempt".into()),
                     source_name: "specialist".into(),
+                    artifact_key: None,
+                    previous_task_id: None,
                 },
                 status,
             };

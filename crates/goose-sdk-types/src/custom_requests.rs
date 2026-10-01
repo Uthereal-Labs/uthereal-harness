@@ -307,6 +307,10 @@ pub struct TaskAdmission {
     pub parent_run_id: Option<String>,
     pub attempt_key: Option<String>,
     pub source_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -347,6 +351,10 @@ pub struct TaskToolReceipt {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskEvidence {
+    #[serde(default)]
+    pub artifact_key: Option<String>,
+    #[serde(default)]
+    pub previous_task_id: Option<String>,
     pub admission: TaskAdmission,
     pub outcome: Option<TaskOutcome>,
     pub receipts: Vec<TaskToolReceipt>,
@@ -358,6 +366,8 @@ pub struct TaskEvidence {
 #[request(method = "_goose/unstable/attempt/task-evidence", response = TaskEvidenceResponse)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskEvidenceRequest {
+    #[serde(default)]
+    pub task_id: Option<String>,
     pub attempt_key: String,
     #[serde(default)]
     pub tool_names: Vec<String>,
