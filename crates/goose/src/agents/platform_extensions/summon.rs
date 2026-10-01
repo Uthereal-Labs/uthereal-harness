@@ -668,7 +668,7 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
             .unwrap_or(false)
     });
     let waiting = if event_driven {
-        "After delegating, tell the user once what is underway, then call wait. What you write is shown to \
+        "After delegating, tell the user once, in their terms, what you are working on, then call wait. What you write is shown to \
          the user as an update, so write only when the user learns something new, such as an artifact \
          finishing or failing; otherwise call wait without writing, for example after answering a specialist's \
          question. You are resumed automatically for each terminal report and each specialist question. \
@@ -686,7 +686,8 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
          Call delegate(source: \"<name>\", instructions: ...) and put the complete task in instructions: \
          the requested outcome and every user requirement for that specialist's deliverable. \
          Specialists marked always_async or non_blocking run in the background: never poll or block on them. \
-         Briefly tell the user which specialist owns the work. \
+         Tell the user what you are doing in their terms (for example, \"Creating the presentation.\"), \
+         never which specialist, agent, or task handles it. \
          Use the returned task ID for send(task_id: ..., message: ...) only to steer a running task with new guidance \
          or to answer its question; never use send to hand over the initial task, request status, or ask it to hurry. \
          {waiting} Questions and terminal reports arrive automatically as internal evidence. \
@@ -923,6 +924,9 @@ pub struct SummonClient {
     completed_tasks: Mutex<HashMap<String, CompletedTask>>,
     artifact_tasks: Mutex<HashMap<(String, String), String>>,
     event_driven_parents: Mutex<HashSet<String>>,
+    /// Highest mailbox message ID delivered to each parent's current report
+    /// turn. Delivered messages stay pending until the turn is acknowledged.
+    delivered_reports: Mutex<HashMap<String, i64>>,
 }
 
 impl Drop for SummonClient {
@@ -949,6 +953,7 @@ impl SummonClient {
             completed_tasks: Mutex::new(HashMap::new()),
             artifact_tasks: Mutex::new(HashMap::new()),
             event_driven_parents: Mutex::new(HashSet::new()),
+            delivered_reports: Mutex::new(HashMap::new()),
         })
     }
 
@@ -3299,7 +3304,7 @@ impl SummonClient {
             let content = vec![ContentBlock::text(format!(
                 "Task {task_id} started in background: \"{description}\"\n\
                  It already has its complete task and reports back automatically: you are resumed for its terminal report or for a question it asks. \
-                 Once you have delegated everything and finished any independent work, tell the user what is underway (once), then call wait. \
+                 Once you have delegated everything and finished any independent work, tell the user once, in their terms, what you are working on, then call wait. \
                  Use send(task_id: \"{task_id}\", message: \"...\") only to steer it with new guidance or answer its question."
             ))];
             return Ok((content, task_id));
@@ -3492,6 +3497,7 @@ impl McpClientTrait for SummonClient {
     }
 
     async fn shutdown_session(&self, session_id: &str) -> anyhow::Result<()> {
+        self.delivered_reports.lock().await.remove(session_id);
         let task_ids = {
             let tasks = self.background_tasks.lock().await;
             tasks
@@ -3536,24 +3542,43 @@ impl McpClientTrait for SummonClient {
         let refreshed_turns = self.refresh_running_task_turns().await;
 
         let event_driven = self.event_driven_parents.lock().await.contains(session_id);
-        let pending_reports: Option<HashSet<String>> = if event_driven {
+        let pending_messages = if event_driven {
             self.context
                 .session_manager
                 .pending_session_messages(session_id)
                 .await
                 .ok()
-                .map(|pending| {
-                    pending
-                        .into_iter()
-                        .filter(|message| {
-                            message.kind == crate::session::MailboxMessageKind::Completion
-                        })
-                        .map(|message| message.sender_session_id)
-                        .collect()
-                })
         } else {
             None
         };
+        let delivered_through = self.delivered_reports.lock().await.get(session_id).copied();
+        let delivered = |message: &crate::session::MailboxMessage| {
+            delivered_through.is_some_and(|through| message.id <= through)
+        };
+        // Pending terminal reports by task, and whether the current turn
+        // already carries each one.
+        let pending_reports: Option<HashMap<String, bool>> =
+            pending_messages.as_ref().map(|pending| {
+                let mut reports = HashMap::new();
+                for message in pending.iter().filter(|message| {
+                    message.kind == crate::session::MailboxMessageKind::Completion
+                }) {
+                    let in_turn = delivered(message);
+                    reports
+                        .entry(message.sender_session_id.clone())
+                        .and_modify(|seen: &mut bool| *seen |= in_turn)
+                        .or_insert(in_turn);
+                }
+                reports
+            });
+        let turn_ends_task = pending_reports
+            .as_ref()
+            .is_some_and(|reports| reports.values().any(|in_turn| *in_turn));
+        let turn_asks_question = pending_messages.as_ref().is_some_and(|pending| {
+            pending.iter().any(|message| {
+                message.kind == crate::session::MailboxMessageKind::Message && delivered(message)
+            })
+        });
 
         let completed = self.completed_tasks.lock().await;
         let running = self.background_tasks.lock().await;
@@ -3569,7 +3594,7 @@ impl McpClientTrait for SummonClient {
             .filter(|task| belongs(task.parent_session_id.as_str()))
             .filter(|task| match &pending_reports {
                 Some(pending) => {
-                    pending.contains(&task.id) || task.completion_delivery_error.is_some()
+                    pending.contains_key(&task.id) || task.completion_delivery_error.is_some()
                 }
                 None => true,
             })
@@ -3606,10 +3631,19 @@ impl McpClientTrait for SummonClient {
             ));
         }
 
-        let delivery = if event_driven {
-            "its report is pending"
-        } else {
-            "completion is reported automatically"
+        let delivery = |task_id: &str| {
+            if !event_driven {
+                "completion is reported automatically"
+            } else if pending_reports
+                .as_ref()
+                .and_then(|reports| reports.get(task_id))
+                .copied()
+                .unwrap_or(false)
+            {
+                "its report is in the message above"
+            } else {
+                "its report is pending"
+            }
         };
         for task in sorted_completed {
             let status = match task.terminal_status {
@@ -3625,12 +3659,18 @@ impl McpClientTrait for SummonClient {
                 status,
                 round_duration(task.duration),
                 task.turns_taken,
-                delivery,
+                delivery(&task.id),
             ));
         }
 
         if has_running {
-            lines.push(if event_driven {
+            lines.push(if event_driven && turn_ends_task {
+                "\n→ A task in the report above has ended while others still run. Unless that report is unrelated to the current request, write a brief update giving the current status of every requested artifact, each one finished so far and each one still in progress, then call wait. You are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
+                    .to_string()
+            } else if event_driven && turn_asks_question {
+                "\n→ The report above is a specialist question and no task has ended. Answer it with send when the request, research, or conversation settles it, then call wait without writing; ask the user only when only they can decide. You are resumed for each terminal report and for each specialist question."
+                    .to_string()
+            } else if event_driven {
                 "\n→ Specialists report automatically. Call wait now unless you still have independent work or news for the user: you are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
                     .to_string()
             } else {
@@ -3640,6 +3680,14 @@ impl McpClientTrait for SummonClient {
         }
 
         Some(lines.join("\n"))
+    }
+
+    async fn note_reports_delivered(&self, session_id: &str, through_id: i64) {
+        let mut delivered = self.delivered_reports.lock().await;
+        let entry = delivered
+            .entry(session_id.to_string())
+            .or_insert(through_id);
+        *entry = (*entry).max(through_id);
     }
 
     async fn has_active_tasks(&self, session_id: &str) -> anyhow::Result<bool> {
@@ -4180,6 +4228,106 @@ mod tests {
         );
         let schema = specialist.create_message_parent_tool().input_schema;
         assert!(schema["properties"].get("kind").is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_context_marks_delivered_reports_and_asks_for_a_status_update() {
+        let (_directory, manager, parent, coordinator) = reliability_fixture().await;
+        let finished = reliability_child(&coordinator, &parent, "new:document:notes", None).await;
+        let running = reliability_child(&coordinator, &parent, "new:slides:deck", None).await;
+        coordinator
+            .event_driven_parents
+            .lock()
+            .await
+            .insert(parent.clone());
+        coordinator.completed_tasks.lock().await.insert(
+            finished.clone(),
+            CompletedTask {
+                id: finished.clone(),
+                parent_session_id: parent.clone(),
+                completion_delivery_error: None,
+                terminal_status: TaskTerminalStatus::Completed,
+                description: "Notes".to_string(),
+                result: Ok("Created notes.".to_string()),
+                turns_taken: 3,
+                duration: Duration::from_secs(40),
+                completed_at: Instant::now(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+        let stop = CancellationToken::new();
+        let stopped = stop.clone();
+        coordinator.background_tasks.lock().await.insert(
+            running.clone(),
+            BackgroundTask {
+                id: running.clone(),
+                parent_session_id: parent.clone(),
+                non_blocking: true,
+                completion_delivery_error: Arc::new(Mutex::new(None)),
+                terminal_status: Arc::new(Mutex::new(None)),
+                description: "Deck".to_string(),
+                started_at: Instant::now(),
+                turns: Arc::new(AtomicU32::new(1)),
+                last_activity: Arc::new(AtomicU64::new(0)),
+                handle: tokio::spawn(async move {
+                    stopped.cancelled().await;
+                    Ok("done".to_string())
+                }),
+                cancellation_token: CancellationToken::new(),
+                completion_token: CancellationToken::new(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+        manager
+            .enqueue_completion_to_parent(
+                &finished,
+                &format!("Task {finished} completed successfully.\n\nCreated notes."),
+            )
+            .await
+            .unwrap();
+        let completion_id = manager.pending_session_messages(&parent).await.unwrap()[0].id;
+
+        // Not yet delivered: the report is still on its way.
+        let moim = coordinator.get_moim(&parent).await.unwrap();
+        assert!(moim.contains("its report is pending"));
+        assert!(moim.contains("Call wait now"));
+
+        // Delivered in this turn but not yet acknowledged.
+        coordinator
+            .note_reports_delivered(&parent, completion_id)
+            .await;
+        let moim = coordinator.get_moim(&parent).await.unwrap();
+        assert!(moim.contains("its report is in the message above"));
+        assert!(!moim.contains("its report is pending"));
+        assert!(moim.contains("A task in the report above has ended"));
+        assert!(moim.contains("current status of every requested artifact"));
+        assert!(!moim.contains("Call wait now"));
+
+        // A question delivered in the next turn does not ask for an update.
+        manager
+            .acknowledge_session_messages(&parent, completion_id)
+            .await
+            .unwrap();
+        let question_id = manager
+            .send_to_parent(
+                &running,
+                "Should the deck use the 2025 or the 2026 figures?",
+            )
+            .await
+            .unwrap();
+        let moim = coordinator.get_moim(&parent).await.unwrap();
+        assert!(moim.contains("Call wait now"));
+        coordinator
+            .note_reports_delivered(&parent, question_id)
+            .await;
+        let moim = coordinator.get_moim(&parent).await.unwrap();
+        assert!(moim.contains("is a specialist question and no task has ended"));
+        assert!(moim.contains("call wait without writing"));
+        assert!(!moim.contains("current status of every requested artifact"));
+
+        stop.cancel();
+        coordinator.shutdown_session(&parent).await.unwrap();
+        assert!(coordinator.delivered_reports.lock().await.is_empty());
     }
 
     #[tokio::test]

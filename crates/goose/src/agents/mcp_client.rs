@@ -179,6 +179,11 @@ pub trait McpClientTrait: Send + Sync {
         Ok(false)
     }
 
+    /// Records that the session's pending mailbox messages up to `through_id`
+    /// are delivered in the turn that is about to run, so turn context can
+    /// describe them as reported rather than still pending.
+    async fn note_reports_delivered(&self, _session_id: &str, _through_id: i64) {}
+
     async fn shutdown_session(&self, _session_id: &str) -> anyhow::Result<()> {
         Ok(())
     }

@@ -201,6 +201,14 @@ the turn after the tool result, and the state machine's `EndTurnOperation`,
 registered after tool execution, yields to the client instead of calling the
 model again.
 
+Reports stay pending until the turn that answers them is acknowledged, so the
+ACP server tells the agent (`note_reports_delivered`) which mailbox messages the
+turn it is about to run carries. Summon's turn context then lists those tasks as
+reported in the message above rather than pending, and picks its closing line
+from the turn: when a task ended while others still run, it asks for a brief
+status of every requested artifact before `wait`; when the turn carries only a
+child's question, it asks for an answer through `send` and a silent `wait`.
+
 The interactive CLI on macOS/Linux checks for reports while its prompt is idle.
 Once the user begins typing, normal line editing owns the terminal until
 submission; reports are handled after the user turn. External-editor prompts,

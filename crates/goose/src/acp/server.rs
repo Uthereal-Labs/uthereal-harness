@@ -2936,6 +2936,9 @@ impl GooseAcpAgent {
                     let through_id = last.id;
                     let envelope = crate::session::MailboxMessage::parent_envelope(&reports)
                         .expect("nonempty reports have an envelope");
+                    // These stay pending until the turn is acknowledged below;
+                    // turn context must show them as reported, not awaited.
+                    agent.note_reports_delivered(&session_id, through_id).await;
                     let report_outcome = self
                         .run_agent_reply(
                             cx,
