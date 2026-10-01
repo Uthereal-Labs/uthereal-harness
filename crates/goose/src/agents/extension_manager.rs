@@ -2803,6 +2803,19 @@ impl ExtensionManager {
         Ok(false)
     }
 
+    pub async fn note_reports_delivered(&self, session_id: &str, through_id: i64) {
+        let clients: Vec<_> = self
+            .extensions
+            .lock()
+            .await
+            .values()
+            .map(|extension| extension.get_client())
+            .collect();
+        for client in clients {
+            client.note_reports_delivered(session_id, through_id).await;
+        }
+    }
+
     pub async fn shutdown_session(&self, session_id: &str) -> anyhow::Result<()> {
         let clients: Vec<_> = self
             .extensions

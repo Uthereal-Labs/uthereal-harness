@@ -428,6 +428,14 @@ impl Agent {
         self.extension_manager.has_active_tasks(session_id).await
     }
 
+    /// Marks pending mailbox messages up to `through_id` as delivered in the
+    /// turn about to run; they are acknowledged once that turn completes.
+    pub async fn note_reports_delivered(&self, session_id: &str, through_id: i64) {
+        self.extension_manager
+            .note_reports_delivered(session_id, through_id)
+            .await
+    }
+
     pub async fn shutdown_session(&self, session_id: &str) -> anyhow::Result<()> {
         self.extension_manager.shutdown_session(session_id).await
     }
