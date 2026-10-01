@@ -209,6 +209,25 @@ from the turn: when a task ended while others still run, it asks for a brief
 status of every requested artifact before `wait`; when the turn carries only a
 child's question, it asks for an answer through `send` and a silent `wait`.
 
+A child blocked in a long wait cannot read its mailbox until the call returns.
+An MCP tool can declare `goose.interruptOnMessage` (a notice text) in its
+definition `_meta`; while such a call runs, a newer parent message makes the
+call yield. The call is detached rather than cancelled, so the work it started
+keeps running, and the tool result is the declared notice with
+`structuredContent: {"interrupted": true}` and `goose.interrupted` metadata. The
+child reads the message at its next checkpoint and can wait again. Cancelling
+the task still cancels the call. The call runs as its own task but keeps the
+caller's tool span and session, so its MCP request still carries the tool
+span's `traceparent` and the server's spans stay beneath that tool. Cortex declares this on its specialists'
+editor waits, so coordinator guidance reaches a specialist while its editor
+works; the artifact-results report treats an interrupted wait as superseded by
+a later wait for the same editor task.
+
+`delegate` checks `previous_task_id` before anything looks it up. A value that
+cannot name an earlier task for the artifact (none exists in this session) is
+dropped, and the result says so as an automatic correction; a value naming the
+wrong task is rejected with the right ID.
+
 The interactive CLI on macOS/Linux checks for reports while its prompt is idle.
 Once the user begins typing, normal line editing owns the terminal until
 submission; reports are handled after the user turn. External-editor prompts,
@@ -225,7 +244,9 @@ ACP `session/prompt` returns when the main agent finishes its reply, while
 specialists keep working in the same loaded conversation. Keep the ACP connection
 and session event stream open. A new user prompt can steer the existing specialist
 through `summon.send`; when main is actively generating, use
-`_goose/unstable/session/steer` with the current run ID instead. Child reports wake
+`_goose/unstable/session/steer` with the current run ID instead. Runs backed by a
+durable prompt attempt accept steering too: a steer joins the session history once
+the agent takes it, and a run that crashes before that is interrupted as a whole. Child reports wake
 main automatically when it is idle, and its response streams over the existing
 connection. Only one main-agent run owns a session at a time, including across
 ACP connections. Failed automatic report delivery pauses until another user
@@ -291,6 +312,9 @@ Each provider call emits one generation in both agent loops, including cached
 input usage. Tool observations contain arguments and results, including failure
 output and error status, when content capture is enabled. Deferred tool execution
 retains the tool span until completion, including the specialist's lifetime.
+An agent run that finishes normally marks its `reply_stream` span OK, so an
+ERROR-level event logged during the run (for example by background work that
+shares the span) stays on the span as an event but does not mark the run failed.
 The exporter keeps its HTTP connection runtime running between batches. MCP requests carry the current tool span's `traceparent` and
 `tracestate` in request metadata across stdio and HTTP; external tools must extract
 that context to attach their own observations. Model pricing belongs in Langfuse's

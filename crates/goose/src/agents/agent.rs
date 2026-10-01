@@ -3735,6 +3735,7 @@ impl Agent {
             if !stop_hook_handled_for_exit {
                 self.emit_stop_hook(&session_config.id, &last_assistant_text, &session.working_dir.to_string_lossy()).await;
             }
+            gen_ai_telemetry::record_completed(&tracing::Span::current());
         }.instrument(reply_stream_span));
         Ok(inner)
     }

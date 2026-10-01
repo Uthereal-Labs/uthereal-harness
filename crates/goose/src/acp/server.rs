@@ -2796,12 +2796,15 @@ impl GooseAcpAgent {
         // which agent owns it; registration stays atomic, so the cross-connection
         // guard still admits only one run per session.
         let agent = self.get_session_agent(&session_id).await?;
+        // Durable attempts accept steering too: a steer becomes part of the
+        // session history once the agent takes it, and a run that crashes
+        // before then is interrupted as a whole, so nothing replays without it.
         self.start_active_run(
             &session_id,
             run_id.clone(),
             cancel_token.clone(),
             agent.clone(),
-            run_guard.attempt.is_none(),
+            true,
         )
         .await?;
 

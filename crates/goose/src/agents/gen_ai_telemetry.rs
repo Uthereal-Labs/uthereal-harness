@@ -102,6 +102,23 @@ pub(super) fn record_tool_result(span: &Span, result: &ToolResult<CallToolResult
     }
 }
 
+/// Mark an agent run that finished normally as successful.
+///
+/// The OpenTelemetry layer turns any ERROR-level event emitted while the span
+/// is entered into an error status, including events from background work
+/// that only shares the span (a transport retry, a recovered tool failure).
+/// A run that completed should not be reported as failed because of them; the
+/// events themselves stay on the span.
+pub(super) fn record_completed(span: &Span) {
+    #[cfg(feature = "otel")]
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        span.set_status(opentelemetry::trace::Status::Ok);
+    }
+    #[cfg(not(feature = "otel"))]
+    let _ = span;
+}
+
 pub(super) fn agent_name(session: &Session) -> &str {
     session
         .recipe
@@ -244,6 +261,29 @@ mod tests {
             "instructions": "do stuff",
         }))
         .unwrap()
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn a_completed_run_is_not_reported_as_failed_after_an_error_event() {
+        use opentelemetry::trace::{Status, TracerProvider as _};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::prelude::*;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("completed-test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("reply_stream");
+            span.in_scope(|| tracing::error!("recovered background failure"));
+            record_completed(&span);
+        });
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].status, Status::Ok);
     }
 
     #[test]
