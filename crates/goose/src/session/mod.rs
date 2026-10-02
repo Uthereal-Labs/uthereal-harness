@@ -28,4 +28,4 @@ pub use session_manager::{
     Session, SessionInsights, SessionManager, SessionNameUpdate, SessionType, SessionUpdateBuilder,
 };
 
-pub use prompt_attempt::PromptAttemptLease;
+pub use prompt_attempt::{PromptAttemptLease, SteeringAdmissionError};

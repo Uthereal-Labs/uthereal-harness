@@ -169,6 +169,20 @@ impl GooseAcpAgent {
             .internal_err_ctx("Failed to cancel prompt attempt")
     }
 
+    #[custom_method(SteeringStatusRequest)]
+    async fn dispatch_steering_status(
+        &self,
+        req: SteeringStatusRequest,
+    ) -> Result<SteeringStatusResponse, agent_client_protocol::Error> {
+        Ok(SteeringStatusResponse {
+            receipt: self
+                .session_manager
+                .steering_delivery_status(&req.attempt_key, &req.delivery_id)
+                .await
+                .internal_err_ctx("Failed to inspect steering receipt")?,
+        })
+    }
+
     #[custom_method(SteerSessionRequest)]
     async fn dispatch_steer_session(
         &self,

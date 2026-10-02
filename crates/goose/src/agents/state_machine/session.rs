@@ -242,5 +242,23 @@ pub(crate) async fn run(
         }
     }
     crate::agents::gen_ai_telemetry::record_usage(&tracing::Span::current(), &turn_usage);
+    if !emit.cancel_token().is_cancelled()
+        && super::trailing_error(
+            session
+                .conversation()
+                .ok_or_else(|| anyhow::anyhow!("Session has no conversation"))?,
+        )
+        .is_none()
+        && session.conversation().is_some_and(|conversation| {
+            super::ends_turn(conversation.messages())
+                && conversation.last().is_some_and(|message| {
+                    !message.metadata.output_token_limit_reached
+                        && message.as_concat_text() != super::ops_maxturns::MAX_TURNS_MESSAGE
+                })
+        })
+        && !last_assistant_text.is_empty()
+    {
+        crate::agents::gen_ai_telemetry::record_completed(&tracing::Span::current());
+    }
     Ok(session)
 }

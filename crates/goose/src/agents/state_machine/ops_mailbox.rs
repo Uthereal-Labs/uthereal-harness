@@ -5,7 +5,6 @@ use crate::agents::state_machine::{
     applied, ends_turn, last_effective_role, messages_since_kickoff, not_applicable, Emitter,
     GooseEffect, Operation, OperationResult,
 };
-use crate::conversation::message::Message;
 use crate::conversation::{Conversation, EffectiveRole};
 use crate::session::{Session, SessionManager, SessionType};
 
@@ -31,10 +30,6 @@ impl Operation<Session, GooseEffect> for MailboxOperation<'_> {
         conversation: &Conversation,
         _emit: &Emitter,
     ) -> Result<OperationResult<GooseEffect>> {
-        if session.session_type != SessionType::SubAgent {
-            return not_applicable();
-        }
-
         let messages = messages_since_kickoff(conversation)?;
         let between_turns = ends_turn(messages)
             || matches!(
@@ -49,6 +44,13 @@ impl Operation<Session, GooseEffect> for MailboxOperation<'_> {
             .session_manager
             .pending_session_messages(&session.id)
             .await?;
+        let pending: Vec<_> = pending
+            .into_iter()
+            .filter(|message| {
+                session.session_type == SessionType::SubAgent
+                    || message.kind == crate::session::MailboxMessageKind::Steering
+            })
+            .collect();
         if pending.is_empty() {
             return not_applicable();
         }
@@ -57,13 +59,7 @@ impl Operation<Session, GooseEffect> for MailboxOperation<'_> {
         for mailbox_message in pending {
             effects.push(GooseEffect::DeliverMailboxMessage {
                 mailbox_id: mailbox_message.id,
-                message: Message::user()
-                    .with_text(format!(
-                        "Message from parent task {}:\n\n{}",
-                        mailbox_message.sender_session_id, mailbox_message.body
-                    ))
-                    .with_visibility(false, true)
-                    .with_steer(),
+                message: mailbox_message.prompt()?,
             });
         }
         applied(effects)

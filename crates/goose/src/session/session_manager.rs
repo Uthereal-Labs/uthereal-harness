@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 19;
+pub const CURRENT_SCHEMA_VERSION: i32 = 20;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
@@ -454,6 +454,13 @@ impl SessionManager {
     }
 
     pub async fn add_message(&self, id: &str, message: &Message) -> Result<()> {
+        if let Some(message_id) = message.id.as_deref().filter(|id| id.starts_with("steer_")) {
+            let consumed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM session_mailbox WHERE recipient_session_id = ? AND kind = 'steering' AND delivered_at IS NOT NULL AND json_extract(body, '$.id') = ? AND EXISTS(SELECT 1 FROM messages WHERE session_id = ? AND message_id = ?))")
+                .bind(id).bind(message_id).bind(id).bind(message_id).fetch_one(self.storage.pool().await?).await?;
+            if consumed {
+                return Ok(());
+            }
+        }
         self.storage.add_message(id, message).await
     }
 
@@ -1116,6 +1123,8 @@ impl SessionStorage {
                 kind TEXT NOT NULL,
                 body TEXT NOT NULL,
                 outcome_json TEXT,
+                steering_attempt_key TEXT,
+                steering_digest TEXT,
                 dedupe_key TEXT,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 delivered_at TIMESTAMP,
@@ -1125,6 +1134,8 @@ impl SessionStorage {
         )
         .execute(&mut *tx)
         .await?;
+
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_mailbox_steering_delivery ON session_mailbox(steering_attempt_key, dedupe_key) WHERE steering_attempt_key IS NOT NULL").execute(&mut *tx).await?;
 
         sqlx::query(super::prompt_attempt::CREATE_TABLE)
             .execute(&mut *tx)
@@ -1684,6 +1695,29 @@ impl SessionStorage {
                         .execute(&mut **tx)
                         .await?;
                 }
+            }
+            20 => {
+                let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_table_info('prompt_attempts') WHERE name = 'steering_sealed')").fetch_one(&mut **tx).await?;
+                if !exists {
+                    sqlx::query("ALTER TABLE prompt_attempts ADD COLUMN steering_sealed INTEGER NOT NULL DEFAULT 0").execute(&mut **tx).await?;
+                }
+                for (column, statement) in [
+                    (
+                        "steering_attempt_key",
+                        "ALTER TABLE session_mailbox ADD COLUMN steering_attempt_key TEXT",
+                    ),
+                    (
+                        "steering_digest",
+                        "ALTER TABLE session_mailbox ADD COLUMN steering_digest TEXT",
+                    ),
+                ] {
+                    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_mailbox') WHERE name = ?)")
+                        .bind(column).fetch_one(&mut **tx).await?;
+                    if !exists {
+                        sqlx::query(statement).execute(&mut **tx).await?;
+                    }
+                }
+                sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_mailbox_steering_delivery ON session_mailbox(steering_attempt_key, dedupe_key) WHERE steering_attempt_key IS NOT NULL").execute(&mut **tx).await?;
             }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);

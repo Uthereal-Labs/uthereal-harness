@@ -227,6 +227,12 @@ pub struct SteerSessionRequest {
     #[serde(default)]
     pub prompt: Vec<ContentBlock>,
     pub expected_run_id: String,
+    #[serde(default)]
+    pub attempt_key: Option<String>,
+    #[serde(default)]
+    pub delivery_id: Option<String>,
+    #[serde(default)]
+    pub request_digest: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcResponse)]
@@ -237,6 +243,30 @@ pub struct SteerSessionResponse {
     /// `messageId` on the streamed `UserMessageChunk` (with `_meta.goose.steer`),
     /// letting clients correlate a queued steer with its pickup.
     pub message_id: String,
+    #[serde(default)]
+    pub delivery_state: SteeringDeliveryState,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SteeringDeliveryState {
+    #[default]
+    Queued,
+    Consumed,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/attempt/steering-status", response = SteeringStatusResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct SteeringStatusRequest {
+    pub attempt_key: String,
+    pub delivery_id: String,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct SteeringStatusResponse {
+    pub receipt: Option<SteerSessionResponse>,
 }
 
 /// Observe an attempt without loading a session or resuming tool execution.

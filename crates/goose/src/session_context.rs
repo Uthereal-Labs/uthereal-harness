@@ -28,6 +28,11 @@ where
     TELEMETRY_SESSION_ID.scope(session_id, future).await
 }
 
+/// The telemetry session ID set for this task, if any.
+pub fn current_telemetry_session_id() -> Option<String> {
+    TELEMETRY_SESSION_ID.try_with(Clone::clone).ok().flatten()
+}
+
 pub fn telemetry_session_id(execution_session_id: &str) -> String {
     TELEMETRY_SESSION_ID
         .try_with(Clone::clone)

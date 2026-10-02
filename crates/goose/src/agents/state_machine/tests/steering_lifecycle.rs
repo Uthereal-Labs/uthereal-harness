@@ -122,3 +122,113 @@ async fn cancellation_preserves_queued_steering_for_resume() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_steering_during_a_final_response_is_reasoned_about_in_both_loops() -> Result<()> {
+    use crate::acp::custom_requests::SteeringDeliveryState;
+    use crate::agents::{Agent, AgentConfig, GoosePlatform, SessionConfig};
+    use crate::config::{permission::PermissionManager, GooseMode};
+    use futures::StreamExt;
+    for state_machine in [false, true] {
+        let (pipeline, api) = test_pipeline().await?;
+        let held = api.on("initial request").hold_reply("initial final answer");
+        api.on("change to four").reply("updated final answer");
+        let config = AgentConfig::new(
+            pipeline.session_manager.clone(),
+            PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            true,
+            GoosePlatform::GooseCli,
+        );
+        let agent = Agent::with_config(config);
+        agent
+            .update_provider(
+                pipeline.provider.clone(),
+                pipeline.model_config.clone(),
+                &pipeline.session_id,
+            )
+            .await?;
+        let lease = pipeline
+            .session_manager
+            .claim_prompt_attempt(
+                &uuid::Uuid::new_v4().to_string(),
+                &"a".repeat(64),
+                &pipeline.session_id,
+            )
+            .await?
+            .unwrap();
+        let stream = agent
+            .reply(
+                Message::user().with_text("initial request"),
+                SessionConfig {
+                    id: pipeline.session_id.clone(),
+                    schedule_id: None,
+                    max_turns: Some(8),
+                    retry_config: None,
+                },
+                state_machine,
+                None,
+            )
+            .await?;
+        let run = async {
+            tokio::pin!(stream);
+            while let Some(event) = stream.next().await {
+                event?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let admission = async {
+            held.entered().await;
+            let message = Message::user()
+                .with_text("change to four")
+                .with_id("steer_durable")
+                .with_steer();
+            pipeline
+                .session_manager
+                .admit_steering_delivery(
+                    &lease.key,
+                    &pipeline.session_id,
+                    &lease.run_id,
+                    "turn",
+                    &"b".repeat(64),
+                    &message,
+                )
+                .await
+                .unwrap();
+            held.release();
+        };
+        let (result, ()) = tokio::join!(run, admission);
+        result?;
+        assert_eq!(api.calls().len(), 2, "state_machine={state_machine}");
+        assert!(api.calls()[1].input_contains("change to four"));
+        let session = pipeline
+            .session_manager
+            .get_session(&pipeline.session_id, true)
+            .await?;
+        assert_eq!(
+            session
+                .conversation
+                .unwrap()
+                .messages()
+                .iter()
+                .filter(|message| message.id.as_deref() == Some("steer_durable"))
+                .count(),
+            1,
+            "state_machine={state_machine}"
+        );
+        let receipt = pipeline
+            .session_manager
+            .steering_delivery_status(&lease.key, "turn")
+            .await?
+            .unwrap();
+        assert_eq!(receipt.delivery_state, SteeringDeliveryState::Consumed);
+        assert!(
+            pipeline
+                .session_manager
+                .seal_prompt_attempt_steering(&lease)
+                .await?
+        );
+    }
+    Ok(())
+}
