@@ -1207,19 +1207,11 @@ impl SummonClient {
             .cloned()
             .collect();
         drop(artifact_tasks);
-        if owners.is_empty() {
+        let note = super::coordinator_fixes::previous_task_id_for_artifact(&previous, &owners)?;
+        if note.is_some() {
             params.previous_task_id = None;
-            return Ok(Some(format!(
-                "previous_task_id \"{previous}\" was ignored automatically: it is only for a follow-up on a task you delegated earlier in this turn, and no earlier task exists for this artifact."
-            )));
         }
-        if owners.iter().any(|owner| owner == &previous) {
-            return Ok(None);
-        }
-        Err(format!(
-            "previous_task_id \"{previous}\" is not the earlier task for this artifact. Use previous_task_id: \"{}\".",
-            owners[0]
-        ))
+        Ok(note)
     }
 
     async fn check_artifact_owners(
@@ -3498,7 +3490,10 @@ impl SummonClient {
                  Once you have delegated everything and finished any independent work, tell the user once, in their terms, what you are working on, then call wait. \
                  Use send(task_id: \"{task_id}\", message: \"...\") only to steer it with new guidance or answer its question."
             ))];
-            return Ok((with_correction(content, correction), task_id));
+            return Ok((
+                super::coordinator_fixes::with_correction(content, correction),
+                task_id,
+            ));
         }
         let retrieval = if non_blocking {
             format!(
@@ -3513,21 +3508,11 @@ impl SummonClient {
             "Task {task_id} started in background: \"{description}\"\n\
              Continue with other work. {retrieval} Use send(task_id: \"{task_id}\", message: \"...\") to provide new guidance."
         ))];
-        Ok((with_correction(content, correction), task_id))
+        Ok((
+            super::coordinator_fixes::with_correction(content, correction),
+            task_id,
+        ))
     }
-}
-
-/// Appends an automatic-correction note to a delegate result.
-fn with_correction(
-    mut content: Vec<ContentBlock>,
-    correction: Option<String>,
-) -> Vec<ContentBlock> {
-    if let Some(correction) = correction {
-        content.push(ContentBlock::text(format!(
-            "Automatic correction: {correction}"
-        )));
-    }
-    content
 }
 
 #[async_trait]

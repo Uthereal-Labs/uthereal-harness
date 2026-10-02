@@ -3,6 +3,7 @@ pub mod apps;
 pub mod chatrecall;
 #[cfg(feature = "code-mode")]
 pub mod code_execution;
+pub mod coordinator_fixes;
 pub mod developer;
 pub mod ext_manager;
 pub mod orchestrator;
