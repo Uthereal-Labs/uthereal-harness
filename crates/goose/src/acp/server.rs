@@ -2796,12 +2796,15 @@ impl GooseAcpAgent {
         // which agent owns it; registration stays atomic, so the cross-connection
         // guard still admits only one run per session.
         let agent = self.get_session_agent(&session_id).await?;
+        // Durable attempts accept steering too: a steer becomes part of the
+        // session history once the agent takes it, and a run that crashes
+        // before then is interrupted as a whole, so nothing replays without it.
         self.start_active_run(
             &session_id,
             run_id.clone(),
             cancel_token.clone(),
             agent.clone(),
-            run_guard.attempt.is_none(),
+            true,
         )
         .await?;
 
@@ -2892,6 +2895,48 @@ impl GooseAcpAgent {
                     break;
                 }
 
+                let steering = self
+                    .session_manager
+                    .pending_session_messages(&session_id)
+                    .await
+                    .internal_err_ctx("Failed to read durable steering")?;
+                let steering: Vec<_> = steering
+                    .into_iter()
+                    .filter(|message| message.kind == crate::session::MailboxMessageKind::Steering)
+                    .collect();
+                if !steering.is_empty() {
+                    for queued in steering {
+                        let message = queued
+                            .prompt()
+                            .internal_err_ctx("Invalid durable steering prompt")?;
+                        if !self
+                            .session_manager
+                            .deliver_session_message(&session_id, queued.id, &message)
+                            .await
+                            .internal_err_ctx("Failed to consume durable steering")?
+                        {
+                            continue;
+                        }
+                        let steer_outcome = self
+                            .run_agent_reply(
+                                cx,
+                                &acp_session_id,
+                                &agent,
+                                message,
+                                use_state_machine,
+                                &cancel_token,
+                            )
+                            .await?;
+                        outcome.was_cancelled |= steer_outcome.was_cancelled;
+                        outcome.output_token_limit_reached |=
+                            steer_outcome.output_token_limit_reached;
+                        if outcome.was_cancelled || outcome.output_token_limit_reached {
+                            return Ok(outcome);
+                        }
+                    }
+                    continue;
+                }
+
                 if await_background_tasks {
                     let steers = agent.drain_pending_steers(&session_id).await;
                     if !steers.is_empty() {
@@ -2922,6 +2967,10 @@ impl GooseAcpAgent {
                     .pending_session_messages(&session_id)
                     .await
                     .internal_err_ctx("Failed to load background task reports")?;
+                let reports: Vec<_> = reports
+                    .into_iter()
+                    .filter(|message| message.kind != crate::session::MailboxMessageKind::Steering)
+                    .collect();
                 if let Some(last) = reports.last() {
                     Self::send_task_outcomes(
                         cx,
@@ -3006,6 +3055,16 @@ impl GooseAcpAgent {
                         if run.run_id == run_id {
                             run.accepting_steers = false;
                         }
+                    }
+                }
+                if let Some(attempt) = &run_guard.attempt {
+                    if !self
+                        .session_manager
+                        .seal_prompt_attempt_steering(attempt)
+                        .await
+                        .internal_err_ctx("Failed to seal steering admission")?
+                    {
+                        continue;
                     }
                 }
                 break;
@@ -3101,6 +3160,68 @@ impl GooseAcpAgent {
             );
         }
 
+        match (&req.attempt_key, &req.delivery_id, &req.request_digest) {
+            (Some(attempt), Some(delivery), Some(digest)) => {
+                if delivery.is_empty()
+                    || delivery.len() > 240
+                    || digest.len() != 64
+                    || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(agent_client_protocol::Error::invalid_params()
+                        .data("invalid steering delivery identity or digest"));
+                }
+                self.session_manager
+                    .prompt_attempt_status(attempt)
+                    .await
+                    .internal_err_ctx("Failed to inspect steering target")?;
+                let message = Self::convert_acp_prompt_to_message(&req.prompt)
+                    .with_steer()
+                    .with_id(format!("steer_{}", Uuid::new_v4()));
+                if message.content.is_empty() {
+                    return Err(agent_client_protocol::Error::invalid_params()
+                        .data("prompt must contain steerable content"));
+                }
+                let receipt = self
+                    .session_manager
+                    .admit_steering_delivery(
+                        attempt,
+                        &req.session_id,
+                        &req.expected_run_id,
+                        delivery,
+                        digest,
+                        &message,
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        crate::session::SteeringAdmissionError::TargetFinished => {
+                            agent_client_protocol::Error::invalid_params()
+                                .data(serde_json::json!({"reason": "steer_target_finished"}))
+                        }
+                        crate::session::SteeringAdmissionError::Conflict => {
+                            agent_client_protocol::Error::invalid_params()
+                                .data(serde_json::json!({"reason": "steer_delivery_conflict"}))
+                        }
+                        crate::session::SteeringAdmissionError::Storage(error) => {
+                            agent_client_protocol::Error::internal_error().data(error.to_string())
+                        }
+                    })?;
+                if let Some(cx) = self.client_cx.get() {
+                    let _ = Self::send_queued_steer_update(
+                        cx,
+                        &SessionId::new(req.session_id),
+                        &receipt.message_id,
+                        &receipt.run_id,
+                    );
+                }
+                return Ok(receipt);
+            }
+            (None, None, None) => {}
+            _ => {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data("attemptKey, deliveryId and requestDigest must be supplied together"))
+            }
+        }
+
         // Route to the agent that owns the run, not this connection's agent:
         // under roaming the steering client may be a different connection than
         // the one running the prompt.
@@ -3139,6 +3260,7 @@ impl GooseAcpAgent {
         Ok(SteerSessionResponse {
             run_id: active_run_id,
             message_id,
+            delivery_state: SteeringDeliveryState::Queued,
         })
     }
 
@@ -3504,6 +3626,8 @@ mod tests {
                     parent_run_id: Some("run_original".into()),
                     attempt_key: Some("attempt".into()),
                     source_name: "specialist".into(),
+                    artifact_key: None,
+                    previous_task_id: None,
                 },
                 status,
             };

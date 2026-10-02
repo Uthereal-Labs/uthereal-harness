@@ -22,6 +22,7 @@ pub(crate) mod subagent_task_config;
 mod tool_confirmation_coordinator;
 mod tool_confirmation_router;
 pub mod tool_execution;
+pub mod tool_interrupt;
 mod tool_schema_normalize;
 pub mod types;
 pub mod validate_extensions;

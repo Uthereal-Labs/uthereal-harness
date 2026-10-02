@@ -2494,6 +2494,7 @@ impl ExtensionManager {
                 None
             };
         let actual_tool_name = resolved.actual_tool_name.clone();
+        let interrupt_notice = super::tool_interrupt::interrupt_notice(resolved.tool_meta.as_ref());
         let resolved_tool = resolved;
         let should_hydrate_mcp_app = self.host_supports_mcp_apps();
         let read_cancellation_token = cancellation_token.clone();
@@ -2566,8 +2567,27 @@ impl ExtensionManager {
             Ok(result)
         };
 
+        // A declared long wait yields to a parent message without cancelling
+        // the work it started; see tool_interrupt.
+        let result: Box<
+            dyn std::future::Future<Output = crate::mcp_utils::ToolResult<CallToolResult>>
+                + Send
+                + Unpin,
+        > = match interrupt_notice {
+            Some(notice) => Box::new(
+                super::tool_interrupt::interruptible_by_parent_message(
+                    fut,
+                    Arc::clone(&self.context.session_manager),
+                    ctx.session_id.clone(),
+                    notice,
+                )
+                .boxed(),
+            ),
+            None => Box::new(fut.boxed()),
+        };
+
         Ok(ToolCallResult {
-            result: Box::new(fut.boxed()),
+            result,
             notification_stream: Some(notification_stream),
             action_required_stream: action_required_receiver.map(
                 |(rx, session_id, tool_call_request_id)| {

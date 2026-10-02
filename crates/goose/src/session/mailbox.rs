@@ -15,6 +15,7 @@ use super::SessionManager;
 pub enum MailboxMessageKind {
     Message,
     Completion,
+    Steering,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -29,6 +30,19 @@ pub struct MailboxMessage {
 }
 
 impl MailboxMessage {
+    pub fn prompt(&self) -> Result<Message> {
+        if self.kind == MailboxMessageKind::Steering {
+            return Ok(serde_json::from_str(&self.body)?);
+        }
+        Ok(Message::user()
+            .with_text(format!(
+                "Message from parent task {}:\n\n{}",
+                self.sender_session_id, self.body
+            ))
+            .with_visibility(false, true)
+            .with_steer())
+    }
+
     pub fn task_outcome(&self) -> Result<Option<TaskOutcome>> {
         self.outcome_json
             .as_deref()
@@ -46,6 +60,7 @@ impl MailboxMessage {
                 let label = match message.kind {
                     MailboxMessageKind::Message => "Question",
                     MailboxMessageKind::Completion => "Completion",
+                    MailboxMessageKind::Steering => "User guidance",
                 };
                 format!(
                     "{label} from task {}:\n{}",

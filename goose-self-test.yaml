@@ -500,6 +500,13 @@ prompt: |
      passive evidence remains scoped and bounded, preserves receipt execution order,
      and never exposes tool arguments or text. Confirm both loops emit the typed
      automatic outcome before the parent reply. Old untyped reports stay unknown.
+  6. Run `cargo test -p goose --lib steering` and
+     `cargo test -p goose --lib tool_interrupt`. Confirm a second worker returns the
+     original receipt for identical delivery with a new message ID/timestamp,
+     changed content rejects after terminalization, admission races cannot lose
+     guidance, and both loops reason about each accepted message exactly once.
+     Pending guidance wakes editor waits without consumption or cancellation;
+     explicit cancellation still aborts the attached call and context survives spawn.
   Record exact commands, counts and failures in {{ workspace_dir }}/durable_attempts.md.
   {% endif %}
 

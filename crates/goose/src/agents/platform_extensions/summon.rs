@@ -671,7 +671,9 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
         "After delegating, tell the user once, in their terms, what you are working on, then call wait. What you write is shown to \
          the user as an update, so write only when the user learns something new, such as an artifact \
          finishing or failing; otherwise call wait without writing, for example after answering a specialist's \
-         question. You are resumed automatically for each terminal report and each specialist question. \
+         question. You are resumed automatically for each terminal report, each specialist question, and each \
+         new user message; a user message sent while tasks run is yours to act on: send a change to the running \
+         task it concerns, or handle a new request alongside the running work. \
          When the last task has reported, wait is unavailable: write the complete answer."
     } else {
         "Use load(source: task_id, peek: true) for requested status."
@@ -829,10 +831,71 @@ fn describe_editor_result(value: &serde_json::Value) -> String {
     line
 }
 
-fn artifact_result_lines(messages: &[Message], tools: &[String]) -> Vec<String> {
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EditorArtifactStatus {
+    Completed,
+    Partial,
+    Empty,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Deserialize)]
+struct EditorArtifactReceipt {
+    #[serde(default)]
+    job_id: Option<String>,
+    document_id: String,
+    status: EditorArtifactStatus,
+    document_revision: Option<u64>,
+}
+
+struct ArtifactResultSummary {
+    lines: Vec<String>,
+    current: HashMap<String, Option<EditorArtifactStatus>>,
+}
+
+impl ArtifactResultSummary {
+    fn completion_description(&self) -> &'static str {
+        if self.current.is_empty() || self.current.values().any(|status| status.is_none()) {
+            "ended without a confirmed artifact outcome"
+        } else if self.current.values().any(|status| {
+            matches!(
+                status,
+                Some(
+                    EditorArtifactStatus::Failed
+                        | EditorArtifactStatus::Cancelled
+                        | EditorArtifactStatus::Empty
+                )
+            )
+        }) {
+            "ended with incomplete artifact output"
+        } else if self
+            .current
+            .values()
+            .any(|status| *status == Some(EditorArtifactStatus::Partial))
+        {
+            "ended with partial artifact output"
+        } else {
+            "completed successfully"
+        }
+    }
+
+    fn section(&self) -> String {
+        let body = if self.lines.is_empty() {
+            "- No editor job was started, so nothing was saved.".to_string()
+        } else {
+            self.lines.join("\n")
+        };
+        format!("{ARTIFACT_RESULTS_HEADING}\n{body}")
+    }
+}
+
+fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactResultSummary {
     let mut calls = Vec::new();
     let mut responses = HashMap::new();
-    for message in messages {
+    let mut response_order = HashMap::new();
+    for (position, message) in messages.iter().enumerate() {
         for content in &message.content {
             match content {
                 MessageContent::ToolRequest(request) => {
@@ -844,15 +907,58 @@ fn artifact_result_lines(messages: &[Message], tools: &[String]) -> Vec<String> 
                 }
                 MessageContent::ToolResponse(response) => {
                     responses.insert(response.id.as_str(), &response.tool_result);
+                    response_order.insert(response.id.as_str(), position);
                 }
                 _ => {}
             }
         }
     }
-    calls
-        .into_iter()
+    let task_key = |arguments: Option<&JsonObject>| {
+        arguments
+            .and_then(|args| args.get("idempotency_key"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let interrupted = |id: &str| matches!(responses.get(id), Some(Ok(result)) if crate::agents::tool_interrupt::was_interrupted(result));
+    let mut targets = HashMap::new();
+    for (_, arguments) in &calls {
+        if let Some(key) = task_key(*arguments) {
+            if arguments.is_some_and(|args| args.contains_key("instruction")) {
+                targets.insert(key, artifact_target(*arguments));
+            }
+        }
+    }
+    let mut current = HashMap::new();
+    let lines = calls.iter().enumerate()
+        .filter(|(index, (id, arguments))| {
+            if !interrupted(id) { return true; }
+            let Some(key) = task_key(*arguments) else { return true; };
+            !calls[index + 1..].iter().any(|(later_id, later_args)| {
+                task_key(*later_args).as_ref() == Some(&key)
+                    && response_order.get(later_id).zip(response_order.get(id)).is_some_and(|(later, earlier)| later > earlier)
+                    && responses.get(later_id).and_then(|response| response.as_ref().ok())
+                        .filter(|result| !crate::agents::tool_interrupt::was_interrupted(result) && result.is_error != Some(true))
+                        .and_then(editor_result_value)
+                        .and_then(|value| serde_json::from_value::<EditorArtifactReceipt>(value).ok())
+                        .is_some_and(|receipt| receipt.job_id.is_some_and(|job| !job.is_empty()) && !receipt.document_id.is_empty() && (!matches!(receipt.status, EditorArtifactStatus::Completed | EditorArtifactStatus::Partial) || receipt.document_revision.is_some_and(|revision| revision > 0)) && arguments.and_then(|args| args.get("document_id")).and_then(serde_json::Value::as_str).is_none_or(|document| document == receipt.document_id))
+            })
+        })
+        .map(|(_, (id, arguments))| (*id, *arguments))
         .map(|(id, arguments)| {
-            let target = artifact_target(arguments);
+
+            let target = task_key(arguments)
+                .and_then(|key| targets.get(&key).cloned())
+                .unwrap_or_else(|| artifact_target(arguments));
+            if interrupted(id) {
+                current.insert(format!("call:{id}"), None);
+                return format!(
+                    "- Editor job for {target} was still running when this task ended; its saved state is unknown."
+                );
+            }
+            let receipt = responses.get(id).and_then(|response| response.as_ref().ok()).and_then(editor_result_value).and_then(|value| serde_json::from_value::<EditorArtifactReceipt>(value).ok());
+            let identity = receipt.as_ref().map(|receipt| receipt.document_id.clone()).or_else(|| arguments.and_then(|arguments| arguments.get("document_id")).and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_else(|| format!("call:{id}"));
+            current.insert(identity, receipt.and_then(|receipt| match receipt.status { EditorArtifactStatus::Completed | EditorArtifactStatus::Partial if receipt.document_revision.is_none_or(|revision| revision == 0) => None, status => Some(status) }));
+
             match responses.get(id) {
                 None => format!(
                     "- Editor job for {target} was still running when this task ended; its saved state is unknown."
@@ -870,31 +976,45 @@ fn artifact_result_lines(messages: &[Message], tools: &[String]) -> Vec<String> 
                 },
             }
         })
-        .collect()
+        .collect();
+    ArtifactResultSummary { lines, current }
+}
+
+#[cfg(test)]
+fn artifact_result_lines(messages: &[Message], tools: &[String]) -> Vec<String> {
+    artifact_result_summary(messages, tools).lines
+}
+
+async fn artifact_results(
+    manager: &crate::session::SessionManager,
+    task_id: &str,
+) -> Option<ArtifactResultSummary> {
+    let session = manager.get_session(task_id, true).await.ok()?;
+    let policy = SummonTaskPolicy::from_session(&session)?;
+    if policy.artifact_result_tools.is_empty() {
+        return None;
+    }
+    Some(
+        session
+            .conversation
+            .as_ref()
+            .map(|conversation| {
+                artifact_result_summary(conversation.messages(), &policy.artifact_result_tools)
+            })
+            .unwrap_or_else(|| ArtifactResultSummary {
+                lines: Vec::new(),
+                current: HashMap::new(),
+            }),
+    )
 }
 
 async fn artifact_results_section(
     manager: &crate::session::SessionManager,
     task_id: &str,
 ) -> Option<String> {
-    let session = manager.get_session(task_id, true).await.ok()?;
-    let policy = SummonTaskPolicy::from_session(&session)?;
-    if policy.artifact_result_tools.is_empty() {
-        return None;
-    }
-    let lines = session
-        .conversation
-        .as_ref()
-        .map(|conversation| {
-            artifact_result_lines(conversation.messages(), &policy.artifact_result_tools)
-        })
-        .unwrap_or_default();
-    let body = if lines.is_empty() {
-        "- No editor job was started, so nothing was saved.".to_string()
-    } else {
-        lines.join("\n")
-    };
-    Some(format!("{ARTIFACT_RESULTS_HEADING}\n{body}"))
+    artifact_results(manager, task_id)
+        .await
+        .map(|summary| summary.section())
 }
 
 /// Get maximum number of concurrent background tasks
@@ -984,7 +1104,7 @@ impl SummonClient {
                     "v1",
                     serde_json::to_value(policy).map_err(|error| error.to_string())?,
                 );
-                let admission = self
+                let mut admission = self
                     .context
                     .session_manager
                     .capture_task_admission(
@@ -994,6 +1114,8 @@ impl SummonClient {
                     )
                     .await
                     .map_err(|error| error.to_string())?;
+                admission.artifact_key = policy.artifact_key.clone();
+                admission.previous_task_id = policy.previous_task_id.clone();
                 extension_data.set_extension_state(
                     "summon",
                     "task_admission_v1",
@@ -1045,6 +1167,59 @@ impl SummonClient {
             return Err("Artifact titles must be nonempty labels of at most 240 bytes".to_string());
         }
         Ok(key)
+    }
+
+    /// Resolves a supplied previous_task_id before anything looks it up. A
+    /// value that cannot name an earlier task for this artifact (none exists in
+    /// this session) is dropped, and the returned note tells the caller; a value
+    /// that names the wrong task is rejected with the right one.
+    async fn normalize_previous_task_id(
+        &self,
+        session_id: &str,
+        artifact_keys: &[String],
+        params: &mut DelegateParams,
+    ) -> Result<Option<String>, String> {
+        let Some(previous) = params.previous_task_id.clone() else {
+            return Ok(None);
+        };
+        if artifact_keys.is_empty() {
+            let task = self
+                .context
+                .session_manager
+                .get_session(&previous, false)
+                .await
+                .map_err(|_| "Unknown previous_task_id".to_string())?;
+            if task.parent_session_id.as_deref() != Some(session_id)
+                || task.session_type != SessionType::SubAgent
+            {
+                return Err(
+                    "previous_task_id must name a task delegated in this session".to_string(),
+                );
+            }
+            return Ok(None);
+        }
+        let mut artifact_tasks = self.artifact_tasks.lock().await;
+        self.reconstruct_artifact_tasks(session_id, &mut artifact_tasks, artifact_keys)
+            .await?;
+        let owners: Vec<String> = artifact_keys
+            .iter()
+            .filter_map(|key| artifact_tasks.get(&(session_id.to_string(), key.clone())))
+            .cloned()
+            .collect();
+        drop(artifact_tasks);
+        if owners.is_empty() {
+            params.previous_task_id = None;
+            return Ok(Some(format!(
+                "previous_task_id \"{previous}\" was ignored automatically: it is only for a follow-up on a task you delegated earlier in this turn, and no earlier task exists for this artifact."
+            )));
+        }
+        if owners.iter().any(|owner| owner == &previous) {
+            return Ok(None);
+        }
+        Err(format!(
+            "previous_task_id \"{previous}\" is not the earlier task for this artifact. Use previous_task_id: \"{}\".",
+            owners[0]
+        ))
     }
 
     async fn check_artifact_owners(
@@ -1157,8 +1332,12 @@ impl SummonClient {
         result: &anyhow::Result<String>,
         terminal_status: TaskTerminalStatus,
     ) -> anyhow::Result<()> {
+        let artifacts = artifact_results(manager, task_id).await;
         let status = match terminal_status {
-            TaskTerminalStatus::Completed => "completed successfully",
+            TaskTerminalStatus::Completed => artifacts.as_ref().map_or(
+                "completed successfully",
+                ArtifactResultSummary::completion_description,
+            ),
             TaskTerminalStatus::Cancelled => "was cancelled",
             TaskTerminalStatus::Failed => "failed",
             TaskTerminalStatus::Panicked => "panicked",
@@ -1168,9 +1347,9 @@ impl SummonClient {
             Err(error) => error.to_string(),
         };
         let mut body = format!("Task {task_id} {status}.\n\n{output}");
-        if let Some(section) = artifact_results_section(manager, task_id).await {
+        if let Some(artifacts) = artifacts {
             body.push_str("\n\n");
-            body.push_str(&section);
+            body.push_str(&artifacts.section());
         }
         manager
             .enqueue_task_outcome(task_id, &body, terminal_status)
@@ -1218,7 +1397,15 @@ impl SummonClient {
                 status: "unknown", turns: None, duration_secs: None,
             });
         };
-        let status = if report
+        let outcome = report.task_outcome().map_err(|error| error.to_string())?;
+        let status = if let Some(outcome) = outcome {
+            match outcome.status {
+                TaskTerminalStatus::Completed => "completed",
+                TaskTerminalStatus::Cancelled => "cancelled",
+                TaskTerminalStatus::Failed => "failed",
+                TaskTerminalStatus::Panicked => "panicked",
+            }
+        } else if report
             .body
             .starts_with(&format!("Task {task_id} completed successfully."))
         {
@@ -1340,7 +1527,7 @@ impl SummonClient {
                 },
                 "previous_task_id": {
                     "type": "string",
-                    "description": "For a follow-up on the same artifact, the finished specialist task whose result you reviewed."
+                    "description": "Only for a follow-up on a task you delegated earlier in this turn: the ID of that finished task, whose result you reviewed. Omit it otherwise, including for an artifact from an earlier turn."
                 },
                 "parameters": {
                     "type": "object",
@@ -1430,7 +1617,7 @@ impl SummonClient {
     fn create_wait_tool(&self) -> Tool {
         Tool::new(
             "wait",
-            "End your turn without writing to the user and sleep until the next delegated-task report or question arrives. Use it whenever you have nothing new for the user, for example right after answering a specialist's question. Available only while a delegated task is still running or a report is waiting.".to_string(),
+            "End your turn without writing to the user and sleep until the next delegated-task report, question, or user message arrives. Use it whenever you have nothing new for the user, for example right after answering a specialist's question. Available only while a delegated task is still running or a report is waiting.".to_string(),
             serde_json::json!({"type": "object", "properties": {}})
                 .as_object()
                 .unwrap()
@@ -2227,6 +2414,9 @@ impl SummonClient {
         }
 
         let working_dir = session.working_dir.clone();
+        let mut params = params;
+        self.normalize_previous_task_id(session_id, &[], &mut params)
+            .await?;
         let recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
             .await?;
@@ -3097,7 +3287,7 @@ impl SummonClient {
     async fn handle_async_delegate(
         &self,
         session_id: &str,
-        params: DelegateParams,
+        mut params: DelegateParams,
     ) -> Result<(Vec<ContentBlock>, String), String> {
         let task_count = self.background_tasks.lock().await.len();
         let max_tasks = max_background_tasks();
@@ -3136,6 +3326,9 @@ impl SummonClient {
         } else {
             Vec::new()
         };
+        let correction = self
+            .normalize_previous_task_id(session_id, &artifact_keys, &mut params)
+            .await?;
         let recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
             .await?;
@@ -3305,7 +3498,7 @@ impl SummonClient {
                  Once you have delegated everything and finished any independent work, tell the user once, in their terms, what you are working on, then call wait. \
                  Use send(task_id: \"{task_id}\", message: \"...\") only to steer it with new guidance or answer its question."
             ))];
-            return Ok((content, task_id));
+            return Ok((with_correction(content, correction), task_id));
         }
         let retrieval = if non_blocking {
             format!(
@@ -3320,8 +3513,21 @@ impl SummonClient {
             "Task {task_id} started in background: \"{description}\"\n\
              Continue with other work. {retrieval} Use send(task_id: \"{task_id}\", message: \"...\") to provide new guidance."
         ))];
-        Ok((content, task_id))
+        Ok((with_correction(content, correction), task_id))
     }
+}
+
+/// Appends an automatic-correction note to a delegate result.
+fn with_correction(
+    mut content: Vec<ContentBlock>,
+    correction: Option<String>,
+) -> Vec<ContentBlock> {
+    if let Some(correction) = correction {
+        content.push(ContentBlock::text(format!(
+            "Automatic correction: {correction}"
+        )));
+    }
+    content
 }
 
 #[async_trait]
@@ -3669,7 +3875,7 @@ impl McpClientTrait for SummonClient {
                 "\n→ The report above is a specialist question and no task has ended. Answer it with send when the request, research, or conversation settles it, then call wait without writing; ask the user only when only they can decide. You are resumed for each terminal report and for each specialist question."
                     .to_string()
             } else if event_driven {
-                "\n→ Specialists report automatically. Call wait now unless you still have independent work or news for the user: you are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
+                "\n→ Specialists report automatically. Call wait now unless you still have independent work, a new user message to act on, or news for the user: you are resumed for each terminal report, each specialist question, and each new user message. Use send only to give a running specialist new guidance or answer its question."
                     .to_string()
             } else {
                 "\n→ Reports arrive automatically. Do not poll or sleep; finish your reply when no independent work remains. Use send to steer an existing task, load(source: \"<id>\", peek: true) for requested status, or load(source: \"<id>\", cancel: true) to stop it"
@@ -3828,6 +4034,123 @@ mod tests {
         assert!(lines[0].contains("Remaining work: Add the rubric"));
         assert!(lines[1].contains("cancelled") && lines[1].contains("no saved revision"));
         assert!(lines[2].contains("document doc-1") && lines[2].contains("still running"));
+    }
+
+    #[test]
+    fn artifact_completion_uses_current_receipts_instead_of_specialist_prose() {
+        let tool = "cortex_document__delegate_editor_task";
+        let messages_for = |outcomes: &[(&str, &str, Option<u64>)]| {
+            let mut messages = Vec::new();
+            for (index, (document, status, revision)) in outcomes.iter().enumerate() {
+                let id = format!("call-{index}");
+                messages.push(
+                    Message::assistant().with_tool_request(
+                        &id,
+                        Ok(
+                            rmcp::model::CallToolRequestParams::new(tool).with_arguments(
+                                serde_json::json!({"document_id":document})
+                                    .as_object()
+                                    .unwrap()
+                                    .clone(),
+                            ),
+                        ),
+                    ),
+                );
+                let mut result = CallToolResult::success(vec![ContentBlock::text("All done")]);
+                result.structured_content = Some(
+                    serde_json::json!({"document_id":document,"status":status,"document_revision":revision}),
+                );
+                messages.push(Message::user().with_tool_response(&id, Ok(result)));
+            }
+            messages.push(Message::assistant().with_text("All requested artifacts are complete."));
+            messages
+        };
+        let tools = vec![tool.to_owned()];
+        let partial =
+            artifact_result_summary(&messages_for(&[("doc", "partial", Some(2))]), &tools);
+        assert_eq!(
+            partial.completion_description(),
+            "ended with partial artifact output"
+        );
+        let failed = artifact_result_summary(&messages_for(&[("doc", "failed", Some(2))]), &tools);
+        assert_eq!(
+            failed.completion_description(),
+            "ended with incomplete artifact output"
+        );
+        let retry = artifact_result_summary(
+            &messages_for(&[("doc", "failed", Some(2)), ("doc", "completed", Some(3))]),
+            &tools,
+        );
+        assert_eq!(retry.completion_description(), "completed successfully");
+        assert_eq!(retry.lines.len(), 2);
+        let distinct = artifact_result_summary(
+            &messages_for(&[
+                ("doc-1", "partial", Some(2)),
+                ("doc-2", "completed", Some(2)),
+            ]),
+            &tools,
+        );
+        assert_eq!(
+            distinct.completion_description(),
+            "ended with partial artifact output"
+        );
+        assert_eq!(distinct.current.len(), 2);
+        let unsaved = artifact_result_summary(&messages_for(&[("doc", "completed", None)]), &tools);
+        assert_eq!(
+            unsaved.completion_description(),
+            "ended without a confirmed artifact outcome"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_editor_wait_is_superseded_by_the_later_wait_for_the_same_task() {
+        let delegate = "cortex_presentation__delegate_editor_task";
+        let wait = "cortex_presentation__await_editor_task";
+        let call = |tool: &str, id: &str, arguments: serde_json::Value| {
+            Message::assistant().with_tool_request(
+                id,
+                Ok(rmcp::model::CallToolRequestParams::new(tool.to_string())
+                    .with_arguments(arguments.as_object().unwrap().clone())),
+            )
+        };
+        let interrupted = || {
+            let mut result = CallToolResult::success(vec![ContentBlock::text("Stopped waiting")]);
+            result.meta = Some(MetaObject(
+                serde_json::json!({ crate::agents::tool_interrupt::INTERRUPTED_META_KEY: true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ));
+            result
+        };
+        let mut saved = CallToolResult::success(vec![ContentBlock::text("saved")]);
+        saved.structured_content = Some(serde_json::json!({
+            "job_id": "job-1", "status": "completed", "summary": "Four slides",
+            "document_id": "deck-1", "document_revision": 3,
+        }));
+        let tools = [delegate.to_string(), wait.to_string()];
+        let messages = vec![
+            call(
+                delegate,
+                "c1",
+                serde_json::json!({"editor": "aurelia_slides", "title": "Deck", "instruction": "Build it", "idempotency_key": "deck"}),
+            ),
+            Message::user().with_tool_response("c1", Ok(interrupted())),
+            call(wait, "c2", serde_json::json!({"idempotency_key": "deck"})),
+            Message::user().with_tool_response("c2", Ok(saved)),
+            call(
+                delegate,
+                "c3",
+                serde_json::json!({"editor": "aurelia_slides", "document_id": "deck-1", "instruction": "Fix", "idempotency_key": "fix"}),
+            ),
+            Message::user().with_tool_response("c3", Ok(interrupted())),
+        ];
+
+        let lines = artifact_result_lines(&messages, &tools);
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("completed") && lines[0].contains("deck-1"));
+        assert!(lines[1].contains("document deck-1") && lines[1].contains("still running"));
     }
 
     #[test]
@@ -4019,6 +4342,74 @@ mod tests {
             source.properties["event_driven_parent"],
             serde_json::json!(true)
         );
+    }
+
+    #[tokio::test]
+    async fn artifact_partial_is_durable_even_when_specialist_claims_completion() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let task = reliability_child(&client, &parent, "document:doc", None).await;
+        let mut session = manager.get_session(&task, false).await.unwrap();
+        let mut policy = SummonTaskPolicy::from_session(&session).unwrap();
+        let tool = "cortex_document__delegate_editor_task";
+        policy.artifact_result_tools = vec![tool.to_owned()];
+        session.extension_data.set_extension_state(
+            "summon",
+            "v1",
+            serde_json::to_value(policy).unwrap(),
+        );
+        manager
+            .update(&task)
+            .extension_data(session.extension_data)
+            .apply()
+            .await
+            .unwrap();
+        let mut result = CallToolResult::success(vec![ContentBlock::text("Saved")]);
+        result.structured_content = Some(
+            serde_json::json!({"document_id":"doc", "status":"partial", "document_revision":3, "remaining_work":"One identified citation concern remains."}),
+        );
+        let messages = vec![
+            Message::assistant()
+                .with_tool_request("edit", Ok(rmcp::model::CallToolRequestParams::new(tool))),
+            Message::user().with_tool_response("edit", Ok(result)),
+        ];
+        manager
+            .replace_conversation(
+                &task,
+                &crate::conversation::Conversation::new_unvalidated(messages),
+            )
+            .await
+            .unwrap();
+        SummonClient::enqueue_task_completion(
+            &manager,
+            &task,
+            &Ok("All requested work is complete.".to_owned()),
+            TaskTerminalStatus::Completed,
+        )
+        .await
+        .unwrap();
+        let report = manager
+            .terminal_report_for_child(&parent, &task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report
+            .body
+            .starts_with(&format!("Task {task} ended with partial artifact output.")));
+        assert!(!report.body.contains("completed successfully"));
+        assert!(report
+            .body
+            .contains("Remaining work: One identified citation concern remains."));
+        assert_eq!(
+            report.task_outcome().unwrap().unwrap().status,
+            TaskTerminalStatus::Completed
+        );
+        let recovered = client.recovered_task_result(&parent, &task).await.unwrap();
+        assert_eq!(recovered.status, "completed");
+        assert!(recovered.content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .contains("ended with partial artifact output"));
     }
 
     #[tokio::test]
@@ -4229,6 +4620,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unusable_previous_task_id_is_dropped_and_a_wrong_one_names_the_right_task() {
+        let (_directory, _manager, parent, coordinator) = reliability_fixture().await;
+        let unowned = vec!["document:earlier-turn".to_string()];
+        let mut params = DelegateParams {
+            previous_task_id: Some("(not available)".to_string()),
+            ..Default::default()
+        };
+        let note = coordinator
+            .normalize_previous_task_id(&parent, &unowned, &mut params)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(params.previous_task_id.is_none());
+        assert!(note.contains("was ignored automatically"));
+
+        let key = "new:presentation:deck".to_string();
+        let owner = reliability_child(&coordinator, &parent, &key, None).await;
+        let owned = vec![key];
+        let mut wrong = DelegateParams {
+            previous_task_id: Some("20260101_1".to_string()),
+            ..Default::default()
+        };
+        let error = coordinator
+            .normalize_previous_task_id(&parent, &owned, &mut wrong)
+            .await
+            .unwrap_err();
+        assert!(error.contains(&format!("Use previous_task_id: \"{owner}\"")));
+        let mut right = DelegateParams {
+            previous_task_id: Some(owner.clone()),
+            ..Default::default()
+        };
+        assert!(coordinator
+            .normalize_previous_task_id(&parent, &owned, &mut right)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(right.previous_task_id.as_deref(), Some(owner.as_str()));
+    }
+
+    #[tokio::test]
     async fn turn_context_marks_delivered_reports_and_asks_for_a_status_update() {
         let (_directory, manager, parent, coordinator) = reliability_fixture().await;
         let finished = reliability_child(&coordinator, &parent, "new:document:notes", None).await;
@@ -4255,6 +4686,10 @@ mod tests {
         );
         let stop = CancellationToken::new();
         let stopped = stop.clone();
+        let (handle, completion_token) = spawn_background_task(async move {
+            stopped.cancelled().await;
+            Ok("done".to_string())
+        });
         coordinator.background_tasks.lock().await.insert(
             running.clone(),
             BackgroundTask {
@@ -4267,12 +4702,9 @@ mod tests {
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
                 last_activity: Arc::new(AtomicU64::new(0)),
-                handle: tokio::spawn(async move {
-                    stopped.cancelled().await;
-                    Ok("done".to_string())
-                }),
+                handle,
                 cancellation_token: CancellationToken::new(),
-                completion_token: CancellationToken::new(),
+                completion_token,
                 notification_sink: buffered_notification_sink(Vec::new()),
             },
         );
@@ -6644,7 +7076,10 @@ You review code."#;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
 
-        // All tasks consumed -- moim should be empty
+        client
+            .handle_load_task_result("20260204_5", false, false, None)
+            .await
+            .unwrap();
         assert!(client.get_moim("test").await.is_none());
     }
 

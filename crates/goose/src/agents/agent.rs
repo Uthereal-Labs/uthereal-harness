@@ -348,17 +348,15 @@ async fn drain_child_mailbox(
     session_manager: &SessionManager,
     session_id: &str,
     conversation: &mut Conversation,
+    is_child: bool,
 ) -> Result<Vec<Message>> {
     let pending = session_manager.pending_session_messages(session_id).await?;
     let mut delivered = Vec::with_capacity(pending.len());
     for mailbox_message in pending {
-        let message = Message::user()
-            .with_text(format!(
-                "Message from parent task {}:\n\n{}",
-                mailbox_message.sender_session_id, mailbox_message.body
-            ))
-            .with_visibility(false, true)
-            .with_steer();
+        if !is_child && mailbox_message.kind != crate::session::MailboxMessageKind::Steering {
+            continue;
+        }
+        let message = mailbox_message.prompt()?;
         let message = message.with_generated_id_if_missing();
         if session_manager
             .deliver_session_message(session_id, mailbox_message.id, &message)
@@ -2694,6 +2692,7 @@ impl Agent {
             let mut goal_check_pending = false;
             let mut tool_pair_summarization_done = false;
             let mut stop_hook_handled_for_exit = false;
+            let mut completed_successfully = false;
             let mut retrying_after_stop_hook_denial = false;
             let mut consecutive_stop_hook_blocks = 0u32;
             let stop_hook_block_cap = self.stop_hook_block_cap();
@@ -2721,11 +2720,12 @@ impl Agent {
                 )
                 .await?;
             }
-            if session.session_type == SessionType::SubAgent {
+            {
                 for message in drain_child_mailbox(
                     &session_manager,
                     &session_config.id,
                     &mut conversation,
+                    session.session_type == SessionType::SubAgent,
                 )
                 .await?
                 {
@@ -2741,11 +2741,12 @@ impl Agent {
                 }
 
                 if can_drain_pending_steers {
-                    if session.session_type == SessionType::SubAgent {
+                    {
                         for message in drain_child_mailbox(
                             &session_manager,
                             &session_config.id,
                             &mut conversation,
+                            session.session_type == SessionType::SubAgent,
                         )
                         .await?
                         {
@@ -2797,6 +2798,7 @@ impl Agent {
                     {
                         crate::hooks::HookDecision::Allow => {
                             stop_hook_handled_for_exit = true;
+                            completed_successfully = true;
                             break;
                         }
                         crate::hooks::HookDecision::Deny { reason, plugin } => {
@@ -3478,11 +3480,7 @@ impl Agent {
                         let mut guard = self.final_output_tool.lock().await;
                         guard.as_mut().map(|fot| fot.final_output.take())
                     };
-                    let has_pending_mailbox = session.session_type == SessionType::SubAgent
-                        && !session_manager
-                            .pending_session_messages(&session_config.id)
-                            .await?
-                            .is_empty();
+                    let has_pending_mailbox = session_manager.pending_session_messages(&session_config.id).await?.iter().any(|message| session.session_type == SessionType::SubAgent || message.kind == crate::session::MailboxMessageKind::Steering);
 
                     match final_output {
                         Some(None) => {
@@ -3679,7 +3677,7 @@ impl Agent {
                 }
                 conversation.extend(messages_to_add);
 
-                if exit_chat && self.has_pending_steers(&session_config.id).await {
+                if exit_chat && (self.has_pending_steers(&session_config.id).await || session_manager.pending_session_messages(&session_config.id).await?.iter().any(|message| session.session_type == SessionType::SubAgent || message.kind == crate::session::MailboxMessageKind::Steering)) {
                     exit_chat = false;
                 }
 
@@ -3690,6 +3688,7 @@ impl Agent {
                     {
                         crate::hooks::HookDecision::Allow => {
                             stop_hook_handled_for_exit = true;
+                            completed_successfully = !provider_errored && !provider_reached_output_token_limit;
                             break;
                         }
                         crate::hooks::HookDecision::Deny { reason, plugin } => {
@@ -3734,6 +3733,9 @@ impl Agent {
 
             if !stop_hook_handled_for_exit {
                 self.emit_stop_hook(&session_config.id, &last_assistant_text, &session.working_dir.to_string_lossy()).await;
+            }
+            if completed_successfully && !is_token_cancelled(&cancel_token) {
+                gen_ai_telemetry::record_completed(&tracing::Span::current());
             }
         }.instrument(reply_stream_span));
         Ok(inner)
