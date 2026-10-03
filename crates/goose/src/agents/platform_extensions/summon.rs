@@ -61,8 +61,13 @@ const TASK_LABEL_BUDGET: usize = 60;
 /// A specialist's wait: default and longest sleep, and how often it checks its
 /// mailbox.
 const SPECIALIST_WAIT_DEFAULT_SECS: u64 = 120;
-const SPECIALIST_WAIT_MAX_SECS: u64 = 600;
+const SPECIALIST_WAIT_MAX_SECS: u64 = 180;
 const SPECIALIST_WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// How the parent continues a specialist that can no longer receive messages.
+fn redelegate_hint(task_id: &str) -> String {
+    format!("A message cannot reach it. To have its work continue, delegate it again with previous_task_id set to '{task_id}' and an instruction that includes what you meant to send.")
+}
 
 fn durable_assistant_turn_count(conversation: &crate::conversation::Conversation) -> u32 {
     let Ok(messages) = messages_since_kickoff(conversation) else {
@@ -1323,6 +1328,11 @@ pub struct SummonClient {
     /// Highest mailbox message ID delivered to each parent's current report
     /// turn. Delivered messages stay pending until the turn is acknowledged.
     delivered_reports: Mutex<HashMap<String, i64>>,
+    /// Specialists whose last wait timed out with no editor task running, with
+    /// how many messages had reached them and tool calls they had made then. A
+    /// wait refuses while that count is unchanged: nothing reached them and they
+    /// did nothing since, so nothing can arrive.
+    empty_waits: Mutex<HashMap<String, usize>>,
 }
 
 impl Drop for SummonClient {
@@ -1350,6 +1360,7 @@ impl SummonClient {
             artifact_tasks: Mutex::new(HashMap::new()),
             event_driven_parents: Mutex::new(HashSet::new()),
             delivered_reports: Mutex::new(HashMap::new()),
+            empty_waits: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1935,7 +1946,7 @@ impl SummonClient {
     fn create_specialist_wait_tool(&self) -> Tool {
         Tool::new(
             "wait",
-            "Sleep until something needs you: the result of an editor task you started, a message from the coordinator, or channel news that asks for you (a question or request addressed to you, a reply in a thread you opened, a change to a facet you follow, or that you joined a channel or gained followers). What woke you arrives right after this tool's result. Call it whenever you have nothing else to do until one of these arrives; never poll. Other channel news reaches you at your next step without waking you. It is refused when you have nothing to wait for: no editor task of yours is running and you are in no channel. On timeout, call it again while you still wait for something.".to_string(),
+            "Sleep until something needs you: the result of an editor task you started, a message from the coordinator, or channel news that asks for you (a question or request addressed to you, a reply in a thread you opened, a new publish or status of a facet you follow, or that you joined a channel or gained followers). What woke you arrives right after this tool's result. Call it only when you have nothing else to do and one of these can still arrive; never poll, and never wait for followers or members that finished. Other channel news reaches you at your next step without waking you. It is refused when nothing can wake you: no editor task of yours is running and either no channel news has ever reached you or your last wait ended with nothing arriving and nothing has reached you since. On timeout, call it again only while something you wait for can still arrive.".to_string(),
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1989,10 +2000,36 @@ impl SummonClient {
                 .and_then(serde_json::Value::as_str)
                 == Some("channel")
         });
+        // What has happened to the specialist: messages that reached it (mailbox
+        // deliveries and coordinator messages) and tool calls it made other than
+        // wait, such as a question to another member.
+        let arrivals = messages
+            .iter()
+            .map(|message| {
+                usize::from(message.metadata.steer)
+                    + message
+                        .content
+                        .iter()
+                        .filter(|content| match content {
+                            MessageContent::ToolRequest(request) => request
+                                .tool_call
+                                .as_ref()
+                                .is_ok_and(|call| call.name != "wait"),
+                            _ => false,
+                        })
+                        .count()
+            })
+            .sum::<usize>();
+        if running.is_empty() && self.empty_waits.lock().await.get(session_id) == Some(&arrivals) {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "Error: Nothing to wait for: your last wait ended with nothing arriving, nothing has reached you or been done by you since, and no editor task of yours is running. If you still need something from another member, ask it with channel_post kind ask: its reply wakes you, and a member that finished is answered for. Otherwise write your final report, naming anything you could not align.",
+            )]);
+        }
         let started = Instant::now();
         loop {
             match manager.pending_session_messages(session_id).await {
                 Ok(pending) if pending.iter().any(|message| message.interrupts_wait()) => {
+                    self.empty_waits.lock().await.remove(session_id);
                     return CallToolResult::success(vec![ContentBlock::text(format!(
                         "Woken after {}s: what arrived follows this result. Act on it, then call wait again while you still wait for something.",
                         started.elapsed().as_secs()
@@ -2007,17 +2044,21 @@ impl SummonClient {
             }
             if running.is_empty() && !in_channel {
                 return CallToolResult::error(vec![ContentBlock::text(
-                    "Error: Nothing to wait for: no editor task of yours is running and you are in no channel. An editor task started in this same step counts once its delegate_editor_task result is in, so call wait in your next step; otherwise write your final report.",
+                    "Error: Nothing to wait for: no editor task of yours is running, and no channel news has ever reached you, so nothing can wake you. An editor task started in this same step counts once its delegate_editor_task result is in, so call wait in your next step; otherwise write your final report.",
                 )]);
             }
             if started.elapsed() >= Duration::from_secs(timeout) {
                 let still = if running.is_empty() {
-                    String::new()
+                    self.empty_waits
+                        .lock()
+                        .await
+                        .insert(session_id.to_string(), arrivals);
+                    " No editor task of yours is running. If you are waiting for another member, ask it with channel_post kind ask instead of waiting again.".to_string()
                 } else {
                     format!(" Editor tasks still running: {}.", running.join(", "))
                 };
                 return CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Nothing arrived in {timeout}s.{still} Call wait again while you still wait for something; message_editor steers a running editor in the meantime."
+                    "Nothing arrived in {timeout}s.{still} Call wait again only while something you wait for can still arrive (an editor result, a reply to your question, or a publish you follow); otherwise write your final report."
                 ))]);
             }
             tokio::select! {
@@ -4009,14 +4050,16 @@ impl McpClientTrait for SummonClient {
                         let tasks = self.background_tasks.lock().await;
                         let Some(task) = tasks.get(&params.task_id) else {
                             return Err(anyhow::anyhow!(
-                                "Task '{}' is not running",
-                                params.task_id
+                                "Task '{}' is not running. {}",
+                                params.task_id,
+                                redelegate_hint(&params.task_id)
                             ));
                         };
                         if task.handle.is_finished() {
                             return Err(anyhow::anyhow!(
-                                "Task '{}' has already finished",
-                                params.task_id
+                                "Task '{}' has already finished. {}",
+                                params.task_id,
+                                redelegate_hint(&params.task_id)
                             ));
                         }
                         self.context
@@ -4264,7 +4307,7 @@ impl McpClientTrait for SummonClient {
 
         if has_running {
             lines.push(if event_driven && turn_ends_task {
-                "\n→ A task in the report above has ended while others still run. Unless that report is unrelated to the current request, write a brief update giving the current status of every requested artifact, each one finished so far and each one still in progress, then call wait. You are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
+                "\n→ A task in the report above has ended while others still run. Unless that report is unrelated to the current request: if it shows that a requested artifact failed or is incomplete and another attempt can still succeed in this turn, delegate its follow-up now, with previous_task_id set to that task, before you write. Then write a brief update giving the current status of every requested artifact, each one finished so far and each one still in progress, then call wait. You are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
                     .to_string()
             } else if event_driven && turn_asks_question {
                 "\n→ The report above is a specialist question and no task has ended. Answer it with send when the request, research, or conversation settles it, then call wait without writing; ask the user only when only they can decide. You are resumed for each terminal report and for each specialist question."
@@ -4831,6 +4874,57 @@ mod tests {
             .unwrap();
         assert!(refused.is_error.unwrap_or(false));
         assert!(!tool_result_ends_turn(&refused));
+
+        // Channel news reached it once: one empty wait is allowed, a repeat is refused
+        // until something new reaches it.
+        let notice = || {
+            let mut message = Message::user()
+                .with_text("Channel news")
+                .with_visibility(false, true)
+                .with_steer();
+            message.metadata.set_operation_note(
+                crate::session::MAILBOX_NOTE,
+                "kind",
+                serde_json::json!("channel"),
+            );
+            message
+        };
+        manager.add_message(&child, &notice()).await.unwrap();
+        let args = || serde_json::json!({"timeout_s": 1}).as_object().cloned();
+        let empty = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!empty.is_error.unwrap_or(false));
+        assert!(format!("{:?}", empty.content).contains("channel_post kind ask"));
+        let repeated = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(repeated.is_error.unwrap_or(false));
+        assert!(format!("{:?}", repeated.content).contains("your last wait ended"));
+        let asked = Message::assistant().with_tool_request(
+            "ask-1",
+            Ok(rmcp::model::CallToolRequestParams::new("cortex_document__channel_post")),
+        );
+        manager.add_message(&child, &asked).await.unwrap();
+        let after_asking = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!after_asking.is_error.unwrap_or(false));
+        manager.add_message(&child, &notice()).await.unwrap();
+        let after_news = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!after_news.is_error.unwrap_or(false));
+    }
+
+    #[test]
+    fn a_send_to_a_task_that_cannot_receive_it_says_how_to_continue() {
+        let hint = redelegate_hint("20261003_4");
+        assert!(hint.contains("previous_task_id set to '20261003_4'"));
     }
 
     #[test]

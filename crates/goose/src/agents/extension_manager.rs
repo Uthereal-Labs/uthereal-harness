@@ -1136,6 +1136,10 @@ impl McpClientTrait for OAuthStepUpClient {
         self.inner.read().await.get_moim(session_id).await
     }
 
+    async fn notify_task_ended(&self, session_id: &str) {
+        self.inner.read().await.notify_task_ended(session_id).await
+    }
+
     async fn update_working_dir(
         &self,
         new_dir: PathBuf,

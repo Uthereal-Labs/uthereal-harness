@@ -209,6 +209,10 @@ from the turn: when a task ended while others still run, it asks for a brief
 status of every requested artifact before `wait`; when the turn carries only a
 child's question, it asks for an answer through `send` and a silent `wait`.
 
+A `send` to a task that has finished or is not running fails with how to
+continue its work: delegate it again with `previous_task_id` set to that task
+and an instruction that includes the message (`redelegate_hint`).
+
 A child blocked in a long tool call cannot read its mailbox until the call
 returns. An MCP tool can declare `goose.interruptOnMessage` (a notice text) in
 its definition `_meta`; while such a call runs, a newer parent message or a
@@ -237,16 +241,20 @@ A subagent whose source lists `artifact_result_tools` also gets `summon.wait`
 ending the turn until the task's mailbox holds something that should wake it
 (`MailboxMessage::interrupts_wait`): a parent message or a task notice with
 `wake`, such as an editor result. Goose delivers that at the checkpoint right
-after the wait's result. `timeout_s` defaults to 120 and is at most 600. It is
-refused when the task has nothing to wait for: no editor task still running
-and no channel notice ever delivered. The task never polls: whatever arrives
+after the wait's result. `timeout_s` defaults to 120 and is at most 180, so a task that waits for something that will never come looks again soon. It is
+refused when the task has nothing to wait for: no editor task still running,
+and either no channel notice ever delivered or its last wait timed out and,
+since then, no message reached it and it called no other tool (`empty_waits`
+records how many there had been). Timing out
+or refusing without a running editor tells the task to ask the member it waits
+for with `channel_post`. The task never polls: whatever arrives
 while it is awake reaches it at its next checkpoint.
 
 When a subagent's run ends (finished, failed or cancelled), Goose sends each of
 its MCP tool servers the notification `notifications/goose/task_ended` with
 `{"taskId": <task session ID>}`, so the server can stop work the task started
 (Cortex cancels its queued or running editor tasks) and settle what it owed
-others. It is best effort: a server that misses it must still bound that work.
+others. Clients that wrap a tool server's connection (such as the OAuth step-up client of an HTTP extension) forward it. It is best effort: a server that misses it must still bound that work.
 
 ### Task notices
 
