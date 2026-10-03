@@ -167,6 +167,23 @@ Address this policy hook denial before trying to stop again."
         .with_visibility(false, true)
 }
 
+/// How many times a specialist is told not to finish while its editor task runs.
+const MAX_RUNNING_EDITOR_REMINDERS: u32 = 3;
+
+pub(crate) fn running_editor_message(keys: &[String]) -> Message {
+    let (tasks, verb) = if keys.len() == 1 {
+        ("task", "is")
+    } else {
+        ("tasks", "are")
+    };
+    Message::user()
+        .with_text(format!(
+            "Your editor {tasks} {} {verb} still running, so do not finish yet. Call wait: each editor result is delivered to you when the editor finishes; review it before your final report.",
+            keys.join(", ")
+        ))
+        .with_visibility(false, true)
+}
+
 pub(crate) fn stop_hook_denial_notification(plugin: &str) -> Message {
     Message::assistant().with_system_notification(
         SystemNotificationType::InlineMessage,
@@ -2709,6 +2726,7 @@ impl Agent {
             let mut completed_successfully = false;
             let mut retrying_after_stop_hook_denial = false;
             let mut consecutive_stop_hook_blocks = 0u32;
+            let mut running_editor_reminders = 0u32;
             let stop_hook_block_cap = self.stop_hook_block_cap();
             let mut can_drain_pending_steers = false;
             let turn_start = chrono::Local::now();
@@ -3704,6 +3722,30 @@ impl Agent {
 
                 if exit_chat && (self.has_pending_steers(&session_config.id).await || session_manager.pending_session_messages(&session_config.id).await?.iter().any(|message| session.session_type == SessionType::SubAgent || message.kind == crate::session::MailboxMessageKind::Steering)) {
                     exit_chat = false;
+                }
+
+                // A specialist whose editor task still runs would report
+                // without the editor's result: remind it to wait, a bounded
+                // number of times.
+                if exit_chat
+                    && session.session_type == SessionType::SubAgent
+                    && running_editor_reminders < MAX_RUNNING_EDITOR_REMINDERS
+                {
+                    let running = super::platform_extensions::summon::running_editor_tasks(
+                        &session,
+                        conversation.messages(),
+                    );
+                    if !running.is_empty() {
+                        running_editor_reminders += 1;
+                        persist_and_push_message_with_id(
+                            &session_manager,
+                            &session_config.id,
+                            &mut conversation,
+                            running_editor_message(&running),
+                        )
+                        .await?;
+                        exit_chat = false;
+                    }
                 }
 
                 if exit_chat {

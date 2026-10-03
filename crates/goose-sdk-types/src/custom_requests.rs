@@ -415,10 +415,11 @@ pub struct TaskEvidenceResponse {
     pub evidence_complete: bool,
 }
 
-/// Queue a channel notice for the running task of an attempt that holds one of
-/// the given artifacts (or has the given task ID). The task reads it at its next
-/// checkpoint; `wake` also ends an interruptible wait, and `refresh_tools`
-/// re-lists the task's tools first (for example after it joins a channel).
+/// Queue a notice for the running task of an attempt that holds one of the
+/// given artifacts (or has the given task ID): channel news, or the result of
+/// an editor task it started. The task reads it at its next checkpoint; `wake`
+/// also ends its wait, and `refresh_tools` re-lists the task's tools first (for
+/// example after it joins a channel).
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
 #[request(method = "_goose/unstable/attempt/task-notice", response = TaskNoticeResponse)]
 #[serde(rename_all = "camelCase")]
@@ -436,6 +437,11 @@ pub struct TaskNoticeRequest {
     /// Makes a retried notice idempotent for its recipient.
     #[serde(default)]
     pub dedupe_key: Option<String>,
+    /// The result of an editor task the recipient started, delivered with the
+    /// notice: `{"idempotency_key": ..., "receipt": {...}}`. Goose counts it as
+    /// that task's result (artifact results, finish guard) once delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

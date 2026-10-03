@@ -15,6 +15,7 @@ const RECEIPT_LIMIT: usize = 128;
 const STRUCTURED_RESULT_LIMIT: usize = 32768;
 const RESPONSE_LIMIT: usize = 262144;
 const NOTICE_TEXT_LIMIT: usize = 65536;
+const EDITOR_RESULT_LIMIT: usize = 16384;
 
 /// The form in which a delegated task's artifact key is stored and compared:
 /// whitespace collapsed and lowercased. Tool servers that name artifacts (such
@@ -216,8 +217,9 @@ impl SessionManager {
         Ok(response)
     }
 
-    /// Queue a channel notice for the attempt's running task that holds one of
-    /// the requested artifacts (or has the requested ID). A task is running
+    /// Queue a notice (channel news or an editor result) for the attempt's
+    /// running task that holds one of the requested artifacts (or has the
+    /// requested ID). A task is running
     /// until its terminal outcome is queued for its parent; a finished task is
     /// reported as `not_running` and receives nothing.
     pub async fn queue_task_notice(
@@ -237,6 +239,14 @@ impl SessionManager {
                 .dedupe_key
                 .as_deref()
                 .is_some_and(|key| key.is_empty() || key.len() > 200)
+            || request.editor_result.as_ref().is_some_and(|result| {
+                result
+                    .get("idempotency_key")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|key| key.is_empty() || key.len() > 240)
+                    || !result.get("receipt").is_some_and(serde_json::Value::is_object)
+                    || !serde_json::to_vec(result).is_ok_and(|bytes| bytes.len() <= EDITOR_RESULT_LIMIT)
+            })
         {
             bail!("Invalid task notice request");
         }
@@ -292,6 +302,7 @@ impl SessionManager {
             text: request.text.clone(),
             wake: request.wake,
             refresh_tools: request.refresh_tools,
+            editor_result: request.editor_result.clone(),
         };
         sqlx::query(
             "INSERT OR IGNORE INTO session_mailbox

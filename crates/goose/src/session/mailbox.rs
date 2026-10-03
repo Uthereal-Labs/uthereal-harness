@@ -20,19 +20,32 @@ pub enum MailboxMessageKind {
     Channel,
 }
 
-/// News from a channel the task belongs to, queued by the tool server.
+/// A notice queued by the task's tool server: news from a channel the task
+/// belongs to, or the result of an editor task it started.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelNotice {
     pub text: String,
-    /// End an interruptible wait (a question or request addressed to the task,
-    /// a change to a facet it watches, or its own join).
+    /// End the task's wait (an editor result, a question or request addressed
+    /// to the task, a reply to its own, a change to a facet it follows, or its
+    /// own join).
     #[serde(default)]
     pub wake: bool,
     /// Re-list the task's tools before its next model call.
     #[serde(default)]
     pub refresh_tools: bool,
+    /// `{"idempotency_key", "receipt"}` of an editor task the recipient
+    /// started; see [`EDITOR_RESULT_NOTE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_result: Option<serde_json::Value>,
 }
+
+/// Operation note on a delivered mailbox message naming what it was: `kind` is
+/// `channel` or `editor_result`.
+pub const MAILBOX_NOTE: &str = "mailbox";
+/// Operation note carrying a delivered editor result under `v1`
+/// (`{"idempotency_key", "receipt"}`), read back as that task's result.
+pub const EDITOR_RESULT_NOTE: &str = "editor_result";
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct MailboxMessage {
@@ -52,10 +65,23 @@ impl MailboxMessage {
         }
         if self.kind == MailboxMessageKind::Channel {
             let notice: ChannelNotice = serde_json::from_str(&self.body)?;
-            return Ok(Message::user()
+            let mut message = Message::user()
                 .with_text(notice.text)
                 .with_visibility(false, true)
-                .with_steer());
+                .with_steer();
+            let kind = match notice.editor_result {
+                Some(result) => {
+                    message
+                        .metadata
+                        .set_operation_note(EDITOR_RESULT_NOTE, "v1", result);
+                    "editor_result"
+                }
+                None => "channel",
+            };
+            message
+                .metadata
+                .set_operation_note(MAILBOX_NOTE, "kind", serde_json::json!(kind));
+            return Ok(message);
         }
         Ok(Message::user()
             .with_text(format!(
@@ -484,6 +510,24 @@ mod tests {
         );
         assert!(!reply.interrupts_wait() && !reply.refreshes_tools());
         assert_eq!(reply.prompt().unwrap().as_concat_text(), "Reply from deck.");
+        let finished = message(
+            MailboxMessageKind::Channel,
+            r#"{"text":"Your editor task deck-1 finished.","wake":true,"editorResult":{"idempotency_key":"deck-1","receipt":{"job_id":"j1"}}}"#,
+        );
+        assert!(finished.interrupts_wait() && !finished.refreshes_tools());
+        let prompt = finished.prompt().unwrap();
+        assert_eq!(
+            prompt.metadata.operation_note(super::EDITOR_RESULT_NOTE, "v1"),
+            Some(&serde_json::json!({"idempotency_key": "deck-1", "receipt": {"job_id": "j1"}}))
+        );
+        assert_eq!(
+            prompt.metadata.operation_note(super::MAILBOX_NOTE, "kind"),
+            Some(&serde_json::json!("editor_result"))
+        );
+        assert_eq!(
+            reply.prompt().unwrap().metadata.operation_note(super::MAILBOX_NOTE, "kind"),
+            Some(&serde_json::json!("channel"))
+        );
         assert!(message(MailboxMessageKind::Message, "Use four slides").interrupts_wait());
         assert!(!message(MailboxMessageKind::Completion, "done").interrupts_wait());
     }

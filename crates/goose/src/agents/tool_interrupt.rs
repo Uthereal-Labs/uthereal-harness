@@ -30,7 +30,9 @@ pub const INTERRUPTED_META_KEY: &str = "goose.interrupted";
 
 const MAILBOX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// True when a tool result came from an interrupted wait rather than the tool.
+/// True when a tool result says the work it started is still running: a wait
+/// this module interrupted, or a tool server result marked the same way (for
+/// example an editor task that was started and keeps working).
 pub fn was_interrupted(result: &CallToolResult) -> bool {
     result
         .meta
@@ -38,6 +40,12 @@ pub fn was_interrupted(result: &CallToolResult) -> bool {
         .and_then(|meta| meta.0.get(INTERRUPTED_META_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        || result
+            .structured_content
+            .as_ref()
+            .and_then(|content| content.get("interrupted"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// The interruption notice a tool definition declares, if any.

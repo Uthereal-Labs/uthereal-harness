@@ -58,6 +58,12 @@ const SUBAGENT_DESCRIPTION_BUDGET: usize = 160;
 
 const TASK_LABEL_BUDGET: usize = 60;
 
+/// A specialist's wait: default and longest sleep, and how often it checks its
+/// mailbox.
+const SPECIALIST_WAIT_DEFAULT_SECS: u64 = 120;
+const SPECIALIST_WAIT_MAX_SECS: u64 = 600;
+const SPECIALIST_WAIT_POLL: Duration = Duration::from_millis(250);
+
 fn durable_assistant_turn_count(conversation: &crate::conversation::Conversation) -> u32 {
     let Ok(messages) = messages_since_kickoff(conversation) else {
         return 0;
@@ -1036,7 +1042,50 @@ impl ArtifactResultSummary {
     }
 }
 
+/// The conversation with each editor result the tool server delivered to the
+/// task's mailbox written as the tool call and response it stands for: a call of
+/// the first artifact result tool with the task's idempotency_key, answered by
+/// its receipt. It follows the delivered message, so it supersedes the
+/// still-running result of the call that started the task.
+fn with_delivered_editor_results(messages: &[Message], tools: &[String]) -> Vec<Message> {
+    let Some(tool) = tools.first() else {
+        return messages.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(messages.len());
+    for (index, message) in messages.iter().enumerate() {
+        normalized.push(message.clone());
+        let Some(result) = message
+            .metadata
+            .operation_note(crate::session::EDITOR_RESULT_NOTE, "v1")
+        else {
+            continue;
+        };
+        let (Some(key), Some(receipt)) = (
+            result
+                .get("idempotency_key")
+                .and_then(serde_json::Value::as_str),
+            result.get("receipt").filter(|receipt| receipt.is_object()),
+        ) else {
+            continue;
+        };
+        let id = format!("delivered_editor_result_{index}");
+        let mut arguments = JsonObject::new();
+        arguments.insert("idempotency_key".to_string(), serde_json::json!(key));
+        normalized.push(Message::assistant().with_tool_request(
+            id.clone(),
+            Ok(rmcp::model::CallToolRequestParams::new(tool.clone()).with_arguments(arguments)),
+        ));
+        normalized.push(
+            Message::user()
+                .with_tool_response(id, Ok(CallToolResult::structured(receipt.clone()))),
+        );
+    }
+    normalized
+}
+
 fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactResultSummary {
+    let normalized = with_delivered_editor_results(messages, tools);
+    let messages = normalized.as_slice();
     let mut calls = Vec::new();
     let mut responses = HashMap::new();
     let mut response_order = HashMap::new();
@@ -1145,6 +1194,66 @@ fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactRe
         })
         );
     ArtifactResultSummary { lines, current }
+}
+
+/// The idempotency keys of editor tasks a specialist started whose latest
+/// result says the editor is still working (a delivered editor result counts
+/// as the latest). A specialist must not finish while one runs: its report
+/// would not have the editor's result.
+pub(crate) fn running_editor_tasks(
+    session: &crate::session::Session,
+    messages: &[Message],
+) -> Vec<String> {
+    SummonTaskPolicy::from_session(session)
+        .map(|policy| running_editor_task_keys(messages, &policy.artifact_result_tools))
+        .unwrap_or_default()
+}
+
+fn running_editor_task_keys(messages: &[Message], tools: &[String]) -> Vec<String> {
+    if tools.is_empty() {
+        return Vec::new();
+    }
+    let normalized = with_delivered_editor_results(messages, tools);
+    let messages = normalized.as_slice();
+    let mut keys: HashMap<&str, String> = HashMap::new();
+    let mut running: HashMap<String, bool> = HashMap::new();
+    for message in messages {
+        for content in &message.content {
+            match content {
+                MessageContent::ToolRequest(request) => {
+                    if let Ok(call) = &request.tool_call {
+                        if tools.iter().any(|tool| call.name == tool.as_str())
+                        {
+                            if let Some(key) = call
+                                .arguments
+                                .as_ref()
+                                .and_then(|args| args.get("idempotency_key"))
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                keys.insert(request.id.as_str(), key.to_owned());
+                            }
+                        }
+                    }
+                }
+                MessageContent::ToolResponse(response) => {
+                    if let Some(key) = keys.get(response.id.as_str()) {
+                        let still_running = matches!(
+                            &response.tool_result,
+                            Ok(result) if crate::agents::tool_interrupt::was_interrupted(result)
+                        );
+                        running.insert(key.clone(), still_running);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut keys: Vec<String> = running
+        .into_iter()
+        .filter_map(|(key, still_running)| still_running.then_some(key))
+        .collect();
+    keys.sort();
+    keys
 }
 
 #[cfg(test)]
@@ -1821,6 +1930,103 @@ impl SummonClient {
                 .clone(),
         ));
         result
+    }
+
+    fn create_specialist_wait_tool(&self) -> Tool {
+        Tool::new(
+            "wait",
+            "Sleep until something needs you: the result of an editor task you started, a message from the coordinator, or channel news that asks for you (a question or request addressed to you, a reply in a thread you opened, a change to a facet you follow, or that you joined a channel or gained followers). What woke you arrives right after this tool's result. Call it whenever you have nothing else to do until one of these arrives; never poll. Other channel news reaches you at your next step without waking you. It is refused when you have nothing to wait for: no editor task of yours is running and you are in no channel. On timeout, call it again while you still wait for something.".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "timeout_s": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": SPECIALIST_WAIT_MAX_SECS,
+                        "description": format!("Longest wait in seconds (default {SPECIALIST_WAIT_DEFAULT_SECS}).")
+                    }
+                },
+                "additionalProperties": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+    }
+
+    /// Sleep until the specialist's mailbox holds something that should wake
+    /// it: an editor result, a coordinator message, or waking channel news.
+    /// Goose delivers it at the checkpoint right after this result.
+    async fn handle_specialist_wait(
+        &self,
+        session_id: &str,
+        arguments: Option<JsonObject>,
+        cancellation_token: CancellationToken,
+    ) -> CallToolResult {
+        let timeout = arguments
+            .as_ref()
+            .and_then(|args| args.get("timeout_s"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(SPECIALIST_WAIT_DEFAULT_SECS)
+            .clamp(1, SPECIALIST_WAIT_MAX_SECS);
+        let manager = &self.context.session_manager;
+        let session = match manager.get_session(session_id, true).await {
+            Ok(session) => session,
+            Err(error) => {
+                return CallToolResult::error(vec![ContentBlock::text(format!("Error: {error}"))])
+            }
+        };
+        let messages = session
+            .conversation
+            .as_ref()
+            .map(|conversation| conversation.messages().to_vec())
+            .unwrap_or_default();
+        let running = running_editor_tasks(&session, &messages);
+        let in_channel = messages.iter().any(|message| {
+            message
+                .metadata
+                .operation_note(crate::session::MAILBOX_NOTE, "kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("channel")
+        });
+        let started = Instant::now();
+        loop {
+            match manager.pending_session_messages(session_id).await {
+                Ok(pending) if pending.iter().any(|message| message.interrupts_wait()) => {
+                    return CallToolResult::success(vec![ContentBlock::text(format!(
+                        "Woken after {}s: what arrived follows this result. Act on it, then call wait again while you still wait for something.",
+                        started.elapsed().as_secs()
+                    ))]);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Error: {error}"
+                    ))])
+                }
+            }
+            if running.is_empty() && !in_channel {
+                return CallToolResult::error(vec![ContentBlock::text(
+                    "Error: Nothing to wait for: no editor task of yours is running and you are in no channel. An editor task started in this same step counts once its delegate_editor_task result is in, so call wait in your next step; otherwise write your final report.",
+                )]);
+            }
+            if started.elapsed() >= Duration::from_secs(timeout) {
+                let still = if running.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Editor tasks still running: {}.", running.join(", "))
+                };
+                return CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Nothing arrived in {timeout}s.{still} Call wait again while you still wait for something; message_editor steers a running editor in the meantime."
+                ))]);
+            }
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    return CallToolResult::error(vec![ContentBlock::text("Error: The wait was cancelled.")]);
+                }
+                _ = tokio::time::sleep(SPECIALIST_WAIT_POLL) => {}
+            }
+        }
     }
 
     fn create_message_parent_tool(&self) -> Tool {
@@ -3704,18 +3910,29 @@ impl McpClientTrait for SummonClient {
     ) -> Result<ListToolsResult, Error> {
         self.cleanup_completed_tasks().await;
 
-        let is_subagent = self
+        let session = self
             .context
             .session_manager
             .get_session(session_id, false)
             .await
-            .map(|s| s.session_type == SessionType::SubAgent)
-            .unwrap_or(false);
+            .ok();
+        let is_subagent = session
+            .as_ref()
+            .is_some_and(|s| s.session_type == SessionType::SubAgent);
 
         let mut tools = vec![self.create_load_tool()];
 
         if is_subagent {
             tools.push(self.create_message_parent_tool());
+            // A specialist that starts editor tasks sleeps until their results,
+            // its parent's messages or its channel news arrive.
+            if session
+                .as_ref()
+                .and_then(SummonTaskPolicy::from_session)
+                .is_some_and(|policy| !policy.artifact_result_tools.is_empty())
+            {
+                tools.push(self.create_specialist_wait_tool());
+            }
         } else {
             let working_dir = self.get_working_dir(session_id).await;
             let sources = self.get_sources(session_id, &working_dir).await;
@@ -3821,7 +4038,21 @@ impl McpClientTrait for SummonClient {
                     ))])),
                 }
             }
-            "wait" => Ok(self.handle_wait(session_id).await),
+            "wait" => {
+                let is_subagent = self
+                    .context
+                    .session_manager
+                    .get_session(session_id, false)
+                    .await
+                    .is_ok_and(|session| session.session_type == SessionType::SubAgent);
+                if is_subagent {
+                    Ok(self
+                        .handle_specialist_wait(session_id, arguments, cancellation_token)
+                        .await)
+                } else {
+                    Ok(self.handle_wait(session_id).await)
+                }
+            }
             "message_parent" => {
                 let params: std::result::Result<MessageParentParams, _> = arguments
                     .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
@@ -4470,7 +4701,7 @@ mod tests {
     #[test]
     fn an_interrupted_editor_wait_is_superseded_by_the_later_wait_for_the_same_task() {
         let delegate = "cortex_presentation__delegate_editor_task";
-        let wait = "cortex_presentation__await_editor_task";
+        let wait = "cortex_presentation__editor_result";
         let call = |tool: &str, id: &str, arguments: serde_json::Value| {
             Message::assistant().with_tool_request(
                 id,
@@ -4516,6 +4747,90 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("completed") && lines[0].contains("deck-1"));
         assert!(lines[1].contains("document deck-1") && lines[1].contains("still running"));
+        // The first task has its result; the follow-up still runs.
+        assert_eq!(running_editor_task_keys(&messages, &tools), vec!["fix".to_string()]);
+    }
+
+    #[test]
+    fn a_started_editor_task_runs_until_its_delivered_result() {
+        let delegate = "cortex_document__delegate_editor_task";
+        let started = || {
+            let mut result = CallToolResult::success(vec![ContentBlock::text("queued")]);
+            result.structured_content =
+                Some(serde_json::json!({ "interrupted": true, "job_id": "job-1" }));
+            result
+        };
+        let delivered = || {
+            let mut message = Message::user()
+                .with_text("Your editor task notes finished.")
+                .with_visibility(false, true);
+            message.metadata.set_operation_note(
+                crate::session::EDITOR_RESULT_NOTE,
+                "v1",
+                serde_json::json!({
+                    "idempotency_key": "notes",
+                    "receipt": {
+                        "job_id": "job-1", "status": "completed", "summary": "Notes",
+                        "document_id": "doc-1", "document_revision": 2,
+                    },
+                }),
+            );
+            message
+        };
+        let tools = [delegate.to_string()];
+        let mut messages = vec![
+            Message::assistant().with_tool_request(
+                "c1",
+                Ok(rmcp::model::CallToolRequestParams::new(delegate.to_string()).with_arguments(
+                    serde_json::json!({"editor": "quire", "instruction": "Write", "idempotency_key": "notes"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )),
+            ),
+            Message::user().with_tool_response("c1", Ok(started())),
+        ];
+        assert_eq!(running_editor_task_keys(&messages, &tools), vec!["notes".to_string()]);
+        let lines = artifact_result_lines(&messages, &tools);
+        assert!(lines[0].contains("still running"), "{lines:?}");
+
+        messages.push(delivered());
+        assert!(running_editor_task_keys(&messages, &tools).is_empty());
+        let lines = artifact_result_lines(&messages, &tools);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("completed") && lines[0].contains("doc-1"));
+    }
+
+    #[tokio::test]
+    async fn a_specialist_wait_is_offered_with_editor_tools_and_refuses_with_nothing_to_wait_for() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let child = reliability_child(&client, &parent, "document:doc", None).await;
+        let listed = |result: ListToolsResult| result.tools.iter().any(|tool| tool.name == "wait");
+        assert!(!listed(client.list_tools(&child, None, CancellationToken::new()).await.unwrap()));
+
+        let mut session = manager.get_session(&child, false).await.unwrap();
+        let mut policy = SummonTaskPolicy::from_session(&session).unwrap();
+        policy.artifact_result_tools = vec!["cortex_document__delegate_editor_task".to_string()];
+        session.extension_data.set_extension_state(
+            "summon",
+            "v1",
+            serde_json::to_value(policy).unwrap(),
+        );
+        manager
+            .update(&child)
+            .extension_data(session.extension_data)
+            .apply()
+            .await
+            .unwrap();
+        assert!(listed(client.list_tools(&child, None, CancellationToken::new()).await.unwrap()));
+
+        let ctx = ToolCallContext::new(child.clone(), None, None);
+        let refused = client
+            .call_tool(&ctx, "wait", None, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(refused.is_error.unwrap_or(false));
+        assert!(!tool_result_ends_turn(&refused));
     }
 
     #[test]

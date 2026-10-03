@@ -209,36 +209,69 @@ from the turn: when a task ended while others still run, it asks for a brief
 status of every requested artifact before `wait`; when the turn carries only a
 child's question, it asks for an answer through `send` and a silent `wait`.
 
-A child blocked in a long wait cannot read its mailbox until the call returns.
-An MCP tool can declare `goose.interruptOnMessage` (a notice text) in its
-definition `_meta`; while such a call runs, a newer parent message or a waking
-channel notice makes the call yield. The call is detached rather than cancelled, so the work it started
-keeps running, and the tool result is the declared notice with
-`structuredContent: {"interrupted": true}` and `goose.interrupted` metadata. The
-child reads the message at its next checkpoint and can wait again. Cancelling
-the task still cancels the call. The call runs as its own task but keeps the
-caller's tool span and session, so its MCP request still carries the tool
-span's `traceparent` and the server's spans stay beneath that tool. Cortex declares this on its specialists'
-editor waits, so coordinator guidance reaches a specialist while its editor
-works; the artifact-results report treats an interrupted wait as superseded by
-a later wait for the same editor task.
+A child blocked in a long tool call cannot read its mailbox until the call
+returns. An MCP tool can declare `goose.interruptOnMessage` (a notice text) in
+its definition `_meta`; while such a call runs, a newer parent message or a
+waking task notice makes the call yield. The call is detached rather than
+cancelled, so the work it started keeps running, and the tool result is the
+declared notice with `structuredContent: {"interrupted": true}` and
+`goose.interrupted` metadata. The child reads the message at its next
+checkpoint. Cancelling the task still cancels the call. The call runs as its
+own task but keeps the caller's tool span and session, so its MCP request still
+carries the tool span's `traceparent` and the server's spans stay beneath that
+tool.
 
-### Channel notices
+A tool server can mark its own result the same way (`goose.interrupted`
+metadata, or `structuredContent` with `"interrupted": true`, which may carry
+more keys such as a job ID) to say the work it started keeps running; Cortex
+marks a started editor task so. The artifact-results report treats such a
+result as superseded by a later result for the same task (by
+`idempotency_key`), and reports the editor as still running otherwise. A
+subagent whose latest result for an editor task (one of its source's
+`artifact_result_tools`) says it still runs is not allowed to finish: Goose
+adds a reminder to wait, at most three times (`running_editor_tasks`, checked
+in the agent loop before it exits).
+
+A subagent whose source lists `artifact_result_tools` also gets `summon.wait`
+(listed only to it; a parent's `wait` is the one above). It blocks without
+ending the turn until the task's mailbox holds something that should wake it
+(`MailboxMessage::interrupts_wait`): a parent message or a task notice with
+`wake`, such as an editor result. Goose delivers that at the checkpoint right
+after the wait's result. `timeout_s` defaults to 120 and is at most 600. It is
+refused when the task has nothing to wait for: no editor task still running
+and no channel notice ever delivered. The task never polls: whatever arrives
+while it is awake reaches it at its next checkpoint.
+
+When a subagent's run ends (finished, failed or cancelled), Goose sends each of
+its MCP tool servers the notification `notifications/goose/task_ended` with
+`{"taskId": <task session ID>}`, so the server can stop work the task started
+(Cortex cancels its queued or running editor tasks) and settle what it owed
+others. It is best effort: a server that misses it must still bound that work.
+
+### Task notices
 
 A tool server can reach a running delegated task directly with
 `_goose/unstable/attempt/task-notice`: it names the attempt and the task by ID
 or by the artifact key it was delegated with, and queues text in that task's
 mailbox as a `channel` message. The task reads it at its next checkpoint like
-parent guidance and cannot finish before reading it. `wake` also ends an
-interruptible wait, and `refreshTools` makes the task list its tools again
-before its next model call, so tools a server shows only to some tasks (such as
-Cortex channel tools, shown only to channel members) appear mid-task. Both
-agent loops honor it. A task whose terminal report is already queued, or that
-does not exist in the attempt, is reported `not_running` and receives nothing.
-Artifact keys are compared as Goose stores them at delegation, with whitespace
-collapsed and lowercased (`session::normalize_artifact_key`), so a caller's
-casing never matters. `dedupeKey` makes a retried notice idempotent. Cortex uses this for specialist
-channels; see `specialist_communications.md` in the Cortex harness.
+parent guidance and cannot finish before reading it. `wake` also ends a wait,
+and `refreshTools` makes the task list its tools again before its next model
+call, so tools a server shows only to some tasks (such as Cortex channel tools,
+shown only to channel members) appear mid-task. Both agent loops honor it. A
+task whose terminal report is already queued, or that does not exist in the
+attempt, is reported `not_running` and receives nothing. Artifact keys are
+compared as Goose stores them at delegation, with whitespace collapsed and
+lowercased (`session::normalize_artifact_key`), so a caller's casing never
+matters. `dedupeKey` makes a retried notice idempotent.
+
+`editorResult` (`{"idempotency_key", "receipt"}`, at most 16 KiB) delivers the
+result of an editor task the recipient started. The delivered message keeps it
+as an operation note (`editor_result`/`v1`, never sent to providers), and the
+artifact-results report and the finish guard read it as that task's result, as
+if the task had called the first of its `artifact_result_tools` again and
+received the receipt. Every delivered notice also carries a `mailbox`/`kind`
+note (`channel` or `editor_result`). Cortex uses notices for editor results and
+specialist channels; see `specialist_communications.md` in the Cortex harness.
 
 `delegate` checks `previous_task_id` before anything looks it up. A value that
 cannot name an earlier task for the artifact (none exists in this session) is

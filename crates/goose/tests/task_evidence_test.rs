@@ -698,6 +698,7 @@ async fn channel_notices_reach_only_the_running_task_holding_the_artifact() {
         wake: true,
         refresh_tools: true,
         dedupe_key: Some(dedupe.into()),
+        editor_result: None,
     };
 
     // The coordinator's casing and spacing still reach the task Goose stored as "new:document:notes".
@@ -719,6 +720,42 @@ async fn channel_notices_reach_only_the_running_task_holding_the_artifact() {
     assert_eq!(
         pending[0].prompt().unwrap().as_concat_text(),
         "You were added to channel numina."
+    );
+
+    // An editor result rides on a notice to the task by ID; a malformed one is refused.
+    let result = |editor_result: serde_json::Value| TaskNoticeRequest {
+        task_id: Some(task.clone()),
+        artifact_keys: Vec::new(),
+        text: "Your editor task 'notes' ended: completed.".into(),
+        refresh_tools: false,
+        dedupe_key: Some("editor:job-1".into()),
+        editor_result: Some(editor_result),
+        ..notice(&[], "unused")
+    };
+    assert!(f
+        .manager
+        .queue_task_notice(&result(json!({"idempotency_key": "notes"})))
+        .await
+        .is_err());
+    let delivered = f
+        .manager
+        .queue_task_notice(&result(
+            json!({"idempotency_key": "notes", "receipt": {"job_id": "job-1", "status": "completed"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delivered.status, TaskNoticeStatus::Queued);
+    let pending = f.manager.pending_session_messages(&task).await.unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(pending[1].interrupts_wait() && !pending[1].refreshes_tools());
+    assert_eq!(
+        pending[1]
+            .prompt()
+            .unwrap()
+            .metadata
+            .operation_note(goose::session::EDITOR_RESULT_NOTE, "v1")
+            .and_then(|value| value.get("idempotency_key")),
+        Some(&json!("notes"))
     );
 
     let elsewhere = f

@@ -170,10 +170,12 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .iter_mut()
             .find(|extension| extension.name() == "summon")
         {
-            if !available_tools.is_empty()
-                && !available_tools.iter().any(|tool| tool == "message_parent")
-            {
-                available_tools.push("message_parent".to_string());
+            // Summon lists wait only to a specialist that starts editor tasks.
+            for tool in ["message_parent", "wait"] {
+                if !available_tools.is_empty() && !available_tools.iter().any(|name| name == tool)
+                {
+                    available_tools.push(tool.to_string());
+                }
             }
         } else {
             task_config
@@ -183,7 +185,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                     description: String::new(),
                     display_name: None,
                     bundled: None,
-                    available_tools: vec!["message_parent".to_string()],
+                    available_tools: vec!["message_parent".to_string(), "wait".to_string()],
                 });
         }
 
@@ -267,42 +269,65 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .await
             .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
 
-        while let Some(message_result) = stream.next().await {
-            match message_result {
-                Ok(AgentEvent::Message(msg)) => {
-                    if let Some(ref callback) = on_message {
-                        callback(&msg);
-                    }
-                    if let Some(ref tx) = notification_tx {
-                        for content in &msg.content {
-                            if let Some(notif) = create_tool_notification(content, &session_id) {
-                                if tx.send(notif).is_err() {
-                                    debug!(
-                                        "Notification receiver dropped for subagent {}",
-                                        session_id
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    conversation.push(msg);
-                }
-                Ok(AgentEvent::Usage(_)) => {}
-                Ok(AgentEvent::MessageUsage { .. }) => {}
-                Ok(AgentEvent::McpNotification(_)) => {}
-                Ok(AgentEvent::HistoryReplaced(updated_conversation)) => {
-                    conversation = updated_conversation;
-                }
-                Err(e) => {
-                    return Err(anyhow!("Subagent stream failed: {e}"));
-                }
-            }
-        }
+        let streamed = stream_subagent_messages(
+            &mut stream,
+            &session_id,
+            on_message.as_ref(),
+            notification_tx.as_ref(),
+            &mut conversation,
+        )
+        .await;
+        drop(stream);
+        // The task's tool servers stop the work it started (such as editor
+        // tasks) and settle what it owed others.
+        agent
+            .extension_manager
+            .notify_task_ended(&session_id)
+            .await;
+        streamed?;
 
         let final_output = get_final_output(&agent, has_response_schema).await;
 
         Ok((conversation, final_output))
     })
+}
+
+async fn stream_subagent_messages(
+    stream: &mut (impl futures::Stream<Item = Result<AgentEvent>> + Unpin),
+    session_id: &str,
+    on_message: Option<&OnMessageCallback>,
+    notification_tx: Option<&tokio::sync::mpsc::UnboundedSender<ServerNotification>>,
+    conversation: &mut Conversation,
+) -> Result<()> {
+    while let Some(message_result) = stream.next().await {
+        match message_result {
+            Ok(AgentEvent::Message(msg)) => {
+                if let Some(callback) = on_message {
+                    callback(&msg);
+                }
+                if let Some(tx) = notification_tx {
+                    for content in &msg.content {
+                        if let Some(notif) = create_tool_notification(content, session_id) {
+                            if tx.send(notif).is_err() {
+                                debug!("Notification receiver dropped for subagent {}", session_id);
+                            }
+                        }
+                    }
+                }
+                conversation.push(msg);
+            }
+            Ok(AgentEvent::Usage(_)) => {}
+            Ok(AgentEvent::MessageUsage { .. }) => {}
+            Ok(AgentEvent::McpNotification(_)) => {}
+            Ok(AgentEvent::HistoryReplaced(updated_conversation)) => {
+                *conversation = updated_conversation;
+            }
+            Err(e) => {
+                return Err(anyhow!("Subagent stream failed: {e}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn build_subagent_prompt(

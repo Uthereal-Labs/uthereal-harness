@@ -2836,6 +2836,20 @@ impl ExtensionManager {
         }
     }
 
+    /// Tell every tool server of this agent that the task `session_id` ended.
+    pub async fn notify_task_ended(&self, session_id: &str) {
+        let clients: Vec<_> = self
+            .extensions
+            .lock()
+            .await
+            .values()
+            .map(|extension| extension.get_client())
+            .collect();
+        for client in clients {
+            client.notify_task_ended(session_id).await;
+        }
+    }
+
     pub async fn shutdown_session(&self, session_id: &str) -> anyhow::Result<()> {
         let clients: Vec<_> = self
             .extensions
