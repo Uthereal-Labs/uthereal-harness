@@ -211,8 +211,8 @@ child's question, it asks for an answer through `send` and a silent `wait`.
 
 A child blocked in a long wait cannot read its mailbox until the call returns.
 An MCP tool can declare `goose.interruptOnMessage` (a notice text) in its
-definition `_meta`; while such a call runs, a newer parent message makes the
-call yield. The call is detached rather than cancelled, so the work it started
+definition `_meta`; while such a call runs, a newer parent message or a waking
+channel notice makes the call yield. The call is detached rather than cancelled, so the work it started
 keeps running, and the tool result is the declared notice with
 `structuredContent: {"interrupted": true}` and `goose.interrupted` metadata. The
 child reads the message at its next checkpoint and can wait again. Cancelling
@@ -222,6 +222,23 @@ span's `traceparent` and the server's spans stay beneath that tool. Cortex decla
 editor waits, so coordinator guidance reaches a specialist while its editor
 works; the artifact-results report treats an interrupted wait as superseded by
 a later wait for the same editor task.
+
+### Channel notices
+
+A tool server can reach a running delegated task directly with
+`_goose/unstable/attempt/task-notice`: it names the attempt and the task by ID
+or by the artifact key it was delegated with, and queues text in that task's
+mailbox as a `channel` message. The task reads it at its next checkpoint like
+parent guidance and cannot finish before reading it. `wake` also ends an
+interruptible wait, and `refreshTools` makes the task list its tools again
+before its next model call, so tools a server shows only to some tasks (such as
+Cortex channel tools, shown only to channel members) appear mid-task. Both
+agent loops honor it. A task whose terminal report is already queued, or that
+does not exist in the attempt, is reported `not_running` and receives nothing.
+Artifact keys are compared as Goose stores them at delegation, with whitespace
+collapsed and lowercased (`session::normalize_artifact_key`), so a caller's
+casing never matters. `dedupeKey` makes a retried notice idempotent. Cortex uses this for specialist
+channels; see `specialist_communications.md` in the Cortex harness.
 
 `delegate` checks `previous_task_id` before anything looks it up. A value that
 cannot name an earlier task for the artifact (none exists in this session) is

@@ -1319,7 +1319,7 @@ impl SummonClient {
         let key = params
                 .artifact_key
                 .as_deref()
-                .map(|key| key.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
+                .map(crate::session::normalize_artifact_key)
                 .filter(|key| {
                     key.strip_prefix("document:").is_some_and(|id| !id.is_empty())
                         || key.strip_prefix(new_prefix.as_str()).is_some_and(|title| !title.is_empty())

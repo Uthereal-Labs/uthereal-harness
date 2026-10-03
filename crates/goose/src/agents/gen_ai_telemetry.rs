@@ -15,6 +15,7 @@ pub(super) fn capture_message_content() -> bool {
 
 pub(super) use goose_agent::telemetry::{
     append_message, input_messages_with_system_json, output_message_json, system_instructions_json,
+    tool_definitions_json,
 };
 
 pub(super) fn simple_input_json(text: &str) -> String {

@@ -136,6 +136,17 @@ impl GooseAcpAgent {
             .internal_err_ctx("Failed to read task evidence")
     }
 
+    #[custom_method(TaskNoticeRequest)]
+    async fn dispatch_task_notice(
+        &self,
+        req: TaskNoticeRequest,
+    ) -> Result<TaskNoticeResponse, agent_client_protocol::Error> {
+        self.session_manager
+            .queue_task_notice(&req)
+            .await
+            .internal_err_ctx("Failed to queue task notice")
+    }
+
     #[custom_method(PromptAttemptTranscriptRequest)]
     async fn dispatch_prompt_attempt_transcript(
         &self,

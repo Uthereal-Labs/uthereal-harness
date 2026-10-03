@@ -12,6 +12,7 @@ mod prompt_attempt;
 pub mod session_manager;
 mod session_naming;
 mod task_evidence;
+pub use task_evidence::normalize_artifact_key;
 
 pub use diagnostics::{
     config_path, generate_diagnostics, get_system_info, latest_llm_log_path, read_capped,
@@ -23,7 +24,7 @@ pub use export_markdown::{
     export_session_to_markdown, message_to_markdown, user_projected_message_to_markdown,
 };
 pub use extension_data::{EnabledExtensionsState, ExtensionData, ExtensionState, TodoState};
-pub use mailbox::{MailboxMessage, MailboxMessageKind};
+pub use mailbox::{ChannelNotice, MailboxMessage, MailboxMessageKind};
 pub use session_manager::{
     Session, SessionInsights, SessionManager, SessionNameUpdate, SessionType, SessionUpdateBuilder,
 };

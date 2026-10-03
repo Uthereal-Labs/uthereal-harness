@@ -415,6 +415,43 @@ pub struct TaskEvidenceResponse {
     pub evidence_complete: bool,
 }
 
+/// Queue a channel notice for the running task of an attempt that holds one of
+/// the given artifacts (or has the given task ID). The task reads it at its next
+/// checkpoint; `wake` also ends an interruptible wait, and `refresh_tools`
+/// re-lists the task's tools first (for example after it joins a channel).
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/attempt/task-notice", response = TaskNoticeResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskNoticeRequest {
+    pub attempt_key: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub artifact_keys: Vec<String>,
+    pub text: String,
+    #[serde(default)]
+    pub wake: bool,
+    #[serde(default)]
+    pub refresh_tools: bool,
+    /// Makes a retried notice idempotent for its recipient.
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskNoticeStatus {
+    Queued,
+    NotRunning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskNoticeResponse {
+    pub status: TaskNoticeStatus,
+    pub task_id: Option<String>,
+}
+
 /// Get a diagnostic report for a session.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
 #[request(

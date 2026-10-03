@@ -16,6 +16,22 @@ pub enum MailboxMessageKind {
     Message,
     Completion,
     Steering,
+    /// A channel notice from the tool server; its body is a [`ChannelNotice`].
+    Channel,
+}
+
+/// News from a channel the task belongs to, queued by the tool server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelNotice {
+    pub text: String,
+    /// End an interruptible wait (a question or request addressed to the task,
+    /// a change to a facet it watches, or its own join).
+    #[serde(default)]
+    pub wake: bool,
+    /// Re-list the task's tools before its next model call.
+    #[serde(default)]
+    pub refresh_tools: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -34,6 +50,13 @@ impl MailboxMessage {
         if self.kind == MailboxMessageKind::Steering {
             return Ok(serde_json::from_str(&self.body)?);
         }
+        if self.kind == MailboxMessageKind::Channel {
+            let notice: ChannelNotice = serde_json::from_str(&self.body)?;
+            return Ok(Message::user()
+                .with_text(notice.text)
+                .with_visibility(false, true)
+                .with_steer());
+        }
         Ok(Message::user()
             .with_text(format!(
                 "Message from parent task {}:\n\n{}",
@@ -41,6 +64,29 @@ impl MailboxMessage {
             ))
             .with_visibility(false, true)
             .with_steer())
+    }
+
+    pub fn channel_notice(&self) -> Option<ChannelNotice> {
+        if self.kind != MailboxMessageKind::Channel {
+            return None;
+        }
+        serde_json::from_str(&self.body).ok()
+    }
+
+    /// Whether this message ends an interruptible tool wait: a parent message,
+    /// or a channel notice that asks to wake the task.
+    pub fn interrupts_wait(&self) -> bool {
+        match self.kind {
+            MailboxMessageKind::Message => true,
+            MailboxMessageKind::Channel => self.channel_notice().is_some_and(|notice| notice.wake),
+            MailboxMessageKind::Completion | MailboxMessageKind::Steering => false,
+        }
+    }
+
+    /// Whether delivering this message should re-list the recipient's tools.
+    pub fn refreshes_tools(&self) -> bool {
+        self.channel_notice()
+            .is_some_and(|notice| notice.refresh_tools)
     }
 
     pub fn task_outcome(&self) -> Result<Option<TaskOutcome>> {
@@ -61,6 +107,7 @@ impl MailboxMessage {
                     MailboxMessageKind::Message => "Question",
                     MailboxMessageKind::Completion => "Completion",
                     MailboxMessageKind::Steering => "User guidance",
+                    MailboxMessageKind::Channel => "Channel notice",
                 };
                 format!(
                     "{label} from task {}:\n{}",
@@ -396,7 +443,7 @@ mod tests {
 
     use crate::config::GooseMode;
     use crate::conversation::message::Message;
-    use crate::session::{MailboxMessageKind, SessionManager, SessionType};
+    use crate::session::{MailboxMessage, MailboxMessageKind, SessionManager, SessionType};
 
     async fn create_session(
         manager: &SessionManager,
@@ -413,6 +460,32 @@ mod tests {
             .await
             .unwrap()
             .id
+    }
+
+    #[test]
+    fn channel_notices_wake_and_refresh_tools_only_when_asked() {
+        let message = |kind: MailboxMessageKind, body: &str| MailboxMessage {
+            id: 1,
+            sender_session_id: "parent".into(),
+            recipient_session_id: "child".into(),
+            kind,
+            body: body.into(),
+            outcome_json: None,
+            created_at: chrono::Utc::now(),
+        };
+        let joined = message(
+            MailboxMessageKind::Channel,
+            r#"{"text":"You were added to channel numina.","wake":true,"refreshTools":true}"#,
+        );
+        assert!(joined.interrupts_wait() && joined.refreshes_tools());
+        let reply = message(
+            MailboxMessageKind::Channel,
+            r#"{"text":"Reply from deck."}"#,
+        );
+        assert!(!reply.interrupts_wait() && !reply.refreshes_tools());
+        assert_eq!(reply.prompt().unwrap().as_concat_text(), "Reply from deck.");
+        assert!(message(MailboxMessageKind::Message, "Use four slides").interrupts_wait());
+        assert!(!message(MailboxMessageKind::Completion, "done").interrupts_wait());
     }
 
     #[tokio::test]

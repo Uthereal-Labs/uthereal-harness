@@ -2,8 +2,8 @@ use goose::config::GooseMode;
 use goose::conversation::message::Message;
 use goose::session::{PromptAttemptLease, SessionManager, SessionType};
 use goose_sdk_types::custom_requests::{
-    PromptAttemptState, TaskAdmission, TaskEvidenceRequest, TaskTerminalStatus,
-    ToolReceiptTransportStatus,
+    PromptAttemptState, TaskAdmission, TaskEvidenceRequest, TaskNoticeRequest, TaskNoticeStatus,
+    TaskTerminalStatus, ToolReceiptTransportStatus,
 };
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use serde_json::{json, Value};
@@ -667,4 +667,75 @@ async fn large_native_review_cannot_crowd_out_compact_terminal_proof() {
         .unwrap();
     assert!(!legacy_task.evidence_complete);
     assert!(legacy_task.receipts[0].structured_result.is_none());
+}
+
+#[tokio::test]
+async fn channel_notices_reach_only_the_running_task_holding_the_artifact() {
+    let f = Fixture::new().await;
+    let task = f.child().await.task_id;
+    let mut data = f
+        .manager
+        .get_session(&task, false)
+        .await
+        .unwrap()
+        .extension_data;
+    data.set_extension_state(
+        "summon",
+        "v1",
+        json!({"artifact_key": "new:document:notes"}),
+    );
+    f.manager
+        .update(&task)
+        .extension_data(data)
+        .apply()
+        .await
+        .unwrap();
+    let notice = |keys: &[&str], dedupe: &str| TaskNoticeRequest {
+        attempt_key: f.lease.key.clone(),
+        task_id: None,
+        artifact_keys: keys.iter().map(|key| key.to_string()).collect(),
+        text: "You were added to channel numina.".into(),
+        wake: true,
+        refresh_tools: true,
+        dedupe_key: Some(dedupe.into()),
+    };
+
+    // The coordinator's casing and spacing still reach the task Goose stored as "new:document:notes".
+    let queued = f
+        .manager
+        .queue_task_notice(&notice(&["document:doc-1", "new:document:  Notes "], "c:1"))
+        .await
+        .unwrap();
+    assert_eq!(queued.status, TaskNoticeStatus::Queued);
+    assert_eq!(queued.task_id.as_deref(), Some(task.as_str()));
+    // A retried notice is queued once.
+    f.manager
+        .queue_task_notice(&notice(&["new:document:Notes"], "c:1"))
+        .await
+        .unwrap();
+    let pending = f.manager.pending_session_messages(&task).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].interrupts_wait() && pending[0].refreshes_tools());
+    assert_eq!(
+        pending[0].prompt().unwrap().as_concat_text(),
+        "You were added to channel numina."
+    );
+
+    let elsewhere = f
+        .manager
+        .queue_task_notice(&notice(&["new:document:Other"], "c:2"))
+        .await
+        .unwrap();
+    assert_eq!(elsewhere.status, TaskNoticeStatus::NotRunning);
+
+    f.manager
+        .enqueue_task_outcome(&task, "done", TaskTerminalStatus::Completed)
+        .await
+        .unwrap();
+    let finished = f
+        .manager
+        .queue_task_notice(&notice(&["new:document:Notes"], "c:3"))
+        .await
+        .unwrap();
+    assert_eq!(finished.status, TaskNoticeStatus::NotRunning);
 }

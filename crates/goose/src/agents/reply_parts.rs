@@ -337,6 +337,7 @@ pub(crate) fn prepare_tools_for_provider(
         gen_ai.usage.cache_creation.input_tokens = tracing::field::Empty,
         gen_ai.input.messages = tracing::field::Empty,
         gen_ai.system_instructions = tracing::field::Empty,
+        gen_ai.tool.definitions = tracing::field::Empty,
         gen_ai.output.messages = tracing::field::Empty,
     )
 )]
@@ -397,6 +398,11 @@ pub(crate) async fn stream_response_from_provider_in_span(
         span.record("gen_ai.input.messages", input_messages.as_str());
         let system_instructions = gen_ai_telemetry::system_instructions_json(system_prompt);
         span.record("gen_ai.system_instructions", system_instructions.as_str());
+        // With toolshim the tools travel in the system prompt instead; record
+        // whichever set the model was given.
+        let offered = if toolshim_tools.is_empty() { tools } else { toolshim_tools };
+        let tool_definitions = gen_ai_telemetry::tool_definitions_json(offered);
+        span.record("gen_ai.tool.definitions", tool_definitions.as_str());
     }
 
     // Clone owned data to move into the async stream

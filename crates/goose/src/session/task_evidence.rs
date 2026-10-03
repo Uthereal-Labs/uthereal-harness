@@ -1,8 +1,9 @@
 use super::SessionManager;
 use anyhow::{bail, Result};
 use goose_sdk_types::custom_requests::{
-    TaskAdmission, TaskEvidence, TaskEvidenceRequest, TaskEvidenceResponse, TaskOutcome,
-    TaskTerminalStatus, TaskToolReceipt, ToolReceiptTransportStatus,
+    TaskAdmission, TaskEvidence, TaskEvidenceRequest, TaskEvidenceResponse, TaskNoticeRequest,
+    TaskNoticeResponse, TaskNoticeStatus, TaskOutcome, TaskTerminalStatus, TaskToolReceipt,
+    ToolReceiptTransportStatus,
 };
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
@@ -13,6 +14,18 @@ const TOOL_BLOCK_LIMIT: i64 = 1024;
 const RECEIPT_LIMIT: usize = 128;
 const STRUCTURED_RESULT_LIMIT: usize = 32768;
 const RESPONSE_LIMIT: usize = 262144;
+const NOTICE_TEXT_LIMIT: usize = 65536;
+
+/// The form in which a delegated task's artifact key is stored and compared:
+/// whitespace collapsed and lowercased. Tool servers that name artifacts (such
+/// as Cortex channels) must apply the same normalization.
+pub fn normalize_artifact_key(key: &str) -> String {
+    key.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+const NOTICE_ARTIFACT_KEYS_LIMIT: usize = 4;
 
 impl SessionManager {
     pub async fn capture_task_admission(
@@ -201,6 +214,100 @@ impl SessionManager {
             bail!("Task admission exceeds the task evidence response limit");
         }
         Ok(response)
+    }
+
+    /// Queue a channel notice for the attempt's running task that holds one of
+    /// the requested artifacts (or has the requested ID). A task is running
+    /// until its terminal outcome is queued for its parent; a finished task is
+    /// reported as `not_running` and receives nothing.
+    pub async fn queue_task_notice(
+        &self,
+        request: &TaskNoticeRequest,
+    ) -> Result<TaskNoticeResponse> {
+        if uuid::Uuid::parse_str(&request.attempt_key)?.to_string() != request.attempt_key
+            || request.text.trim().is_empty()
+            || request.text.len() > NOTICE_TEXT_LIMIT
+            || (request.task_id.is_none() && request.artifact_keys.is_empty())
+            || request.artifact_keys.len() > NOTICE_ARTIFACT_KEYS_LIMIT
+            || request
+                .artifact_keys
+                .iter()
+                .any(|key| key.is_empty() || key.len() > 512)
+            || request
+                .dedupe_key
+                .as_deref()
+                .is_some_and(|key| key.is_empty() || key.len() > 200)
+        {
+            bail!("Invalid task notice request");
+        }
+        let pool = self.storage().pool().await?;
+        let binding: Option<(String, String)> = sqlx::query_as(
+            "SELECT session_id, run_id FROM prompt_attempts
+             WHERE attempt_key = ? AND session_id IS NOT NULL AND run_id IS NOT NULL",
+        )
+        .bind(&request.attempt_key)
+        .fetch_optional(pool)
+        .await?;
+        let Some((parent_session_id, parent_run_id)) = binding else {
+            bail!("Attempt does not own a parent session and run");
+        };
+        let task_id: Option<String> = sqlx::query_scalar(
+            r#"SELECT id FROM sessions
+             WHERE parent_session_id = ?
+              AND json_extract(extension_data, '$."summon.task_admission_v1".parentSessionId') = ?
+              AND json_extract(extension_data, '$."summon.task_admission_v1".parentRunId') = ?
+              AND json_extract(extension_data, '$."summon.task_admission_v1".attemptKey') = ?
+              AND json_extract(extension_data, '$."summon.task_admission_v1".taskId') = id
+              AND (id = ? OR json_extract(extension_data, '$."summon.v1".artifact_key') IN (SELECT value FROM json_each(?)))
+              AND NOT EXISTS (
+                SELECT 1 FROM session_mailbox m
+                WHERE m.sender_session_id = sessions.id
+                  AND m.recipient_session_id = sessions.parent_session_id
+                  AND m.kind = 'completion'
+              )
+             ORDER BY created_at DESC, id DESC LIMIT 1"#,
+        )
+        .bind(&parent_session_id)
+        .bind(&parent_session_id)
+        .bind(&parent_run_id)
+        .bind(&request.attempt_key)
+        .bind(request.task_id.as_deref())
+        .bind(serde_json::to_string(
+            &request
+                .artifact_keys
+                .iter()
+                .map(String::as_str)
+                .map(normalize_artifact_key)
+                .collect::<Vec<_>>(),
+        )?)
+        .fetch_optional(pool)
+        .await?;
+        let Some(task_id) = task_id else {
+            return Ok(TaskNoticeResponse {
+                status: TaskNoticeStatus::NotRunning,
+                task_id: None,
+            });
+        };
+        let notice = super::ChannelNotice {
+            text: request.text.clone(),
+            wake: request.wake,
+            refresh_tools: request.refresh_tools,
+        };
+        sqlx::query(
+            "INSERT OR IGNORE INTO session_mailbox
+             (sender_session_id, recipient_session_id, kind, body, dedupe_key)
+             VALUES (?, ?, 'channel', ?, ?)",
+        )
+        .bind(&parent_session_id)
+        .bind(&task_id)
+        .bind(serde_json::to_string(&notice)?)
+        .bind(request.dedupe_key.as_deref())
+        .execute(pool)
+        .await?;
+        Ok(TaskNoticeResponse {
+            status: TaskNoticeStatus::Queued,
+            task_id: Some(task_id),
+        })
     }
 
     async fn task_receipts(
