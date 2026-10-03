@@ -1732,8 +1732,14 @@ impl SummonClient {
         });
         if instructions_required {
             // Every available source is a specialist, so no delegation can
-            // start without the complete task.
+            // start without the complete task. Specialists take no recipe
+            // parameters: without that field, every argument sits at the top
+            // level, where the delegation reads it.
             schema["required"] = serde_json::json!(["instructions"]);
+            schema["additionalProperties"] = serde_json::json!(false);
+            if let Some(properties) = schema["properties"].as_object_mut() {
+                properties.remove("parameters");
+            }
         }
 
         Tool::new(
@@ -2704,6 +2710,12 @@ impl SummonClient {
             .instructions
             .as_deref()
             .is_some_and(|instructions| !instructions.trim().is_empty());
+        if specialist && params.parameters.is_some() {
+            return Err(
+                "Specialists take no parameters: pass instructions, artifact_key and the other fields at the top level of delegate."
+                    .to_string(),
+            );
+        }
         if specialist && !has_instructions {
             return Err(format!(
                 "Delegation to {} requires instructions with the complete task: the requested outcome and the user's requirements for this deliverable, plus any Research-dependent and Evidence IDs lines. The specialist starts from these instructions; send is only for steering it after it is running.",
@@ -6163,11 +6175,15 @@ You review code."#;
                 .get("required"),
             Some(&serde_json::json!(["instructions"]))
         );
-        assert!(client
-            .create_delegate_tool(false)
-            .input_schema
-            .get("required")
-            .is_none());
+        let specialist_schema = client.create_delegate_tool(true).input_schema;
+        assert_eq!(
+            specialist_schema.get("additionalProperties"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(specialist_schema["properties"].get("parameters").is_none());
+        let general_schema = client.create_delegate_tool(false).input_schema;
+        assert!(general_schema.get("required").is_none());
+        assert!(general_schema["properties"].get("parameters").is_some());
     }
 
     #[test]
