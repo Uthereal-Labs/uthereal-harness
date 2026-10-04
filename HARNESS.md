@@ -169,8 +169,10 @@ tool/context routing policies, not filesystem or operating-system sandboxes.
 
 - `summon.delegate` returns the native child session ID for background work.
 - `summon.send(task_id, message)` queues guidance for that running child.
-- `summon.message_parent(message)` lets a child send an update or question. Its
-  recipient is derived from the stored parent relationship, not model input.
+- `summon.message_parent(message)` lets a child ask its parent a question; a
+  message that asks none is refused (`asks_question`), since progress and
+  results reach the parent in the final report. Its recipient is derived from
+  the stored parent relationship, not model input.
 - `summon.load(source: task_id, peek: true)` inspects progress; its existing
   cancellation option stops the task.
 
@@ -212,6 +214,19 @@ child's question, it asks for an answer through `send` and a silent `wait`.
 A `send` to a task that has finished or is not running fails with how to
 continue its work: delegate it again with `previous_task_id` set to that task
 and an instruction that includes the message (`redelegate_hint`).
+
+A `delegate` whose `source` is unknown fails with the sources the caller can
+delegate to (agents and recipes). One that writes delegate's own fields
+(`instructions`, `source`, `artifact_key` and the like) inside `parameters`
+fails with the top-level shape to use, when the call has no `source` or nests
+`instructions` or `artifact_key`; a recipe's own parameter that shares a name
+is left alone. An empty `parameters: {}` is treated as absent.
+
+A source can set `connect_tool` and `connect_reminder`. When a delegation of it
+leaves the parent with two or more running artifact tasks and the parent has
+never called `connect_tool`, the delegate result adds `connect_reminder`, once
+per parent session (`connect_reminder`). Cortex uses it to remind the
+coordinator that artifacts that depend on each other can be connected.
 
 A child blocked in a long tool call cannot read its mailbox until the call
 returns. An MCP tool can declare `goose.interruptOnMessage` (a notice text) in

@@ -64,6 +64,11 @@ const SPECIALIST_WAIT_DEFAULT_SECS: u64 = 120;
 const SPECIALIST_WAIT_MAX_SECS: u64 = 180;
 const SPECIALIST_WAIT_POLL: Duration = Duration::from_millis(250);
 
+/// Whether a message to the parent asks something (message_parent is for questions only).
+fn asks_question(message: &str) -> bool {
+    message.contains(['?', '\u{FF1F}', '\u{061F}'])
+}
+
 /// How the parent continues a specialist that can no longer receive messages.
 fn redelegate_hint(task_id: &str) -> String {
     format!("A message cannot reach it. To have its work continue, delegate it again with previous_task_id set to '{task_id}' and an instruction that includes what you meant to send.")
@@ -282,6 +287,61 @@ impl NotificationSink {
             Self::Emitter(_) => 0,
         }
     }
+}
+
+/// Fields of delegate itself that a model sometimes nests under `parameters`.
+const DELEGATE_TOP_LEVEL_FIELDS: &[&str] = &[
+    "instructions",
+    "source",
+    "artifact_key",
+    "artifact_title",
+    "previous_task_id",
+    "context",
+    "async",
+    "max_turns",
+];
+
+/// Delegate fields passed inside `parameters`, with the shape delegate expects.
+fn nested_delegate_fields_error(params: &DelegateParams) -> Option<String> {
+    let parameters = params.parameters.as_ref()?;
+    let nested: Vec<&str> = DELEGATE_TOP_LEVEL_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| parameters.contains_key(*field))
+        .collect();
+    // A recipe source may declare a parameter that shares a name; delegate's
+    // own fields are only assumed when the call cannot work without them.
+    let misplaced = params.source.is_none()
+        || nested.contains(&"instructions")
+        || nested.contains(&"artifact_key");
+    if nested.is_empty() || !misplaced {
+        return None;
+    }
+    Some(format!(
+        "{} {} of delegate itself, not of parameters: pass {} at the top level, for example delegate({{\"source\": \"<specialist>\", \"instructions\": \"<complete task>\", \"artifact_key\": \"<key>\"}}). parameters is only for a recipe source's own declared parameters.",
+        nested.join(", "),
+        if nested.len() == 1 {
+            "is a field"
+        } else {
+            "are fields"
+        },
+        if nested.len() == 1 { "it" } else { "them" },
+    ))
+}
+
+/// An unknown delegate source, with the sources that can be delegated to.
+fn unknown_delegate_source_error(source_name: &str, available: &[String]) -> String {
+    if available.is_empty() {
+        return format!(
+            "Source '{}' not found, and no source can be delegated to here. Delegate with instructions only.",
+            source_name
+        );
+    }
+    format!(
+        "Source '{}' not found. Pass one of the sources you can delegate to: {}.",
+        source_name,
+        available.join(", ")
+    )
 }
 
 fn merge_subrecipe_parameters(
@@ -1081,8 +1141,7 @@ fn with_delivered_editor_results(messages: &[Message], tools: &[String]) -> Vec<
             Ok(rmcp::model::CallToolRequestParams::new(tool.clone()).with_arguments(arguments)),
         ));
         normalized.push(
-            Message::user()
-                .with_tool_response(id, Ok(CallToolResult::structured(receipt.clone()))),
+            Message::user().with_tool_response(id, Ok(CallToolResult::structured(receipt.clone()))),
         );
     }
     normalized
@@ -1227,8 +1286,7 @@ fn running_editor_task_keys(messages: &[Message], tools: &[String]) -> Vec<Strin
             match content {
                 MessageContent::ToolRequest(request) => {
                     if let Ok(call) = &request.tool_call {
-                        if tools.iter().any(|tool| call.name == tool.as_str())
-                        {
+                        if tools.iter().any(|tool| call.name == tool.as_str()) {
                             if let Some(key) = call
                                 .arguments
                                 .as_ref()
@@ -1333,6 +1391,8 @@ pub struct SummonClient {
     /// wait refuses while that count is unchanged: nothing reached them and they
     /// did nothing since, so nothing can arrive.
     empty_waits: Mutex<HashMap<String, usize>>,
+    /// Parents already shown a source's connect_reminder.
+    connect_reminded: Mutex<HashSet<String>>,
 }
 
 impl Drop for SummonClient {
@@ -1361,6 +1421,7 @@ impl SummonClient {
             event_driven_parents: Mutex::new(HashSet::new()),
             delivered_reports: Mutex::new(HashMap::new()),
             empty_waits: Mutex::new(HashMap::new()),
+            connect_reminded: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1965,6 +2026,60 @@ impl SummonClient {
         )
     }
 
+    /// The reminder a source asks for, once per parent session, when two or more of
+    /// the parent's artifact tasks are running and it has not called `tool`.
+    async fn connect_reminder(
+        &self,
+        session_id: &str,
+        tool: &str,
+        reminder: String,
+    ) -> Option<String> {
+        let running = {
+            // The same lock order as delegation: artifact tasks, then background tasks.
+            let artifact_tasks = self.artifact_tasks.lock().await;
+            let tasks = self.background_tasks.lock().await;
+            artifact_tasks
+                .iter()
+                .filter(|((parent, _), task_id)| {
+                    parent == session_id
+                        && tasks
+                            .get(*task_id)
+                            .is_some_and(|task| !task.handle.is_finished())
+                })
+                .map(|(_, task_id)| task_id.clone())
+                .collect::<HashSet<_>>()
+                .len()
+        };
+        if running < 2 || self.connect_reminded.lock().await.contains(session_id) {
+            return None;
+        }
+        let session = self
+            .context
+            .session_manager
+            .get_session(session_id, true)
+            .await
+            .ok()?;
+        let called = session.conversation.as_ref().is_some_and(|conversation| {
+            conversation.messages().iter().any(|message| {
+                message.content.iter().any(|content| match content {
+                    MessageContent::ToolRequest(request) => request
+                        .tool_call
+                        .as_ref()
+                        .is_ok_and(|call| call.name == tool),
+                    _ => false,
+                })
+            })
+        });
+        if called {
+            return None;
+        }
+        self.connect_reminded
+            .lock()
+            .await
+            .insert(session_id.to_string());
+        Some(reminder)
+    }
+
     /// Sleep until the specialist's mailbox holds something that should wake
     /// it: an editor result, a coordinator message, or waking channel news.
     /// Goose delivers it at the checkpoint right after this result.
@@ -2073,7 +2188,7 @@ impl SummonClient {
     fn create_message_parent_tool(&self) -> Tool {
         Tool::new(
             "message_parent",
-            "Ask the parent one concrete question without ending this task. Use it only in exceptional cases: when you cannot continue without an answer that only the parent or the user can give. The parent replies through your task. Never use it for progress, results, warnings, or limitations; your final report, including any limitation, is delivered automatically.".to_string(),
+            "Ask the parent one concrete question without ending this task. Use it only in exceptional cases: when you cannot continue without an answer that only the parent or the user can give. The parent replies through your task. Never use it for progress, results, warnings, or limitations; your final report, including any limitation, is delivered automatically. A message that asks no question is refused.".to_string(),
             serde_json::json!({
                 "type": "object",
                 "required": ["message"],
@@ -2748,11 +2863,15 @@ impl SummonClient {
     ) -> Result<CallToolResult, String> {
         self.cleanup_completed_tasks().await;
 
-        let params: DelegateParams = arguments
+        let mut params: DelegateParams = arguments
             .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
             .transpose()
             .map_err(|e| format!("Invalid parameters: {}", e))?
             .unwrap_or_default();
+        // An empty `parameters: {}` passes nothing; treat it as absent.
+        if params.parameters.as_ref().is_some_and(HashMap::is_empty) {
+            params.parameters = None;
+        }
 
         self.validate_delegate_params(&params)?;
 
@@ -2973,6 +3092,9 @@ impl SummonClient {
     }
 
     fn validate_delegate_params(&self, params: &DelegateParams) -> Result<(), String> {
+        if let Some(error) = nested_delegate_fields_error(params) {
+            return Err(error);
+        }
         if params.instructions.is_none() && params.source.is_none() {
             return Err("Must provide 'instructions' or 'source' (or both)".to_string());
         }
@@ -3033,10 +3155,27 @@ impl SummonClient {
         session_id: &str,
         working_dir: &Path,
     ) -> Result<Recipe, String> {
-        let source = self
+        let source = match self
             .resolve_source(session_id, source_name, working_dir)
             .await?
-            .ok_or_else(|| format!("Source '{}' not found", source_name))?;
+        {
+            Some(source) => source,
+            None => {
+                let available: Vec<String> = self
+                    .get_sources(session_id, working_dir)
+                    .await
+                    .into_iter()
+                    .filter(|source| {
+                        matches!(
+                            source.source_type,
+                            SourceType::Agent | SourceType::Recipe | SourceType::Subrecipe
+                        )
+                    })
+                    .map(|source| source.name)
+                    .collect();
+                return Err(unknown_delegate_source_error(source_name, &available));
+            }
+        };
 
         let mut recipe = match source.source_type {
             SourceType::Recipe | SourceType::Subrecipe => {
@@ -3739,6 +3878,18 @@ impl SummonClient {
         };
         let non_blocking = source_flag("non_blocking");
         let event_driven_parent = source_flag("event_driven_parent");
+        let source_text = |name: &str| {
+            source
+                .as_ref()
+                .and_then(|source| source.properties.get(name))
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        // A source can remind its parent, once, to connect artifacts it delegates in
+        // parallel: shown when two or more artifact tasks run and the parent has not
+        // called the connecting tool.
+        let connect_reminder = source_text("connect_reminder").zip(source_text("connect_tool"));
         let artifact_keys = if source_flag("artifact_guard") {
             vec![Self::artifact_key(&params)?]
         } else {
@@ -3908,14 +4059,21 @@ impl SummonClient {
                 .await
                 .insert(session_id.to_string());
         }
+        let reminder = match connect_reminder {
+            Some((reminder, tool)) => self.connect_reminder(session_id, &tool, reminder).await,
+            None => None,
+        };
 
         if event_driven_parent {
-            let content = vec![ContentBlock::text(format!(
+            let mut content = vec![ContentBlock::text(format!(
                 "Task {task_id} started in background: \"{description}\"\n\
                  It already has its complete task and reports back automatically: you are resumed for its terminal report or for a question it asks. \
                  Once you have delegated everything and finished any independent work, tell the user once, in their terms, what you are working on, then call wait. \
                  Use send(task_id: \"{task_id}\", message: \"...\") only to steer it with new guidance or answer its question."
             ))];
+            if let Some(reminder) = reminder {
+                content.push(ContentBlock::text(reminder));
+            }
             return Ok((
                 super::coordinator_fixes::with_correction(content, correction),
                 task_id,
@@ -4109,6 +4267,11 @@ impl McpClientTrait for SummonClient {
                     Ok(params) if params.message.trim().is_empty() => {
                         Ok(CallToolResult::error(vec![ContentBlock::text(
                             "Error: message_parent requires the question to ask.",
+                        )]))
+                    }
+                    Ok(params) if !asks_question(&params.message) => {
+                        Ok(CallToolResult::error(vec![ContentBlock::text(
+                            "Error: message_parent carries only a question the parent must answer, and this message asks none. Progress, results and limitations reach the parent in your final report; continue your work, or ask one concrete question.",
                         )]))
                     }
                     Ok(params) => {
@@ -4791,7 +4954,10 @@ mod tests {
         assert!(lines[0].contains("completed") && lines[0].contains("deck-1"));
         assert!(lines[1].contains("document deck-1") && lines[1].contains("still running"));
         // The first task has its result; the follow-up still runs.
-        assert_eq!(running_editor_task_keys(&messages, &tools), vec!["fix".to_string()]);
+        assert_eq!(
+            running_editor_task_keys(&messages, &tools),
+            vec!["fix".to_string()]
+        );
     }
 
     #[test]
@@ -4833,7 +4999,10 @@ mod tests {
             ),
             Message::user().with_tool_response("c1", Ok(started())),
         ];
-        assert_eq!(running_editor_task_keys(&messages, &tools), vec!["notes".to_string()]);
+        assert_eq!(
+            running_editor_task_keys(&messages, &tools),
+            vec!["notes".to_string()]
+        );
         let lines = artifact_result_lines(&messages, &tools);
         assert!(lines[0].contains("still running"), "{lines:?}");
 
@@ -4849,7 +5018,12 @@ mod tests {
         let (_directory, manager, parent, client) = reliability_fixture().await;
         let child = reliability_child(&client, &parent, "document:doc", None).await;
         let listed = |result: ListToolsResult| result.tools.iter().any(|tool| tool.name == "wait");
-        assert!(!listed(client.list_tools(&child, None, CancellationToken::new()).await.unwrap()));
+        assert!(!listed(
+            client
+                .list_tools(&child, None, CancellationToken::new())
+                .await
+                .unwrap()
+        ));
 
         let mut session = manager.get_session(&child, false).await.unwrap();
         let mut policy = SummonTaskPolicy::from_session(&session).unwrap();
@@ -4865,7 +5039,12 @@ mod tests {
             .apply()
             .await
             .unwrap();
-        assert!(listed(client.list_tools(&child, None, CancellationToken::new()).await.unwrap()));
+        assert!(listed(
+            client
+                .list_tools(&child, None, CancellationToken::new())
+                .await
+                .unwrap()
+        ));
 
         let ctx = ToolCallContext::new(child.clone(), None, None);
         let refused = client
@@ -4905,7 +5084,9 @@ mod tests {
         assert!(format!("{:?}", repeated.content).contains("your last wait ended"));
         let asked = Message::assistant().with_tool_request(
             "ask-1",
-            Ok(rmcp::model::CallToolRequestParams::new("cortex_document__channel_post")),
+            Ok(rmcp::model::CallToolRequestParams::new(
+                "cortex_document__channel_post",
+            )),
         );
         manager.add_message(&child, &asked).await.unwrap();
         let after_asking = client
@@ -4919,6 +5100,14 @@ mod tests {
             .await
             .unwrap();
         assert!(!after_news.is_error.unwrap_or(false));
+    }
+
+    #[test]
+    fn message_parent_accepts_only_questions() {
+        assert!(asks_question(
+            "Should the notes follow the four-slide deck?"
+        ));
+        assert!(!asks_question("I am aligning the notes task now."));
     }
 
     #[test]
@@ -5260,7 +5449,8 @@ mod tests {
                 .unwrap_err();
             assert!(error.contains("requires instructions"), "{error}");
         }
-        let arguments = serde_json::json!({"source":"cortex-slides","artifact_key":"new:slides:quarterly","artifact_title":"Quarterly","instructions":"Create the report.","extensions":[],"async":false}).as_object().unwrap().clone();
+        // An empty `parameters` map is ignored rather than refused for a specialist.
+        let arguments = serde_json::json!({"source":"cortex-slides","artifact_key":"new:slides:quarterly","artifact_title":"Quarterly","instructions":"Create the report.","parameters":{},"extensions":[],"async":false}).as_object().unwrap().clone();
         let first = client
             .handle_delegate(
                 &parent,
@@ -5431,6 +5621,75 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(right.previous_task_id.as_deref(), Some(owner.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_parent_running_two_artifact_tasks_is_reminded_once_to_connect_them() {
+        async fn start(coordinator: &SummonClient, parent: &str, id: &str) {
+            let (handle, completion_token) = spawn_background_task(async move {
+                std::future::pending::<()>().await;
+                Ok("done".to_string())
+            });
+            coordinator.background_tasks.lock().await.insert(
+                id.to_string(),
+                BackgroundTask {
+                    id: id.to_string(),
+                    parent_session_id: parent.to_string(),
+                    non_blocking: true,
+                    completion_delivery_error: Arc::new(Mutex::new(None)),
+                    terminal_status: Arc::new(Mutex::new(None)),
+                    description: id.to_string(),
+                    started_at: Instant::now(),
+                    turns: Arc::new(AtomicU32::new(1)),
+                    last_activity: Arc::new(AtomicU64::new(0)),
+                    handle,
+                    cancellation_token: CancellationToken::new(),
+                    completion_token,
+                    notification_sink: buffered_notification_sink(Vec::new()),
+                },
+            );
+            coordinator.artifact_tasks.lock().await.insert(
+                (parent.to_string(), format!("new:document:{id}")),
+                id.to_string(),
+            );
+        }
+        let (_directory, manager, parent, coordinator) = reliability_fixture().await;
+        let reminder = "Connect them.".to_string();
+        start(&coordinator, &parent, "a").await;
+        assert_eq!(
+            coordinator
+                .connect_reminder(&parent, "connect", reminder.clone())
+                .await,
+            None
+        );
+        start(&coordinator, &parent, "b").await;
+        assert_eq!(
+            coordinator
+                .connect_reminder(&parent, "connect", reminder.clone())
+                .await
+                .as_deref(),
+            Some("Connect them.")
+        );
+        assert_eq!(
+            coordinator
+                .connect_reminder(&parent, "connect", reminder.clone())
+                .await,
+            None
+        );
+
+        // A parent that already called the connecting tool is not reminded.
+        coordinator.connect_reminded.lock().await.clear();
+        let called = Message::assistant().with_tool_request(
+            "connect-1",
+            Ok(rmcp::model::CallToolRequestParams::new("connect")),
+        );
+        manager.add_message(&parent, &called).await.unwrap();
+        assert_eq!(
+            coordinator
+                .connect_reminder(&parent, "connect", reminder)
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -6653,6 +6912,42 @@ You review code."#;
             Some("# Reference Context\n\nbackground info")
         );
         assert_eq!(recipe.prompt.as_deref(), Some("do the task"));
+    }
+
+    #[test]
+    fn test_delegate_fields_nested_under_parameters_get_the_top_level_shape() {
+        let nested = DelegateParams {
+            parameters: Some(HashMap::from([
+                ("source".to_string(), serde_json::json!("writer")),
+                ("instructions".to_string(), serde_json::json!("Write it.")),
+            ])),
+            ..Default::default()
+        };
+        let error = nested_delegate_fields_error(&nested).unwrap();
+        assert!(error.starts_with("instructions, source are fields of delegate itself"));
+        assert!(error.contains("at the top level"));
+
+        // A recipe's own parameter that shares a name is left alone.
+        let recipe = DelegateParams {
+            source: Some("report".to_string()),
+            parameters: Some(HashMap::from([(
+                "context".to_string(),
+                serde_json::json!("quarterly"),
+            )])),
+            ..Default::default()
+        };
+        assert!(nested_delegate_fields_error(&recipe).is_none());
+    }
+
+    #[test]
+    fn test_unknown_delegate_source_lists_the_sources_to_use() {
+        let error = unknown_delegate_source_error(
+            "search_index",
+            &["writer".to_string(), "analyst".to_string()],
+        );
+        assert!(error.starts_with("Source 'search_index' not found."));
+        assert!(error.ends_with("writer, analyst."));
+        assert!(unknown_delegate_source_error("search_index", &[]).contains("instructions only"));
     }
 
     #[test]
