@@ -19,7 +19,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::FutureExt;
 use goose_agent::operation::messages_since_kickoff;
-use goose_sdk_types::custom_requests::{SourceEntry, SourceType, TaskTerminalStatus};
+use goose_sdk_types::custom_requests::{
+    ChannelWaitContext, SourceEntry, SourceType, TaskTerminalStatus,
+};
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, InitializeResult, JsonObject, ListToolsResult,
     MetaObject, Role, ServerCapabilities, ServerNotification, Tool,
@@ -1386,11 +1388,6 @@ pub struct SummonClient {
     /// Highest mailbox message ID delivered to each parent's current report
     /// turn. Delivered messages stay pending until the turn is acknowledged.
     delivered_reports: Mutex<HashMap<String, i64>>,
-    /// Specialists whose last wait timed out with no editor task running, with
-    /// how many messages had reached them and tool calls they had made then. A
-    /// wait refuses while that count is unchanged: nothing reached them and they
-    /// did nothing since, so nothing can arrive.
-    empty_waits: Mutex<HashMap<String, usize>>,
     /// Parents already shown a source's connect_reminder.
     connect_reminded: Mutex<HashSet<String>>,
 }
@@ -1420,7 +1417,6 @@ impl SummonClient {
             artifact_tasks: Mutex::new(HashMap::new()),
             event_driven_parents: Mutex::new(HashSet::new()),
             delivered_reports: Mutex::new(HashMap::new()),
-            empty_waits: Mutex::new(HashMap::new()),
             connect_reminded: Mutex::new(HashSet::new()),
         })
     }
@@ -2007,7 +2003,7 @@ impl SummonClient {
     fn create_specialist_wait_tool(&self) -> Tool {
         Tool::new(
             "wait",
-            "Sleep until something needs you: the result of an editor task you started, a message from the coordinator, or channel news that asks for you (a question or request addressed to you, a reply in a thread you opened, a new publish or status of a facet you follow, or that you joined a channel or gained followers). What woke you arrives right after this tool's result. Call it only when you have nothing else to do and one of these can still arrive; never poll, and never wait for followers or members that finished. Other channel news reaches you at your next step without waking you. It is refused when nothing can wake you: no editor task of yours is running and either no channel news has ever reached you or your last wait ended with nothing arriving and nothing has reached you since. On timeout, call it again only while something you wait for can still arrive.".to_string(),
+            "Wait for an outstanding dependency: an editor task you started, the first publication from a live member you follow, a reply to your open channel question/request, or an answer to a successfully sent message_parent question. Already-pending coordinator or waking channel news is delivered immediately. What woke you arrives after this result. A channel membership, followers, an unrelated tool call, or a plan you already received does not permit waiting. If you need a further publication, ask its owner with channel_post kind ask first. Never wait for followers, rendering by another member, or finished members. Once your editor results have been reviewed and channel obligations answered, write your final report. On timeout, wait again only for a dependency still outstanding.".to_string(),
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2080,6 +2076,92 @@ impl SummonClient {
         Some(reminder)
     }
 
+    fn parent_reply_pending(messages: &[Message]) -> bool {
+        let mut questions = HashSet::new();
+        let mut pending = false;
+        for message in messages {
+            if message
+                .metadata
+                .operation_note(crate::session::MAILBOX_NOTE, "kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("message")
+            {
+                pending = false;
+                questions.clear();
+            }
+            for content in &message.content {
+                match content {
+                    MessageContent::ToolRequest(request)
+                        if request
+                            .tool_call
+                            .as_ref()
+                            .is_ok_and(|call| call.name == "message_parent") =>
+                    {
+                        questions.insert(request.id.as_str());
+                    }
+                    MessageContent::ToolResponse(response)
+                        if questions.contains(response.id.as_str())
+                            && response
+                                .tool_result
+                                .as_ref()
+                                .is_ok_and(|result| result.is_error != Some(true)) =>
+                    {
+                        pending = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        pending
+    }
+
+    fn channel_wait_contexts(messages: &[Message]) -> HashMap<String, ChannelWaitContext> {
+        let mut contexts: HashMap<String, ChannelWaitContext> = HashMap::new();
+        let mut record = |context: ChannelWaitContext| {
+            // A queued notice may be delivered after a newer MCP read. The log
+            // position orders transport snapshots, not facet/artifact freshness.
+            if contexts
+                .get(&context.channel_id)
+                .is_none_or(|current| context.sequence >= current.sequence)
+            {
+                contexts.insert(context.channel_id.clone(), context);
+            }
+        };
+        for message in messages {
+            if let Some(value) = message.metadata.operation_note(
+                crate::session::MAILBOX_NOTE,
+                crate::session::CHANNEL_WAIT_META_KEY,
+            ) {
+                if let Ok(context) = serde_json::from_value(value.clone()) {
+                    record(context);
+                }
+            }
+            for content in &message.content {
+                if let MessageContent::ToolResponse(response) = content {
+                    if let Ok(result) = &response.tool_result {
+                        if result.is_error == Some(true) {
+                            continue;
+                        }
+                        if let Some(value) = result
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.0.get(crate::session::CHANNEL_WAIT_META_KEY))
+                        {
+                            if let Ok(updates) =
+                                serde_json::from_value::<Vec<ChannelWaitContext>>(value.clone())
+                            {
+                                for context in updates {
+                                    record(context);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        contexts
+    }
+
     /// Sleep until the specialist's mailbox holds something that should wake
     /// it: an editor result, a coordinator message, or waking channel news.
     /// Goose delivers it at the checkpoint right after this result.
@@ -2108,43 +2190,14 @@ impl SummonClient {
             .map(|conversation| conversation.messages().to_vec())
             .unwrap_or_default();
         let running = running_editor_tasks(&session, &messages);
-        let in_channel = messages.iter().any(|message| {
-            message
-                .metadata
-                .operation_note(crate::session::MAILBOX_NOTE, "kind")
-                .and_then(serde_json::Value::as_str)
-                == Some("channel")
-        });
-        // What has happened to the specialist: messages that reached it (mailbox
-        // deliveries and coordinator messages) and tool calls it made other than
-        // wait, such as a question to another member.
-        let arrivals = messages
-            .iter()
-            .map(|message| {
-                usize::from(message.metadata.steer)
-                    + message
-                        .content
-                        .iter()
-                        .filter(|content| match content {
-                            MessageContent::ToolRequest(request) => request
-                                .tool_call
-                                .as_ref()
-                                .is_ok_and(|call| call.name != "wait"),
-                            _ => false,
-                        })
-                        .count()
-            })
-            .sum::<usize>();
-        if running.is_empty() && self.empty_waits.lock().await.get(session_id) == Some(&arrivals) {
-            return CallToolResult::error(vec![ContentBlock::text(
-                "Error: Nothing to wait for: your last wait ended with nothing arriving, nothing has reached you or been done by you since, and no editor task of yours is running. If you still need something from another member, ask it with channel_post kind ask: its reply wakes you, and a member that finished is answered for. Otherwise write your final report, naming anything you could not align.",
-            )]);
-        }
+        let channel_waiting = Self::channel_wait_contexts(&messages)
+            .values()
+            .any(ChannelWaitContext::is_waiting);
+        let parent_waiting = Self::parent_reply_pending(&messages);
         let started = Instant::now();
         loop {
             match manager.pending_session_messages(session_id).await {
                 Ok(pending) if pending.iter().any(|message| message.interrupts_wait()) => {
-                    self.empty_waits.lock().await.remove(session_id);
                     return CallToolResult::success(vec![ContentBlock::text(format!(
                         "Woken after {}s: what arrived follows this result. Act on it, then call wait again while you still wait for something.",
                         started.elapsed().as_secs()
@@ -2157,18 +2210,14 @@ impl SummonClient {
                     ))])
                 }
             }
-            if running.is_empty() && !in_channel {
+            if running.is_empty() && !channel_waiting && !parent_waiting {
                 return CallToolResult::error(vec![ContentBlock::text(
-                    "Error: Nothing to wait for: no editor task of yours is running, and no channel news has ever reached you, so nothing can wake you. An editor task started in this same step counts once its delegate_editor_task result is in, so call wait in your next step; otherwise write your final report.",
+                    "Error: Nothing to wait for: no editor task of yours is running, no first upstream publication is outstanding, and no channel question/request or successfully sent parent question awaits a reply. Channel membership and followers do not permit waiting. If you need a further publication, ask its owner with channel_post kind ask; otherwise finish your review, answer any channel obligations, and write your final report.",
                 )]);
             }
             if started.elapsed() >= Duration::from_secs(timeout) {
                 let still = if running.is_empty() {
-                    self.empty_waits
-                        .lock()
-                        .await
-                        .insert(session_id.to_string(), arrivals);
-                    " No editor task of yours is running. If you are waiting for another member, ask it with channel_post kind ask instead of waiting again.".to_string()
+                    " Your publication or reply dependency is still outstanding; do independent work if any remains.".to_string()
                 } else {
                     format!(" Editor tasks still running: {}.", running.join(", "))
                 };
@@ -5054,52 +5103,191 @@ mod tests {
         assert!(refused.is_error.unwrap_or(false));
         assert!(!tool_result_ends_turn(&refused));
 
-        // Channel news reached it once: one empty wait is allowed, a repeat is refused
-        // until something new reaches it.
-        let notice = || {
-            let mut message = Message::user()
-                .with_text("Channel news")
-                .with_visibility(false, true)
-                .with_steer();
-            message.metadata.set_operation_note(
-                crate::session::MAILBOX_NOTE,
-                "kind",
-                serde_json::json!("channel"),
-            );
-            message
-        };
-        manager.add_message(&child, &notice()).await.unwrap();
+        let mut historical = Message::user().with_text("Channel news");
+        historical.metadata.set_operation_note(
+            crate::session::MAILBOX_NOTE,
+            "kind",
+            serde_json::json!("channel"),
+        );
+        manager.add_message(&child, &historical).await.unwrap();
         let args = || serde_json::json!({"timeout_s": 1}).as_object().cloned();
-        let empty = client
-            .call_tool(&ctx, "wait", args(), CancellationToken::new())
-            .await
-            .unwrap();
-        assert!(!empty.is_error.unwrap_or(false));
-        assert!(format!("{:?}", empty.content).contains("channel_post kind ask"));
+        let empty = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.call_tool(&ctx, "wait", args(), CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(empty.is_error, Some(true));
+
+        let unrelated = Message::assistant().with_tool_request(
+            "read-1",
+            Ok(rmcp::model::CallToolRequestParams::new(
+                "cortex_document__channel_read",
+            )),
+        );
+        manager.add_message(&child, &unrelated).await.unwrap();
         let repeated = client
             .call_tool(&ctx, "wait", args(), CancellationToken::new())
             .await
             .unwrap();
-        assert!(repeated.is_error.unwrap_or(false));
-        assert!(format!("{:?}", repeated.content).contains("your last wait ended"));
-        let asked = Message::assistant().with_tool_request(
-            "ask-1",
-            Ok(rmcp::model::CallToolRequestParams::new(
-                "cortex_document__channel_post",
-            )),
+        assert_eq!(repeated.is_error, Some(true));
+
+        let context = |sequence: u64, publications: &[&str], replies: &[&str]| {
+            let mut result = CallToolResult::success(vec![]);
+            result.meta = Some(MetaObject(
+                serde_json::json!({
+                    crate::session::CHANNEL_WAIT_META_KEY: [{
+                        "channelId": "c1", "sequence": sequence,
+                        "publications": publications, "replies": replies,
+                    }]
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ));
+            Message::user().with_tool_response("context", Ok(result))
+        };
+        manager
+            .add_message(&child, &context(1, &["deck"], &[]))
+            .await
+            .unwrap();
+        let publication = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_ne!(publication.is_error, Some(true));
+        manager
+            .add_message(&child, &context(2, &[], &["question-1"]))
+            .await
+            .unwrap();
+        let reply = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_ne!(reply.is_error, Some(true));
+        manager
+            .add_message(&child, &context(3, &[], &[]))
+            .await
+            .unwrap();
+        // A delayed join cannot restore a dependency cleared by a newer tool result.
+        manager
+            .add_message(&child, &context(1, &["deck"], &[]))
+            .await
+            .unwrap();
+        let cleared = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(cleared.is_error, Some(true));
+
+        let editor_call = Message::assistant().with_tool_request(
+            "editor",
+            Ok(
+                rmcp::model::CallToolRequestParams::new("cortex_document__delegate_editor_task")
+                    .with_arguments(
+                        serde_json::json!({"idempotency_key": "notes"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+            ),
         );
-        manager.add_message(&child, &asked).await.unwrap();
-        let after_asking = client
+        let mut queued = CallToolResult::success(vec![]);
+        queued.structured_content = Some(serde_json::json!({"job_id": "j1", "status": "queued"}));
+        queued.meta = Some(MetaObject(
+            serde_json::json!({crate::agents::tool_interrupt::INTERRUPTED_META_KEY: true})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+        manager.add_message(&child, &editor_call).await.unwrap();
+        manager
+            .add_message(
+                &child,
+                &Message::user().with_tool_response("editor", Ok(queued)),
+            )
+            .await
+            .unwrap();
+        let editor_wait = client
             .call_tool(&ctx, "wait", args(), CancellationToken::new())
             .await
             .unwrap();
-        assert!(!after_asking.is_error.unwrap_or(false));
-        manager.add_message(&child, &notice()).await.unwrap();
-        let after_news = client
+        assert_ne!(editor_wait.is_error, Some(true));
+
+        manager
+            .send_to_child(&parent, &child, "Use the revised plan.")
+            .await
+            .unwrap();
+        let pending = client
             .call_tool(&ctx, "wait", args(), CancellationToken::new())
             .await
             .unwrap();
-        assert!(!after_news.is_error.unwrap_or(false));
+        assert_ne!(pending.is_error, Some(true));
+        assert!(format!("{:?}", pending.content).contains("Woken"));
+    }
+
+    #[test]
+    fn wait_context_preserves_other_channels_and_ignores_failed_or_malformed_updates() {
+        let notice = |channel: &str, sequence: u64, replies: &[&str]| {
+            let mut message = Message::user().with_text("Channel notice");
+            message.metadata.set_operation_note(
+                crate::session::MAILBOX_NOTE, crate::session::CHANNEL_WAIT_META_KEY,
+                serde_json::json!({"channelId": channel, "sequence": sequence, "publications": [], "replies": replies}),
+            );
+            message
+        };
+        let mut failed = CallToolResult::error(vec![]);
+        failed.meta = Some(MetaObject(
+            serde_json::json!({
+                crate::session::CHANNEL_WAIT_META_KEY: [
+                    {"channelId": "c1", "sequence": 99, "publications": [], "replies": []}
+                ]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ));
+        let mut malformed = Message::user().with_text("Bad context");
+        malformed.metadata.set_operation_note(
+            crate::session::MAILBOX_NOTE,
+            crate::session::CHANNEL_WAIT_META_KEY,
+            serde_json::json!({"channelId": "c1", "replies": []}),
+        );
+        let contexts = SummonClient::channel_wait_contexts(&[
+            notice("c1", 1, &["q1"]),
+            notice("c2", 2, &[]),
+            Message::user().with_tool_response("failed", Ok(failed)),
+            malformed,
+        ]);
+        assert!(contexts["c1"].is_waiting());
+        assert!(!contexts["c2"].is_waiting());
+    }
+
+    #[test]
+    fn only_a_successfully_sent_parent_question_permits_waiting_until_a_reply() {
+        let question = Message::assistant().with_tool_request(
+            "q1",
+            Ok(rmcp::model::CallToolRequestParams::new("message_parent")),
+        );
+        let mut messages = vec![
+            question.clone(),
+            Message::user().with_tool_response("q1", Ok(CallToolResult::error(vec![]))),
+        ];
+        assert!(!SummonClient::parent_reply_pending(&messages));
+        messages
+            .push(Message::user().with_tool_response("q1", Ok(CallToolResult::success(vec![]))));
+        assert!(SummonClient::parent_reply_pending(&messages));
+        let mut reply = Message::user().with_text("Parent answer");
+        reply.metadata.set_operation_note(
+            crate::session::MAILBOX_NOTE,
+            "kind",
+            serde_json::json!("message"),
+        );
+        messages.push(reply);
+        assert!(!SummonClient::parent_reply_pending(&messages));
+        messages.push(question);
+        assert!(!SummonClient::parent_reply_pending(&messages));
     }
 
     #[test]

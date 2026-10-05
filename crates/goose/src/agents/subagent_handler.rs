@@ -172,8 +172,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
         {
             // Summon lists wait only to a specialist that starts editor tasks.
             for tool in ["message_parent", "wait"] {
-                if !available_tools.is_empty() && !available_tools.iter().any(|name| name == tool)
-                {
+                if !available_tools.is_empty() && !available_tools.iter().any(|name| name == tool) {
                     available_tools.push(tool.to_string());
                 }
             }
@@ -280,10 +279,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
         drop(stream);
         // The task's tool servers stop the work it started (such as editor
         // tasks) and settle what it owed others.
-        agent
-            .extension_manager
-            .notify_task_ended(&session_id)
-            .await;
+        agent.extension_manager.notify_task_ended(&session_id).await;
         streamed?;
 
         let final_output = get_final_output(&agent, has_response_schema).await;

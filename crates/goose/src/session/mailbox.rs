@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
-use goose_sdk_types::custom_requests::TaskOutcome;
+use goose_sdk_types::custom_requests::{ChannelWaitContext, TaskOutcome};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
@@ -38,14 +38,17 @@ pub struct ChannelNotice {
     /// started; see [`EDITOR_RESULT_NOTE`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_wait: Option<ChannelWaitContext>,
 }
 
-/// Operation note on a delivered mailbox message naming what it was: `kind` is
-/// `channel` or `editor_result`.
+/// Operation note on a delivered mailbox message naming its kind, including
+/// `channel`, `editor_result`, and an ordinary parent `message`.
 pub const MAILBOX_NOTE: &str = "mailbox";
 /// Operation note carrying a delivered editor result under `v1`
 /// (`{"idempotency_key", "receipt"}`), read back as that task's result.
 pub const EDITOR_RESULT_NOTE: &str = "editor_result";
+pub const CHANNEL_WAIT_META_KEY: &str = "goose.channelWait";
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct MailboxMessage {
@@ -69,6 +72,13 @@ impl MailboxMessage {
                 .with_text(notice.text)
                 .with_visibility(false, true)
                 .with_steer();
+            if let Some(context) = notice.channel_wait {
+                message.metadata.set_operation_note(
+                    MAILBOX_NOTE,
+                    CHANNEL_WAIT_META_KEY,
+                    serde_json::to_value(context)?,
+                );
+            }
             let kind = match notice.editor_result {
                 Some(result) => {
                     message
@@ -83,13 +93,17 @@ impl MailboxMessage {
                 .set_operation_note(MAILBOX_NOTE, "kind", serde_json::json!(kind));
             return Ok(message);
         }
-        Ok(Message::user()
+        let mut message = Message::user()
             .with_text(format!(
                 "Message from parent task {}:\n\n{}",
                 self.sender_session_id, self.body
             ))
             .with_visibility(false, true)
-            .with_steer())
+            .with_steer();
+        message
+            .metadata
+            .set_operation_note(MAILBOX_NOTE, "kind", serde_json::json!(self.kind));
+        Ok(message)
     }
 
     pub fn channel_notice(&self) -> Option<ChannelNotice> {
@@ -510,6 +524,20 @@ mod tests {
         );
         assert!(!reply.interrupts_wait() && !reply.refreshes_tools());
         assert_eq!(reply.prompt().unwrap().as_concat_text(), "Reply from deck.");
+        let dependencies = message(
+            MailboxMessageKind::Channel,
+            r#"{"text":"Plan published","channelWait":{"channelId":"c1","sequence":8,"publications":[],"replies":["q1"]}}"#,
+        );
+        assert_eq!(
+            dependencies
+                .prompt()
+                .unwrap()
+                .metadata
+                .operation_note(super::MAILBOX_NOTE, super::CHANNEL_WAIT_META_KEY),
+            Some(
+                &serde_json::json!({"channelId": "c1", "sequence": 8, "publications": [], "replies": ["q1"]})
+            )
+        );
         let finished = message(
             MailboxMessageKind::Channel,
             r#"{"text":"Your editor task deck-1 finished.","wake":true,"editorResult":{"idempotency_key":"deck-1","receipt":{"job_id":"j1"}}}"#,
@@ -517,7 +545,9 @@ mod tests {
         assert!(finished.interrupts_wait() && !finished.refreshes_tools());
         let prompt = finished.prompt().unwrap();
         assert_eq!(
-            prompt.metadata.operation_note(super::EDITOR_RESULT_NOTE, "v1"),
+            prompt
+                .metadata
+                .operation_note(super::EDITOR_RESULT_NOTE, "v1"),
             Some(&serde_json::json!({"idempotency_key": "deck-1", "receipt": {"job_id": "j1"}}))
         );
         assert_eq!(
@@ -525,7 +555,11 @@ mod tests {
             Some(&serde_json::json!("editor_result"))
         );
         assert_eq!(
-            reply.prompt().unwrap().metadata.operation_note(super::MAILBOX_NOTE, "kind"),
+            reply
+                .prompt()
+                .unwrap()
+                .metadata
+                .operation_note(super::MAILBOX_NOTE, "kind"),
             Some(&serde_json::json!("channel"))
         );
         assert!(message(MailboxMessageKind::Message, "Use four slides").interrupts_wait());

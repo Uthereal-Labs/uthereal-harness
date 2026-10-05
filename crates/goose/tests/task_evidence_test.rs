@@ -699,12 +699,18 @@ async fn channel_notices_reach_only_the_running_task_holding_the_artifact() {
         refresh_tools: true,
         dedupe_key: Some(dedupe.into()),
         editor_result: None,
+        channel_wait: Some(goose_sdk_types::custom_requests::ChannelWaitContext {
+            channel_id: "c1".into(),
+            sequence: 2,
+            publications: vec!["deck".into()],
+            replies: vec![],
+        }),
     };
 
-    // The coordinator's casing and spacing still reach the task Goose stored as "new:document:notes".
+    // Casing and surrounding whitespace reach the task stored as "new:document:notes".
     let queued = f
         .manager
-        .queue_task_notice(&notice(&["document:doc-1", "new:document:  Notes "], "c:1"))
+        .queue_task_notice(&notice(&["document:doc-1", " new:document:Notes "], "c:1"))
         .await
         .unwrap();
     assert_eq!(queued.status, TaskNoticeStatus::Queued);
@@ -717,6 +723,15 @@ async fn channel_notices_reach_only_the_running_task_holding_the_artifact() {
     let pending = f.manager.pending_session_messages(&task).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert!(pending[0].interrupts_wait() && pending[0].refreshes_tools());
+    assert_eq!(
+        pending[0]
+            .channel_notice()
+            .unwrap()
+            .channel_wait
+            .unwrap()
+            .publications,
+        vec!["deck"]
+    );
     assert_eq!(
         pending[0].prompt().unwrap().as_concat_text(),
         "You were added to channel numina."

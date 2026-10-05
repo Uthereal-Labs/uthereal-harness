@@ -244,8 +244,11 @@ impl SessionManager {
                     .get("idempotency_key")
                     .and_then(serde_json::Value::as_str)
                     .is_none_or(|key| key.is_empty() || key.len() > 240)
-                    || !result.get("receipt").is_some_and(serde_json::Value::is_object)
-                    || !serde_json::to_vec(result).is_ok_and(|bytes| bytes.len() <= EDITOR_RESULT_LIMIT)
+                    || !result
+                        .get("receipt")
+                        .is_some_and(serde_json::Value::is_object)
+                    || !serde_json::to_vec(result)
+                        .is_ok_and(|bytes| bytes.len() <= EDITOR_RESULT_LIMIT)
             })
         {
             bail!("Invalid task notice request");
@@ -303,6 +306,7 @@ impl SessionManager {
             wake: request.wake,
             refresh_tools: request.refresh_tools,
             editor_result: request.editor_result.clone(),
+            channel_wait: request.channel_wait.clone(),
         };
         sqlx::query(
             "INSERT OR IGNORE INTO session_mailbox

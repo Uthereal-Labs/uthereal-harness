@@ -25,7 +25,8 @@ pub use export_markdown::{
 };
 pub use extension_data::{EnabledExtensionsState, ExtensionData, ExtensionState, TodoState};
 pub use mailbox::{
-    ChannelNotice, MailboxMessage, MailboxMessageKind, EDITOR_RESULT_NOTE, MAILBOX_NOTE,
+    ChannelNotice, MailboxMessage, MailboxMessageKind, CHANNEL_WAIT_META_KEY, EDITOR_RESULT_NOTE,
+    MAILBOX_NOTE,
 };
 pub use session_manager::{
     Session, SessionInsights, SessionManager, SessionNameUpdate, SessionType, SessionUpdateBuilder,

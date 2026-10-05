@@ -17,11 +17,11 @@ use rmcp::model::{
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
-        ClientInfo, ClientNotification, ClientRequest, CustomNotification, GetPromptRequestParams, GetPromptResult, Implementation,
-        InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourcesResult,
-        ListToolsResult, Notification, PaginatedRequestParams, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResult, Request, RequestId, RequestOptionalParam,
-        Role, ServerNotification, ServerResult,
+        ClientInfo, ClientNotification, ClientRequest, CustomNotification, GetPromptRequestParams,
+        GetPromptResult, Implementation, InitializeRequestParams, InitializeResult,
+        ListPromptsResult, ListResourcesResult, ListToolsResult, Notification,
+        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult,
+        Request, RequestId, RequestOptionalParam, Role, ServerNotification, ServerResult,
     },
     service::{
         ClientInitializeError, ClientLifecycleMode, ClientServiceExt, PeerRequestOptions,

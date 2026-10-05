@@ -415,6 +415,25 @@ pub struct TaskEvidenceResponse {
     pub evidence_complete: bool,
 }
 
+/// Outstanding channel dependencies, independent of publication versions or status.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelWaitContext {
+    pub channel_id: String,
+    /// Orders mailbox and tool-result delivery, never artifact alignment.
+    pub sequence: u64,
+    #[serde(default)]
+    pub publications: Vec<String>,
+    #[serde(default)]
+    pub replies: Vec<String>,
+}
+
+impl ChannelWaitContext {
+    pub fn is_waiting(&self) -> bool {
+        !self.publications.is_empty() || !self.replies.is_empty()
+    }
+}
+
 /// Queue a notice for the running task of an attempt that holds one of the
 /// given artifacts (or has the given task ID): channel news, or the result of
 /// an editor task it started. The task reads it at its next checkpoint; `wake`
@@ -442,6 +461,8 @@ pub struct TaskNoticeRequest {
     /// that task's result (artifact results, finish guard) once delivered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_wait: Option<ChannelWaitContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
