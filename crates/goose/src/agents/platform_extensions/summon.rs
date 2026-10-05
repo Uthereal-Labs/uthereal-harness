@@ -770,6 +770,15 @@ fn build_subagent_instructions(session: Option<&crate::session::Session>) -> Str
          the user-facing response yourself. Never claim success when a specialist reports failure.",
     ));
 
+    if subagents.iter().any(|source| {
+        source
+            .properties
+            .get("artifact_guard")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }) {
+        out.push_str("\nArtifact reports: already_satisfied is successful verification of the existing saved revision without a new save. Accept its current revision-bound verification when it meets the user requirements; do not demand a mutation solely to obtain a new save. Partial and empty outcomes still require review. Respect edit_cycle_stalled and exhausted correction budgets: do not evade them by starting a fresh specialist or changing the task key. Preserve verified predecessor receipts and address only remaining user requirements.\n");
+    }
     out
 }
 
@@ -887,7 +896,13 @@ fn describe_editor_result(value: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_i64)
         .map_or_else(
             || "no saved revision".to_string(),
-            |revision| format!("saved revision {revision}"),
+            |revision| {
+                if status == "already_satisfied" {
+                    format!("existing revision {revision} unchanged; no new save")
+                } else {
+                    format!("saved revision {revision}")
+                }
+            },
         );
     let mut line = format!(
         "- Editor job {status}: document {}, {revision}",
@@ -915,6 +930,7 @@ fn describe_editor_result(value: &serde_json::Value) -> String {
 #[serde(rename_all = "snake_case")]
 enum EditorArtifactStatus {
     Completed,
+    AlreadySatisfied,
     Partial,
     Empty,
     Failed,
@@ -1031,6 +1047,11 @@ fn saved_artifact_receipt(value: &serde_json::Value) -> Option<SavedArtifactRece
             .ok()
             .filter(ArtifactVerification::bounded)
     });
+    if receipt.status == EditorArtifactStatus::AlreadySatisfied
+        && !verification.as_ref().is_some_and(|proof| proof.valid)
+    {
+        return None;
+    }
     let grounding_integrity = saved_revision_id.as_ref().and_then(|_| {
         serde_json::from_value::<ArtifactIntegrity>(value.get("grounding_integrity")?.clone())
             .ok()
@@ -1046,6 +1067,23 @@ fn saved_artifact_receipt(value: &serde_json::Value) -> Option<SavedArtifactRece
         grounding_integrity,
         policy_stop_reason: bounded_text("policy_stop_reason"),
     })
+}
+
+fn confirmed_editor_status(value: &serde_json::Value) -> Option<EditorArtifactStatus> {
+    let receipt: EditorArtifactReceipt = serde_json::from_value(value.clone()).ok()?;
+    match receipt.status {
+        EditorArtifactStatus::AlreadySatisfied => {
+            saved_artifact_receipt(value).map(|receipt| receipt.status)
+        }
+        EditorArtifactStatus::Completed | EditorArtifactStatus::Partial
+            if receipt
+                .document_revision
+                .is_none_or(|revision| revision == 0) =>
+        {
+            None
+        }
+        status => Some(status),
+    }
 }
 
 fn predecessor_receipts(messages: &[Message]) -> Vec<SavedArtifactReceipt> {
@@ -1212,6 +1250,7 @@ fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactRe
                     && responses.get(later_id).and_then(|response| response.as_ref().ok())
                         .filter(|result| !crate::agents::tool_interrupt::was_interrupted(result) && result.is_error != Some(true))
                         .and_then(editor_result_value)
+                        .filter(|value| confirmed_editor_status(value).is_some())
                         .and_then(|value| serde_json::from_value::<EditorArtifactReceipt>(value).ok())
                         .is_some_and(|receipt| receipt.job_id.is_some_and(|job| !job.is_empty()) && !receipt.document_id.is_empty() && (!matches!(receipt.status, EditorArtifactStatus::Completed | EditorArtifactStatus::Partial) || receipt.document_revision.is_some_and(|revision| revision > 0)) && arguments.and_then(|args| args.get("document_id")).and_then(serde_json::Value::as_str).is_none_or(|document| document == receipt.document_id))
             })
@@ -1234,7 +1273,7 @@ fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactRe
                 serde_json::from_str::<serde_json::Value>(&tool_result_text(result)).ok().is_some_and(|value| value.get("code").and_then(serde_json::Value::as_str) == Some("editor_policy_exhausted"))
             });
             if !rejected {
-            current.insert(identity, receipt.and_then(|receipt| match receipt.status { EditorArtifactStatus::Completed | EditorArtifactStatus::Partial if receipt.document_revision.is_none_or(|revision| revision == 0) => None, status => Some(status) }));
+            current.insert(identity, responses.get(id).and_then(|response| response.as_ref().ok()).and_then(editor_result_value).and_then(|value| confirmed_editor_status(&value)));
             }
 
             match responses.get(id) {
@@ -4645,6 +4684,67 @@ mod tests {
                 "layout_issue_count":0,"issues":[],"omitted_checks":0,"omitted_issues":0,"diagnostics_compacted":false},
             "grounding_integrity":{"validation_status":"valid","saved_associations_count":8,"dropped_count":0,"unresolved_count":0}
         })
+    }
+
+    #[test]
+    fn already_satisfied_requires_verified_existing_revision() {
+        let mut value = verified_partial_receipt();
+        value["status"] = serde_json::json!("already_satisfied");
+        assert_eq!(
+            confirmed_editor_status(&value),
+            Some(EditorArtifactStatus::AlreadySatisfied)
+        );
+        let report = describe_editor_result(&value);
+        assert!(report.contains("existing revision 2 unchanged; no new save"));
+        let tool = "cortex_spreadsheet__delegate_editor_task";
+        let mut result = CallToolResult::success(vec![]);
+        result.structured_content = Some(value.clone());
+        let messages = vec![
+            Message::assistant()
+                .with_tool_request("verify", Ok(rmcp::model::CallToolRequestParams::new(tool))),
+            Message::user().with_tool_response("verify", Ok(result)),
+        ];
+        assert_eq!(
+            artifact_result_summary(&messages, &[tool.to_owned()]).completion_description(),
+            "completed successfully"
+        );
+        let assignment = artifact_assignment(
+            &DelegateParams {
+                artifact_key: Some("document:budget".into()),
+                previous_task_id: Some("previous".into()),
+                ..Default::default()
+            },
+            Some(&report),
+        )
+        .unwrap();
+        let inherited =
+            artifact_result_summary(&[Message::user().with_text(assignment)], &[tool.to_owned()]);
+        assert_eq!(inherited.completion_description(), "completed successfully");
+        assert!(inherited
+            .section()
+            .contains("existing revision 2 unchanged; no new save"));
+        let receipt = saved_artifact_receipt(&value).unwrap();
+        assert_eq!(receipt.document_revision, 2);
+        assert_eq!(receipt.saved_revision_id.as_deref(), Some("saved-2"));
+        let summary = ArtifactResultSummary {
+            lines: vec![report],
+            current: HashMap::from([(
+                "budget".into(),
+                Some(EditorArtifactStatus::AlreadySatisfied),
+            )]),
+        };
+        assert_eq!(summary.completion_description(), "completed successfully");
+        for key in ["document_revision", "saved_revision_id", "verification"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert_eq!(confirmed_editor_status(&missing), None);
+        }
+        value["verification"]["valid"] = serde_json::json!(false);
+        assert_eq!(confirmed_editor_status(&value), None);
+        assert_eq!(
+            confirmed_editor_status(&serde_json::json!({"document_id":"budget", "status":"empty"})),
+            Some(EditorArtifactStatus::Empty)
+        );
     }
 
     #[test]
