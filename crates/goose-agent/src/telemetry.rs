@@ -1,5 +1,5 @@
 use goose_provider_types::conversation::message::{Message, MessageContent, ToolResult};
-use rmcp::model::{CallToolRequestParams, Role};
+use rmcp::model::{CallToolRequestParams, Role, Tool};
 use serde_json::{json, Value};
 
 pub fn input_messages_with_system_json(system_prompt: &str, messages: &[Message]) -> String {
@@ -10,6 +10,26 @@ pub fn input_messages_with_system_json(system_prompt: &str, messages: &[Message]
     }));
     values.extend(messages.iter().map(message_json));
     Value::Array(values).to_string()
+}
+
+/// The tools offered to the model, as the GenAI semantic convention's
+/// `gen_ai.tool.definitions`: name, description and input schema, in the order
+/// sent. The system prompt lists only tool names; the model sees these.
+pub fn tool_definitions_json(tools: &[Tool]) -> String {
+    Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.name.as_ref(),
+                    "description": tool.description.as_deref(),
+                    "parameters": Value::Object(tool.input_schema.as_ref().clone()),
+                })
+            })
+            .collect(),
+    )
+    .to_string()
 }
 
 pub fn system_instructions_json(system_prompt: &str) -> String {
@@ -162,5 +182,36 @@ fn message_part_json(content: &MessageContent) -> Value {
             "kind": error.kind,
             "content": error.message,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn tool_definitions_keep_name_description_and_schema_in_order() {
+        let schema = json!({"type": "object", "properties": {"query": {"type": "string"}}});
+        let tools = vec![
+            Tool::new(
+                "search".to_string(),
+                "Search the knowledge base.".to_string(),
+                Arc::new(schema.as_object().unwrap().clone()),
+            ),
+            Tool::new(
+                "read".to_string(),
+                "Read one result.".to_string(),
+                Arc::new(json!({"type": "object"}).as_object().unwrap().clone()),
+            ),
+        ];
+        let definitions: Value = serde_json::from_str(&tool_definitions_json(&tools)).unwrap();
+        assert_eq!(
+            definitions,
+            json!([
+                {"type": "function", "name": "search", "description": "Search the knowledge base.", "parameters": schema},
+                {"type": "function", "name": "read", "description": "Read one result.", "parameters": {"type": "object"}},
+            ])
+        );
     }
 }

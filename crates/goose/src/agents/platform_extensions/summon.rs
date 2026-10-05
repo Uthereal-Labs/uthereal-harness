@@ -19,7 +19,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::FutureExt;
 use goose_agent::operation::messages_since_kickoff;
-use goose_sdk_types::custom_requests::{SourceEntry, SourceType, TaskTerminalStatus};
+use goose_sdk_types::custom_requests::{
+    ChannelWaitContext, SourceEntry, SourceType, TaskTerminalStatus,
+};
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, InitializeResult, JsonObject, ListToolsResult,
     MetaObject, Role, ServerCapabilities, ServerNotification, Tool,
@@ -57,6 +59,22 @@ pub static EXTENSION_NAME: &str = "summon";
 const SUBAGENT_DESCRIPTION_BUDGET: usize = 160;
 
 const TASK_LABEL_BUDGET: usize = 60;
+
+/// A specialist's wait: default and longest sleep, and how often it checks its
+/// mailbox.
+const SPECIALIST_WAIT_DEFAULT_SECS: u64 = 120;
+const SPECIALIST_WAIT_MAX_SECS: u64 = 180;
+const SPECIALIST_WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// Whether a message to the parent asks something (message_parent is for questions only).
+fn asks_question(message: &str) -> bool {
+    message.contains(['?', '\u{FF1F}', '\u{061F}'])
+}
+
+/// How the parent continues a specialist that can no longer receive messages.
+fn redelegate_hint(task_id: &str) -> String {
+    format!("A message cannot reach it. To have its work continue, delegate it again with previous_task_id set to '{task_id}' and an instruction that includes what you meant to send.")
+}
 
 fn durable_assistant_turn_count(conversation: &crate::conversation::Conversation) -> u32 {
     let Ok(messages) = messages_since_kickoff(conversation) else {
@@ -271,6 +289,61 @@ impl NotificationSink {
             Self::Emitter(_) => 0,
         }
     }
+}
+
+/// Fields of delegate itself that a model sometimes nests under `parameters`.
+const DELEGATE_TOP_LEVEL_FIELDS: &[&str] = &[
+    "instructions",
+    "source",
+    "artifact_key",
+    "artifact_title",
+    "previous_task_id",
+    "context",
+    "async",
+    "max_turns",
+];
+
+/// Delegate fields passed inside `parameters`, with the shape delegate expects.
+fn nested_delegate_fields_error(params: &DelegateParams) -> Option<String> {
+    let parameters = params.parameters.as_ref()?;
+    let nested: Vec<&str> = DELEGATE_TOP_LEVEL_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| parameters.contains_key(*field))
+        .collect();
+    // A recipe source may declare a parameter that shares a name; delegate's
+    // own fields are only assumed when the call cannot work without them.
+    let misplaced = params.source.is_none()
+        || nested.contains(&"instructions")
+        || nested.contains(&"artifact_key");
+    if nested.is_empty() || !misplaced {
+        return None;
+    }
+    Some(format!(
+        "{} {} of delegate itself, not of parameters: pass {} at the top level, for example delegate({{\"source\": \"<specialist>\", \"instructions\": \"<complete task>\", \"artifact_key\": \"<key>\"}}). parameters is only for a recipe source's own declared parameters.",
+        nested.join(", "),
+        if nested.len() == 1 {
+            "is a field"
+        } else {
+            "are fields"
+        },
+        if nested.len() == 1 { "it" } else { "them" },
+    ))
+}
+
+/// An unknown delegate source, with the sources that can be delegated to.
+fn unknown_delegate_source_error(source_name: &str, available: &[String]) -> String {
+    if available.is_empty() {
+        return format!(
+            "Source '{}' not found, and no source can be delegated to here. Delegate with instructions only.",
+            source_name
+        );
+    }
+    format!(
+        "Source '{}' not found. Pass one of the sources you can delegate to: {}.",
+        source_name,
+        available.join(", ")
+    )
 }
 
 fn merge_subrecipe_parameters(
@@ -1074,7 +1147,49 @@ impl ArtifactResultSummary {
     }
 }
 
+/// The conversation with each editor result the tool server delivered to the
+/// task's mailbox written as the tool call and response it stands for: a call of
+/// the first artifact result tool with the task's idempotency_key, answered by
+/// its receipt. It follows the delivered message, so it supersedes the
+/// still-running result of the call that started the task.
+fn with_delivered_editor_results(messages: &[Message], tools: &[String]) -> Vec<Message> {
+    let Some(tool) = tools.first() else {
+        return messages.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(messages.len());
+    for (index, message) in messages.iter().enumerate() {
+        normalized.push(message.clone());
+        let Some(result) = message
+            .metadata
+            .operation_note(crate::session::EDITOR_RESULT_NOTE, "v1")
+        else {
+            continue;
+        };
+        let (Some(key), Some(receipt)) = (
+            result
+                .get("idempotency_key")
+                .and_then(serde_json::Value::as_str),
+            result.get("receipt").filter(|receipt| receipt.is_object()),
+        ) else {
+            continue;
+        };
+        let id = format!("delivered_editor_result_{index}");
+        let mut arguments = JsonObject::new();
+        arguments.insert("idempotency_key".to_string(), serde_json::json!(key));
+        normalized.push(Message::assistant().with_tool_request(
+            id.clone(),
+            Ok(rmcp::model::CallToolRequestParams::new(tool.clone()).with_arguments(arguments)),
+        ));
+        normalized.push(
+            Message::user().with_tool_response(id, Ok(CallToolResult::structured(receipt.clone()))),
+        );
+    }
+    normalized
+}
+
 fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactResultSummary {
+    let normalized = with_delivered_editor_results(messages, tools);
+    let messages = normalized.as_slice();
     let mut calls = Vec::new();
     let mut responses = HashMap::new();
     let mut response_order = HashMap::new();
@@ -1186,6 +1301,97 @@ fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactRe
     ArtifactResultSummary { lines, current }
 }
 
+/// The idempotency keys of editor tasks a specialist started whose latest
+/// result says the editor is still working (a delivered editor result counts
+/// as the latest). A specialist must not finish while one runs: its report
+/// would not have the editor's result.
+pub(crate) fn running_editor_tasks(
+    session: &crate::session::Session,
+    messages: &[Message],
+) -> Vec<String> {
+    SummonTaskPolicy::from_session(session)
+        .map(|policy| running_editor_task_keys(messages, &policy.artifact_result_tools))
+        .unwrap_or_default()
+}
+
+/// Wait without another model call until durable news can be reviewed.
+pub(crate) async fn wait_for_editor_notice(
+    manager: &crate::session::SessionManager,
+    session_id: &str,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<()> {
+    let waiting = async {
+        loop {
+            if manager
+                .pending_session_messages(session_id)
+                .await?
+                .iter()
+                .any(|message| {
+                    message.interrupts_wait()
+                        || message.kind == crate::session::MailboxMessageKind::Channel
+                })
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(SPECIALIST_WAIT_POLL).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => anyhow::bail!("Incomplete artifact output: editor wait cancelled"),
+        result = tokio::time::timeout(timeout, waiting) => {
+            result.map_err(|_| anyhow::anyhow!("Incomplete artifact output: editor result deadline exceeded"))?
+        }
+    }
+}
+
+fn running_editor_task_keys(messages: &[Message], tools: &[String]) -> Vec<String> {
+    if tools.is_empty() {
+        return Vec::new();
+    }
+    let normalized = with_delivered_editor_results(messages, tools);
+    let messages = normalized.as_slice();
+    let mut keys: HashMap<&str, String> = HashMap::new();
+    let mut running: HashMap<String, bool> = HashMap::new();
+    for message in messages {
+        for content in &message.content {
+            match content {
+                MessageContent::ToolRequest(request) => {
+                    if let Ok(call) = &request.tool_call {
+                        if tools.iter().any(|tool| call.name == tool.as_str()) {
+                            if let Some(key) = call
+                                .arguments
+                                .as_ref()
+                                .and_then(|args| args.get("idempotency_key"))
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                keys.insert(request.id.as_str(), key.to_owned());
+                            }
+                        }
+                    }
+                }
+                MessageContent::ToolResponse(response) => {
+                    if let Some(key) = keys.get(response.id.as_str()) {
+                        let still_running = matches!(
+                            &response.tool_result,
+                            Ok(result) if crate::agents::tool_interrupt::was_interrupted(result)
+                        );
+                        running.insert(key.clone(), still_running);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut keys: Vec<String> = running
+        .into_iter()
+        .filter_map(|(key, still_running)| still_running.then_some(key))
+        .collect();
+    keys.sort();
+    keys
+}
+
 #[cfg(test)]
 fn artifact_result_lines(messages: &[Message], tools: &[String]) -> Vec<String> {
     artifact_result_summary(messages, tools).lines
@@ -1253,6 +1459,8 @@ pub struct SummonClient {
     /// Highest mailbox message ID delivered to each parent's current report
     /// turn. Delivered messages stay pending until the turn is acknowledged.
     delivered_reports: Mutex<HashMap<String, i64>>,
+    /// Parents already shown a source's connect_reminder.
+    connect_reminded: Mutex<HashSet<String>>,
 }
 
 impl Drop for SummonClient {
@@ -1280,6 +1488,7 @@ impl SummonClient {
             artifact_tasks: Mutex::new(HashMap::new()),
             event_driven_parents: Mutex::new(HashSet::new()),
             delivered_reports: Mutex::new(HashMap::new()),
+            connect_reminded: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1358,7 +1567,7 @@ impl SummonClient {
         let key = params
                 .artifact_key
                 .as_deref()
-                .map(|key| key.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
+                .map(crate::session::normalize_artifact_key)
                 .filter(|key| {
                     key.strip_prefix("document:").is_some_and(|id| !id.is_empty())
                         || key.strip_prefix(new_prefix.as_str()).is_some_and(|title| !title.is_empty())
@@ -1771,8 +1980,14 @@ impl SummonClient {
         });
         if instructions_required {
             // Every available source is a specialist, so no delegation can
-            // start without the complete task.
+            // start without the complete task. Specialists take no recipe
+            // parameters: without that field, every argument sits at the top
+            // level, where the delegation reads it.
             schema["required"] = serde_json::json!(["instructions"]);
+            schema["additionalProperties"] = serde_json::json!(false);
+            if let Some(properties) = schema["properties"].as_object_mut() {
+                properties.remove("parameters");
+            }
         }
 
         Tool::new(
@@ -1856,10 +2071,244 @@ impl SummonClient {
         result
     }
 
+    fn create_specialist_wait_tool(&self) -> Tool {
+        Tool::new(
+            "wait",
+            "Wait for an outstanding dependency: an editor task you started, the first publication from a live member you follow, a reply to your open channel question/request, or an answer to a successfully sent message_parent question. Already-pending coordinator or waking channel news is delivered immediately. What woke you arrives after this result. A channel membership, followers, an unrelated tool call, or a plan you already received does not permit waiting. If you need a further publication, ask its owner with channel_post kind ask first. Never wait for followers, rendering by another member, or finished members. Once your editor results have been reviewed and channel obligations answered, write your final report. On timeout, wait again only for a dependency still outstanding.".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "timeout_s": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": SPECIALIST_WAIT_MAX_SECS,
+                        "description": format!("Longest wait in seconds (default {SPECIALIST_WAIT_DEFAULT_SECS}).")
+                    }
+                },
+                "additionalProperties": false
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+    }
+
+    /// The reminder a source asks for, once per parent session, when two or more of
+    /// the parent's artifact tasks are running and it has not called `tool`.
+    async fn connect_reminder(
+        &self,
+        session_id: &str,
+        tool: &str,
+        reminder: String,
+    ) -> Option<String> {
+        let running = {
+            // The same lock order as delegation: artifact tasks, then background tasks.
+            let artifact_tasks = self.artifact_tasks.lock().await;
+            let tasks = self.background_tasks.lock().await;
+            artifact_tasks
+                .iter()
+                .filter(|((parent, _), task_id)| {
+                    parent == session_id
+                        && tasks
+                            .get(*task_id)
+                            .is_some_and(|task| !task.handle.is_finished())
+                })
+                .map(|(_, task_id)| task_id.clone())
+                .collect::<HashSet<_>>()
+                .len()
+        };
+        if running < 2 || self.connect_reminded.lock().await.contains(session_id) {
+            return None;
+        }
+        let session = self
+            .context
+            .session_manager
+            .get_session(session_id, true)
+            .await
+            .ok()?;
+        let called = session.conversation.as_ref().is_some_and(|conversation| {
+            conversation.messages().iter().any(|message| {
+                message.content.iter().any(|content| match content {
+                    MessageContent::ToolRequest(request) => request
+                        .tool_call
+                        .as_ref()
+                        .is_ok_and(|call| call.name == tool),
+                    _ => false,
+                })
+            })
+        });
+        if called {
+            return None;
+        }
+        self.connect_reminded
+            .lock()
+            .await
+            .insert(session_id.to_string());
+        Some(reminder)
+    }
+
+    fn parent_reply_pending(messages: &[Message]) -> bool {
+        let mut questions = HashSet::new();
+        let mut pending = false;
+        for message in messages {
+            if message
+                .metadata
+                .operation_note(crate::session::MAILBOX_NOTE, "kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("message")
+            {
+                pending = false;
+                questions.clear();
+            }
+            for content in &message.content {
+                match content {
+                    MessageContent::ToolRequest(request)
+                        if request
+                            .tool_call
+                            .as_ref()
+                            .is_ok_and(|call| call.name == "message_parent") =>
+                    {
+                        questions.insert(request.id.as_str());
+                    }
+                    MessageContent::ToolResponse(response)
+                        if questions.contains(response.id.as_str())
+                            && response
+                                .tool_result
+                                .as_ref()
+                                .is_ok_and(|result| result.is_error != Some(true)) =>
+                    {
+                        pending = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        pending
+    }
+
+    fn channel_wait_contexts(messages: &[Message]) -> HashMap<String, ChannelWaitContext> {
+        let mut contexts: HashMap<String, ChannelWaitContext> = HashMap::new();
+        let mut record = |context: ChannelWaitContext| {
+            // A queued notice may be delivered after a newer MCP read. The log
+            // position orders transport snapshots, not facet/artifact freshness.
+            if contexts
+                .get(&context.channel_id)
+                .is_none_or(|current| context.sequence >= current.sequence)
+            {
+                contexts.insert(context.channel_id.clone(), context);
+            }
+        };
+        for message in messages {
+            if let Some(value) = message.metadata.operation_note(
+                crate::session::MAILBOX_NOTE,
+                crate::session::CHANNEL_WAIT_META_KEY,
+            ) {
+                if let Ok(context) = serde_json::from_value(value.clone()) {
+                    record(context);
+                }
+            }
+            for content in &message.content {
+                if let MessageContent::ToolResponse(response) = content {
+                    if let Ok(result) = &response.tool_result {
+                        if result.is_error == Some(true) {
+                            continue;
+                        }
+                        if let Some(value) = result
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.0.get(crate::session::CHANNEL_WAIT_META_KEY))
+                        {
+                            if let Ok(updates) =
+                                serde_json::from_value::<Vec<ChannelWaitContext>>(value.clone())
+                            {
+                                for context in updates {
+                                    record(context);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        contexts
+    }
+
+    /// Sleep until the specialist's mailbox holds something that should wake
+    /// it: an editor result, a coordinator message, or waking channel news.
+    /// Goose delivers it at the checkpoint right after this result.
+    async fn handle_specialist_wait(
+        &self,
+        session_id: &str,
+        arguments: Option<JsonObject>,
+        cancellation_token: CancellationToken,
+    ) -> CallToolResult {
+        let timeout = arguments
+            .as_ref()
+            .and_then(|args| args.get("timeout_s"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(SPECIALIST_WAIT_DEFAULT_SECS)
+            .clamp(1, SPECIALIST_WAIT_MAX_SECS);
+        let manager = &self.context.session_manager;
+        let session = match manager.get_session(session_id, true).await {
+            Ok(session) => session,
+            Err(error) => {
+                return CallToolResult::error(vec![ContentBlock::text(format!("Error: {error}"))])
+            }
+        };
+        let messages = session
+            .conversation
+            .as_ref()
+            .map(|conversation| conversation.messages().to_vec())
+            .unwrap_or_default();
+        let running = running_editor_tasks(&session, &messages);
+        let channel_waiting = Self::channel_wait_contexts(&messages)
+            .values()
+            .any(ChannelWaitContext::is_waiting);
+        let parent_waiting = Self::parent_reply_pending(&messages);
+        let started = Instant::now();
+        loop {
+            match manager.pending_session_messages(session_id).await {
+                Ok(pending) if pending.iter().any(|message| message.interrupts_wait()) => {
+                    return CallToolResult::success(vec![ContentBlock::text(format!(
+                        "Woken after {}s: what arrived follows this result. Act on it, then call wait again while you still wait for something.",
+                        started.elapsed().as_secs()
+                    ))]);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Error: {error}"
+                    ))])
+                }
+            }
+            if running.is_empty() && !channel_waiting && !parent_waiting {
+                return CallToolResult::error(vec![ContentBlock::text(
+                    "Error: Nothing to wait for: no editor task of yours is running, no first upstream publication is outstanding, and no channel question/request or successfully sent parent question awaits a reply. Channel membership and followers do not permit waiting. If you need a further publication, ask its owner with channel_post kind ask; otherwise finish your review, answer any channel obligations, and write your final report.",
+                )]);
+            }
+            if started.elapsed() >= Duration::from_secs(timeout) {
+                let still = if running.is_empty() {
+                    " Your publication or reply dependency is still outstanding; do independent work if any remains.".to_string()
+                } else {
+                    format!(" Editor tasks still running: {}.", running.join(", "))
+                };
+                return CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Nothing arrived in {timeout}s.{still} Call wait again only while something you wait for can still arrive (an editor result, a reply to your question, or a publish you follow); otherwise write your final report."
+                ))]);
+            }
+            tokio::select! {
+                _ = cancellation_token.cancelled() => {
+                    return CallToolResult::error(vec![ContentBlock::text("Error: The wait was cancelled.")]);
+                }
+                _ = tokio::time::sleep(SPECIALIST_WAIT_POLL) => {}
+            }
+        }
+    }
+
     fn create_message_parent_tool(&self) -> Tool {
         Tool::new(
             "message_parent",
-            "Ask the parent one concrete question without ending this task. Use it only in exceptional cases: when you cannot continue without an answer that only the parent or the user can give. The parent replies through your task. Never use it for progress, results, warnings, or limitations; your final report, including any limitation, is delivered automatically.".to_string(),
+            "Ask the parent one concrete question without ending this task. Use it only in exceptional cases: when you cannot continue without an answer that only the parent or the user can give. The parent replies through your task. Never use it for progress, results, warnings, or limitations; your final report, including any limitation, is delivered automatically. A message that asks no question is refused.".to_string(),
             serde_json::json!({
                 "type": "object",
                 "required": ["message"],
@@ -2534,11 +2983,15 @@ impl SummonClient {
     ) -> Result<CallToolResult, String> {
         self.cleanup_completed_tasks().await;
 
-        let params: DelegateParams = arguments
+        let mut params: DelegateParams = arguments
             .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
             .transpose()
             .map_err(|e| format!("Invalid parameters: {}", e))?
             .unwrap_or_default();
+        // An empty `parameters: {}` passes nothing; treat it as absent.
+        if params.parameters.as_ref().is_some_and(HashMap::is_empty) {
+            params.parameters = None;
+        }
 
         self.validate_delegate_params(&params)?;
 
@@ -2743,6 +3196,12 @@ impl SummonClient {
             .instructions
             .as_deref()
             .is_some_and(|instructions| !instructions.trim().is_empty());
+        if specialist && params.parameters.is_some() {
+            return Err(
+                "Specialists take no parameters: pass instructions, artifact_key and the other fields at the top level of delegate."
+                    .to_string(),
+            );
+        }
         if specialist && !has_instructions {
             return Err(format!(
                 "Delegation to {} requires instructions with the complete task: the requested outcome and the user's requirements for this deliverable, plus any Research-dependent and Evidence IDs lines. The specialist starts from these instructions; send is only for steering it after it is running.",
@@ -2753,6 +3212,9 @@ impl SummonClient {
     }
 
     fn validate_delegate_params(&self, params: &DelegateParams) -> Result<(), String> {
+        if let Some(error) = nested_delegate_fields_error(params) {
+            return Err(error);
+        }
         if params.instructions.is_none() && params.source.is_none() {
             return Err("Must provide 'instructions' or 'source' (or both)".to_string());
         }
@@ -2813,10 +3275,27 @@ impl SummonClient {
         session_id: &str,
         working_dir: &Path,
     ) -> Result<Recipe, String> {
-        let source = self
+        let source = match self
             .resolve_source(session_id, source_name, working_dir)
             .await?
-            .ok_or_else(|| format!("Source '{}' not found", source_name))?;
+        {
+            Some(source) => source,
+            None => {
+                let available: Vec<String> = self
+                    .get_sources(session_id, working_dir)
+                    .await
+                    .into_iter()
+                    .filter(|source| {
+                        matches!(
+                            source.source_type,
+                            SourceType::Agent | SourceType::Recipe | SourceType::Subrecipe
+                        )
+                    })
+                    .map(|source| source.name)
+                    .collect();
+                return Err(unknown_delegate_source_error(source_name, &available));
+            }
+        };
 
         let mut recipe = match source.source_type {
             SourceType::Recipe | SourceType::Subrecipe => {
@@ -3519,6 +3998,18 @@ impl SummonClient {
         };
         let non_blocking = source_flag("non_blocking");
         let event_driven_parent = source_flag("event_driven_parent");
+        let source_text = |name: &str| {
+            source
+                .as_ref()
+                .and_then(|source| source.properties.get(name))
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        // A source can remind its parent, once, to connect artifacts it delegates in
+        // parallel: shown when two or more artifact tasks run and the parent has not
+        // called the connecting tool.
+        let connect_reminder = source_text("connect_reminder").zip(source_text("connect_tool"));
         let artifact_keys = if source_flag("artifact_guard") {
             vec![Self::artifact_key(&params)?]
         } else {
@@ -3688,14 +4179,21 @@ impl SummonClient {
                 .await
                 .insert(session_id.to_string());
         }
+        let reminder = match connect_reminder {
+            Some((reminder, tool)) => self.connect_reminder(session_id, &tool, reminder).await,
+            None => None,
+        };
 
         if event_driven_parent {
-            let content = vec![ContentBlock::text(format!(
+            let mut content = vec![ContentBlock::text(format!(
                 "Task {task_id} started in background: \"{description}\"\n\
                  It already has its complete task and reports back automatically: you are resumed for its terminal report or for a question it asks. \
                  Once you have delegated everything and finished any independent work, tell the user once, in their terms, what you are working on, then call wait. \
                  Use send(task_id: \"{task_id}\", message: \"...\") only to steer it with new guidance or answer its question."
             ))];
+            if let Some(reminder) = reminder {
+                content.push(ContentBlock::text(reminder));
+            }
             return Ok((
                 super::coordinator_fixes::with_correction(content, correction),
                 task_id,
@@ -3731,18 +4229,29 @@ impl McpClientTrait for SummonClient {
     ) -> Result<ListToolsResult, Error> {
         self.cleanup_completed_tasks().await;
 
-        let is_subagent = self
+        let session = self
             .context
             .session_manager
             .get_session(session_id, false)
             .await
-            .map(|s| s.session_type == SessionType::SubAgent)
-            .unwrap_or(false);
+            .ok();
+        let is_subagent = session
+            .as_ref()
+            .is_some_and(|s| s.session_type == SessionType::SubAgent);
 
         let mut tools = vec![self.create_load_tool()];
 
         if is_subagent {
             tools.push(self.create_message_parent_tool());
+            // A specialist that starts editor tasks sleeps until their results,
+            // its parent's messages or its channel news arrive.
+            if session
+                .as_ref()
+                .and_then(SummonTaskPolicy::from_session)
+                .is_some_and(|policy| !policy.artifact_result_tools.is_empty())
+            {
+                tools.push(self.create_specialist_wait_tool());
+            }
         } else {
             let working_dir = self.get_working_dir(session_id).await;
             let sources = self.get_sources(session_id, &working_dir).await;
@@ -3819,14 +4328,16 @@ impl McpClientTrait for SummonClient {
                         let tasks = self.background_tasks.lock().await;
                         let Some(task) = tasks.get(&params.task_id) else {
                             return Err(anyhow::anyhow!(
-                                "Task '{}' is not running",
-                                params.task_id
+                                "Task '{}' is not running. {}",
+                                params.task_id,
+                                redelegate_hint(&params.task_id)
                             ));
                         };
                         if task.handle.is_finished() {
                             return Err(anyhow::anyhow!(
-                                "Task '{}' has already finished",
-                                params.task_id
+                                "Task '{}' has already finished. {}",
+                                params.task_id,
+                                redelegate_hint(&params.task_id)
                             ));
                         }
                         self.context
@@ -3848,7 +4359,21 @@ impl McpClientTrait for SummonClient {
                     ))])),
                 }
             }
-            "wait" => Ok(self.handle_wait(session_id).await),
+            "wait" => {
+                let is_subagent = self
+                    .context
+                    .session_manager
+                    .get_session(session_id, false)
+                    .await
+                    .is_ok_and(|session| session.session_type == SessionType::SubAgent);
+                if is_subagent {
+                    Ok(self
+                        .handle_specialist_wait(session_id, arguments, cancellation_token)
+                        .await)
+                } else {
+                    Ok(self.handle_wait(session_id).await)
+                }
+            }
             "message_parent" => {
                 let params: std::result::Result<MessageParentParams, _> = arguments
                     .map(|args| serde_json::from_value(serde_json::Value::Object(args)))
@@ -3862,6 +4387,11 @@ impl McpClientTrait for SummonClient {
                     Ok(params) if params.message.trim().is_empty() => {
                         Ok(CallToolResult::error(vec![ContentBlock::text(
                             "Error: message_parent requires the question to ask.",
+                        )]))
+                    }
+                    Ok(params) if !asks_question(&params.message) => {
+                        Ok(CallToolResult::error(vec![ContentBlock::text(
+                            "Error: message_parent carries only a question the parent must answer, and this message asks none. Progress, results and limitations reach the parent in your final report; continue your work, or ask one concrete question.",
                         )]))
                     }
                     Ok(params) => {
@@ -4060,7 +4590,7 @@ impl McpClientTrait for SummonClient {
 
         if has_running {
             lines.push(if event_driven && turn_ends_task {
-                "\n→ A task in the report above has ended while others still run. Unless that report is unrelated to the current request, write a brief update giving the current status of every requested artifact, each one finished so far and each one still in progress, then call wait. You are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
+                "\n→ A task in the report above has ended while others still run. Unless that report is unrelated to the current request: if it shows that a requested artifact failed or is incomplete and another attempt can still succeed in this turn, delegate its follow-up now, with previous_task_id set to that task, before you write. Then write a brief update giving the current status of every requested artifact, each one finished so far and each one still in progress, then call wait. You are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
                     .to_string()
             } else if event_driven && turn_asks_question {
                 "\n→ The report above is a specialist question and no task has ended. Answer it with send when the request, research, or conversation settles it, then call wait without writing; ask the user only when only they can decide. You are resumed for each terminal report and for each specialist question."
@@ -4186,6 +4716,77 @@ mod tests {
                 "layout_issue_count":0,"issues":[],"omitted_checks":0,"omitted_issues":0,"diagnostics_compacted":false},
             "grounding_integrity":{"validation_status":"valid","saved_associations_count":8,"dropped_count":0,"unresolved_count":0}
         })
+    }
+
+    #[test]
+    fn delivered_receipts_preserve_verified_existing_and_partial_outcomes() {
+        let tools = ["cortex_spreadsheet__delegate_editor_task".to_owned()];
+        for status in ["already_satisfied", "partial"] {
+            let mut receipt = verified_partial_receipt();
+            receipt["status"] = serde_json::json!(status);
+            let notice = |receipt: serde_json::Value| {
+                let mut message = Message::user().with_text("Editor result");
+                message.metadata.set_operation_note(
+                    crate::session::EDITOR_RESULT_NOTE,
+                    "v1",
+                    serde_json::json!({"idempotency_key":"budget", "receipt":receipt}),
+                );
+                message
+            };
+            let summary = artifact_result_summary(&[notice(receipt.clone())], &tools);
+            assert_eq!(
+                summary.completion_description(),
+                if status == "partial" {
+                    "ended with partial artifact output"
+                } else {
+                    "completed successfully"
+                }
+            );
+            if status == "already_satisfied" {
+                assert!(summary
+                    .section()
+                    .contains("existing revision 2 unchanged; no new save"));
+                receipt["verification"]["valid"] = serde_json::json!(false);
+                assert_eq!(
+                    artifact_result_summary(&[notice(receipt)], &tools).completion_description(),
+                    "ended without a confirmed artifact outcome"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_wait_wakes_and_fails_truthfully_without_inference() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let child = reliability_child(&client, &parent, "document:doc", None).await;
+        let cancel = CancellationToken::new();
+        assert!(
+            wait_for_editor_notice(&manager, &child, &cancel, Duration::ZERO)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("deadline")
+        );
+        cancel.cancel();
+        assert!(
+            wait_for_editor_notice(&manager, &child, &cancel, Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        manager
+            .send_to_child(&parent, &child, "Review your editor result")
+            .await
+            .unwrap();
+        wait_for_editor_notice(
+            &manager,
+            &child,
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -4558,7 +5159,7 @@ mod tests {
     #[test]
     fn an_interrupted_editor_wait_is_superseded_by_the_later_wait_for_the_same_task() {
         let delegate = "cortex_presentation__delegate_editor_task";
-        let wait = "cortex_presentation__await_editor_task";
+        let wait = "cortex_presentation__editor_result";
         let call = |tool: &str, id: &str, arguments: serde_json::Value| {
             Message::assistant().with_tool_request(
                 id,
@@ -4604,6 +5205,306 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].contains("completed") && lines[0].contains("deck-1"));
         assert!(lines[1].contains("document deck-1") && lines[1].contains("still running"));
+        // The first task has its result; the follow-up still runs.
+        assert_eq!(
+            running_editor_task_keys(&messages, &tools),
+            vec!["fix".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_started_editor_task_runs_until_its_delivered_result() {
+        let delegate = "cortex_document__delegate_editor_task";
+        let started = || {
+            let mut result = CallToolResult::success(vec![ContentBlock::text("queued")]);
+            result.structured_content =
+                Some(serde_json::json!({ "interrupted": true, "job_id": "job-1" }));
+            result
+        };
+        let delivered = || {
+            let mut message = Message::user()
+                .with_text("Your editor task notes finished.")
+                .with_visibility(false, true);
+            message.metadata.set_operation_note(
+                crate::session::EDITOR_RESULT_NOTE,
+                "v1",
+                serde_json::json!({
+                    "idempotency_key": "notes",
+                    "receipt": {
+                        "job_id": "job-1", "status": "completed", "summary": "Notes",
+                        "document_id": "doc-1", "document_revision": 2,
+                    },
+                }),
+            );
+            message
+        };
+        let tools = [delegate.to_string()];
+        let mut messages = vec![
+            Message::assistant().with_tool_request(
+                "c1",
+                Ok(rmcp::model::CallToolRequestParams::new(delegate.to_string()).with_arguments(
+                    serde_json::json!({"editor": "quire", "instruction": "Write", "idempotency_key": "notes"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )),
+            ),
+            Message::user().with_tool_response("c1", Ok(started())),
+        ];
+        assert_eq!(
+            running_editor_task_keys(&messages, &tools),
+            vec!["notes".to_string()]
+        );
+        let lines = artifact_result_lines(&messages, &tools);
+        assert!(lines[0].contains("still running"), "{lines:?}");
+
+        messages.push(delivered());
+        assert!(running_editor_task_keys(&messages, &tools).is_empty());
+        let lines = artifact_result_lines(&messages, &tools);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("completed") && lines[0].contains("doc-1"));
+    }
+
+    #[tokio::test]
+    async fn a_specialist_wait_is_offered_with_editor_tools_and_refuses_with_nothing_to_wait_for() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let child = reliability_child(&client, &parent, "document:doc", None).await;
+        let listed = |result: ListToolsResult| result.tools.iter().any(|tool| tool.name == "wait");
+        assert!(!listed(
+            client
+                .list_tools(&child, None, CancellationToken::new())
+                .await
+                .unwrap()
+        ));
+
+        let mut session = manager.get_session(&child, false).await.unwrap();
+        let mut policy = SummonTaskPolicy::from_session(&session).unwrap();
+        policy.artifact_result_tools = vec!["cortex_document__delegate_editor_task".to_string()];
+        session.extension_data.set_extension_state(
+            "summon",
+            "v1",
+            serde_json::to_value(policy).unwrap(),
+        );
+        manager
+            .update(&child)
+            .extension_data(session.extension_data)
+            .apply()
+            .await
+            .unwrap();
+        assert!(listed(
+            client
+                .list_tools(&child, None, CancellationToken::new())
+                .await
+                .unwrap()
+        ));
+
+        let ctx = ToolCallContext::new(child.clone(), None, None);
+        let refused = client
+            .call_tool(&ctx, "wait", None, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(refused.is_error.unwrap_or(false));
+        assert!(!tool_result_ends_turn(&refused));
+
+        let mut historical = Message::user().with_text("Channel news");
+        historical.metadata.set_operation_note(
+            crate::session::MAILBOX_NOTE,
+            "kind",
+            serde_json::json!("channel"),
+        );
+        manager.add_message(&child, &historical).await.unwrap();
+        let args = || serde_json::json!({"timeout_s": 1}).as_object().cloned();
+        let empty = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.call_tool(&ctx, "wait", args(), CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(empty.is_error, Some(true));
+
+        let unrelated = Message::assistant().with_tool_request(
+            "read-1",
+            Ok(rmcp::model::CallToolRequestParams::new(
+                "cortex_document__channel_read",
+            )),
+        );
+        manager.add_message(&child, &unrelated).await.unwrap();
+        let repeated = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(repeated.is_error, Some(true));
+
+        let context = |sequence: u64, publications: &[&str], replies: &[&str]| {
+            let mut result = CallToolResult::success(vec![]);
+            result.meta = Some(MetaObject(
+                serde_json::json!({
+                    crate::session::CHANNEL_WAIT_META_KEY: [{
+                        "channelId": "c1", "sequence": sequence,
+                        "publications": publications, "replies": replies,
+                    }]
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ));
+            Message::user().with_tool_response("context", Ok(result))
+        };
+        manager
+            .add_message(&child, &context(1, &["deck"], &[]))
+            .await
+            .unwrap();
+        let publication = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_ne!(publication.is_error, Some(true));
+        manager
+            .add_message(&child, &context(2, &[], &["question-1"]))
+            .await
+            .unwrap();
+        let reply = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_ne!(reply.is_error, Some(true));
+        manager
+            .add_message(&child, &context(3, &[], &[]))
+            .await
+            .unwrap();
+        // A delayed join cannot restore a dependency cleared by a newer tool result.
+        manager
+            .add_message(&child, &context(1, &["deck"], &[]))
+            .await
+            .unwrap();
+        let cleared = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(cleared.is_error, Some(true));
+
+        let editor_call = Message::assistant().with_tool_request(
+            "editor",
+            Ok(
+                rmcp::model::CallToolRequestParams::new("cortex_document__delegate_editor_task")
+                    .with_arguments(
+                        serde_json::json!({"idempotency_key": "notes"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+            ),
+        );
+        let mut queued = CallToolResult::success(vec![]);
+        queued.structured_content = Some(serde_json::json!({"job_id": "j1", "status": "queued"}));
+        queued.meta = Some(MetaObject(
+            serde_json::json!({crate::agents::tool_interrupt::INTERRUPTED_META_KEY: true})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+        manager.add_message(&child, &editor_call).await.unwrap();
+        manager
+            .add_message(
+                &child,
+                &Message::user().with_tool_response("editor", Ok(queued)),
+            )
+            .await
+            .unwrap();
+        let editor_wait = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_ne!(editor_wait.is_error, Some(true));
+
+        manager
+            .send_to_child(&parent, &child, "Use the revised plan.")
+            .await
+            .unwrap();
+        let pending = client
+            .call_tool(&ctx, "wait", args(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_ne!(pending.is_error, Some(true));
+        assert!(format!("{:?}", pending.content).contains("Woken"));
+    }
+
+    #[test]
+    fn wait_context_preserves_other_channels_and_ignores_failed_or_malformed_updates() {
+        let notice = |channel: &str, sequence: u64, replies: &[&str]| {
+            let mut message = Message::user().with_text("Channel notice");
+            message.metadata.set_operation_note(
+                crate::session::MAILBOX_NOTE, crate::session::CHANNEL_WAIT_META_KEY,
+                serde_json::json!({"channelId": channel, "sequence": sequence, "publications": [], "replies": replies}),
+            );
+            message
+        };
+        let mut failed = CallToolResult::error(vec![]);
+        failed.meta = Some(MetaObject(
+            serde_json::json!({
+                crate::session::CHANNEL_WAIT_META_KEY: [
+                    {"channelId": "c1", "sequence": 99, "publications": [], "replies": []}
+                ]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ));
+        let mut malformed = Message::user().with_text("Bad context");
+        malformed.metadata.set_operation_note(
+            crate::session::MAILBOX_NOTE,
+            crate::session::CHANNEL_WAIT_META_KEY,
+            serde_json::json!({"channelId": "c1", "replies": []}),
+        );
+        let contexts = SummonClient::channel_wait_contexts(&[
+            notice("c1", 1, &["q1"]),
+            notice("c2", 2, &[]),
+            Message::user().with_tool_response("failed", Ok(failed)),
+            malformed,
+        ]);
+        assert!(contexts["c1"].is_waiting());
+        assert!(!contexts["c2"].is_waiting());
+    }
+
+    #[test]
+    fn only_a_successfully_sent_parent_question_permits_waiting_until_a_reply() {
+        let question = Message::assistant().with_tool_request(
+            "q1",
+            Ok(rmcp::model::CallToolRequestParams::new("message_parent")),
+        );
+        let mut messages = vec![
+            question.clone(),
+            Message::user().with_tool_response("q1", Ok(CallToolResult::error(vec![]))),
+        ];
+        assert!(!SummonClient::parent_reply_pending(&messages));
+        messages
+            .push(Message::user().with_tool_response("q1", Ok(CallToolResult::success(vec![]))));
+        assert!(SummonClient::parent_reply_pending(&messages));
+        let mut reply = Message::user().with_text("Parent answer");
+        reply.metadata.set_operation_note(
+            crate::session::MAILBOX_NOTE,
+            "kind",
+            serde_json::json!("message"),
+        );
+        messages.push(reply);
+        assert!(!SummonClient::parent_reply_pending(&messages));
+        messages.push(question);
+        assert!(!SummonClient::parent_reply_pending(&messages));
+    }
+
+    #[test]
+    fn message_parent_accepts_only_questions() {
+        assert!(asks_question(
+            "Should the notes follow the four-slide deck?"
+        ));
+        assert!(!asks_question("I am aligning the notes task now."));
+    }
+
+    #[test]
+    fn a_send_to_a_task_that_cannot_receive_it_says_how_to_continue() {
+        let hint = redelegate_hint("20261003_4");
+        assert!(hint.contains("previous_task_id set to '20261003_4'"));
     }
 
     #[test]
@@ -4939,7 +5840,8 @@ mod tests {
                 .unwrap_err();
             assert!(error.contains("requires instructions"), "{error}");
         }
-        let arguments = serde_json::json!({"source":"cortex-slides","artifact_key":"new:slides:quarterly","artifact_title":"Quarterly","instructions":"Create the report.","extensions":[],"async":false}).as_object().unwrap().clone();
+        // An empty `parameters` map is ignored rather than refused for a specialist.
+        let arguments = serde_json::json!({"source":"cortex-slides","artifact_key":"new:slides:quarterly","artifact_title":"Quarterly","instructions":"Create the report.","parameters":{},"extensions":[],"async":false}).as_object().unwrap().clone();
         let first = client
             .handle_delegate(
                 &parent,
@@ -5110,6 +6012,75 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(right.previous_task_id.as_deref(), Some(owner.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_parent_running_two_artifact_tasks_is_reminded_once_to_connect_them() {
+        async fn start(coordinator: &SummonClient, parent: &str, id: &str) {
+            let (handle, completion_token) = spawn_background_task(async move {
+                std::future::pending::<()>().await;
+                Ok("done".to_string())
+            });
+            coordinator.background_tasks.lock().await.insert(
+                id.to_string(),
+                BackgroundTask {
+                    id: id.to_string(),
+                    parent_session_id: parent.to_string(),
+                    non_blocking: true,
+                    completion_delivery_error: Arc::new(Mutex::new(None)),
+                    terminal_status: Arc::new(Mutex::new(None)),
+                    description: id.to_string(),
+                    started_at: Instant::now(),
+                    turns: Arc::new(AtomicU32::new(1)),
+                    last_activity: Arc::new(AtomicU64::new(0)),
+                    handle,
+                    cancellation_token: CancellationToken::new(),
+                    completion_token,
+                    notification_sink: buffered_notification_sink(Vec::new()),
+                },
+            );
+            coordinator.artifact_tasks.lock().await.insert(
+                (parent.to_string(), format!("new:document:{id}")),
+                id.to_string(),
+            );
+        }
+        let (_directory, manager, parent, coordinator) = reliability_fixture().await;
+        let reminder = "Connect them.".to_string();
+        start(&coordinator, &parent, "a").await;
+        assert_eq!(
+            coordinator
+                .connect_reminder(&parent, "connect", reminder.clone())
+                .await,
+            None
+        );
+        start(&coordinator, &parent, "b").await;
+        assert_eq!(
+            coordinator
+                .connect_reminder(&parent, "connect", reminder.clone())
+                .await
+                .as_deref(),
+            Some("Connect them.")
+        );
+        assert_eq!(
+            coordinator
+                .connect_reminder(&parent, "connect", reminder.clone())
+                .await,
+            None
+        );
+
+        // A parent that already called the connecting tool is not reminded.
+        coordinator.connect_reminded.lock().await.clear();
+        let called = Message::assistant().with_tool_request(
+            "connect-1",
+            Ok(rmcp::model::CallToolRequestParams::new("connect")),
+        );
+        manager.add_message(&parent, &called).await.unwrap();
+        assert_eq!(
+            coordinator
+                .connect_reminder(&parent, "connect", reminder)
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -6263,11 +7234,15 @@ You review code."#;
                 .get("required"),
             Some(&serde_json::json!(["instructions"]))
         );
-        assert!(client
-            .create_delegate_tool(false)
-            .input_schema
-            .get("required")
-            .is_none());
+        let specialist_schema = client.create_delegate_tool(true).input_schema;
+        assert_eq!(
+            specialist_schema.get("additionalProperties"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(specialist_schema["properties"].get("parameters").is_none());
+        let general_schema = client.create_delegate_tool(false).input_schema;
+        assert!(general_schema.get("required").is_none());
+        assert!(general_schema["properties"].get("parameters").is_some());
     }
 
     #[test]
@@ -6328,6 +7303,42 @@ You review code."#;
             Some("# Reference Context\n\nbackground info")
         );
         assert_eq!(recipe.prompt.as_deref(), Some("do the task"));
+    }
+
+    #[test]
+    fn test_delegate_fields_nested_under_parameters_get_the_top_level_shape() {
+        let nested = DelegateParams {
+            parameters: Some(HashMap::from([
+                ("source".to_string(), serde_json::json!("writer")),
+                ("instructions".to_string(), serde_json::json!("Write it.")),
+            ])),
+            ..Default::default()
+        };
+        let error = nested_delegate_fields_error(&nested).unwrap();
+        assert!(error.starts_with("instructions, source are fields of delegate itself"));
+        assert!(error.contains("at the top level"));
+
+        // A recipe's own parameter that shares a name is left alone.
+        let recipe = DelegateParams {
+            source: Some("report".to_string()),
+            parameters: Some(HashMap::from([(
+                "context".to_string(),
+                serde_json::json!("quarterly"),
+            )])),
+            ..Default::default()
+        };
+        assert!(nested_delegate_fields_error(&recipe).is_none());
+    }
+
+    #[test]
+    fn test_unknown_delegate_source_lists_the_sources_to_use() {
+        let error = unknown_delegate_source_error(
+            "search_index",
+            &["writer".to_string(), "analyst".to_string()],
+        );
+        assert!(error.starts_with("Source 'search_index' not found."));
+        assert!(error.ends_with("writer, analyst."));
+        assert!(unknown_delegate_source_error("search_index", &[]).contains("instructions only"));
     }
 
     #[test]

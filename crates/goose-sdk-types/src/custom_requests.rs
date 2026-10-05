@@ -415,6 +415,70 @@ pub struct TaskEvidenceResponse {
     pub evidence_complete: bool,
 }
 
+/// Outstanding channel dependencies, independent of publication versions or status.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelWaitContext {
+    pub channel_id: String,
+    /// Orders mailbox and tool-result delivery, never artifact alignment.
+    pub sequence: u64,
+    #[serde(default)]
+    pub publications: Vec<String>,
+    #[serde(default)]
+    pub replies: Vec<String>,
+}
+
+impl ChannelWaitContext {
+    pub fn is_waiting(&self) -> bool {
+        !self.publications.is_empty() || !self.replies.is_empty()
+    }
+}
+
+/// Queue a notice for the running task of an attempt that holds one of the
+/// given artifacts (or has the given task ID): channel news, or the result of
+/// an editor task it started. The task reads it at its next checkpoint; `wake`
+/// also ends its wait, and `refresh_tools` re-lists the task's tools first (for
+/// example after it joins a channel).
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/attempt/task-notice", response = TaskNoticeResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskNoticeRequest {
+    pub attempt_key: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub artifact_keys: Vec<String>,
+    pub text: String,
+    #[serde(default)]
+    pub wake: bool,
+    #[serde(default)]
+    pub refresh_tools: bool,
+    /// Makes a retried notice idempotent for its recipient.
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    /// The result of an editor task the recipient started, delivered with the
+    /// notice: `{"idempotency_key": ..., "receipt": {...}}`. Goose counts it as
+    /// that task's result (artifact results, finish guard) once delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_wait: Option<ChannelWaitContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskNoticeStatus {
+    Queued,
+    NotRunning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskNoticeResponse {
+    pub status: TaskNoticeStatus,
+    pub task_id: Option<String>,
+}
+
 /// Get a diagnostic report for a session.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
 #[request(

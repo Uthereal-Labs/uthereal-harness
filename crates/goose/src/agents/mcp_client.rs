@@ -17,11 +17,11 @@ use rmcp::model::{
 use rmcp::{
     model::{
         CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
-        ClientInfo, ClientRequest, GetPromptRequestParams, GetPromptResult, Implementation,
-        InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourcesResult,
-        ListToolsResult, Notification, PaginatedRequestParams, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResult, Request, RequestId, RequestOptionalParam,
-        Role, ServerNotification, ServerResult,
+        ClientInfo, ClientNotification, ClientRequest, CustomNotification, GetPromptRequestParams,
+        GetPromptResult, Implementation, InitializeRequestParams, InitializeResult,
+        ListPromptsResult, ListResourcesResult, ListToolsResult, Notification,
+        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResult,
+        Request, RequestId, RequestOptionalParam, Role, ServerNotification, ServerResult,
     },
     service::{
         ClientInitializeError, ClientLifecycleMode, ClientServiceExt, PeerRequestOptions,
@@ -188,10 +188,20 @@ pub trait McpClientTrait: Send + Sync {
         Ok(())
     }
 
+    /// Tell the tool server that the task `session_id` ended, so it stops the
+    /// work the task started there (best effort; failures are only logged).
+    async fn notify_task_ended(&self, _session_id: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn update_working_dir(&self, _new_dir: PathBuf) -> Result<(), Error> {
         Ok(())
     }
 }
+
+/// Notification a tool server receives when a delegated task that used it ends.
+/// Its params are `{"taskId": <the task's session ID>}`.
+pub const TASK_ENDED_NOTIFICATION: &str = "notifications/goose/task_ended";
 
 struct ActiveToolCallGuard {
     active_tool_calls: Arc<StdMutex<HashMap<String, Vec<String>>>>,
@@ -846,6 +856,15 @@ async fn send_cancel_message(
 impl McpClientTrait for McpClient {
     fn get_info(&self) -> Option<&InitializeResult> {
         self.server_info.as_ref()
+    }
+
+    async fn notify_task_ended(&self, session_id: &str) -> Result<(), Error> {
+        let notification = ClientNotification::CustomNotification(CustomNotification::new(
+            TASK_ENDED_NOTIFICATION,
+            Some(serde_json::json!({ "taskId": session_id })),
+        ));
+        let client = self.client.lock().await;
+        client.peer().send_notification(notification).await
     }
 
     async fn list_resources(

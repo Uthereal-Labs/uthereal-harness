@@ -335,8 +335,11 @@ pub(crate) fn prepare_tools_for_provider(
         gen_ai.usage.output_tokens = tracing::field::Empty,
         gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
         gen_ai.usage.cache_creation.input_tokens = tracing::field::Empty,
+        langfuse.observation.completion_start_time = tracing::field::Empty,
+        uthereal.provider_stream.elapsed_ms = tracing::field::Empty,
         gen_ai.input.messages = tracing::field::Empty,
         gen_ai.system_instructions = tracing::field::Empty,
+        gen_ai.tool.definitions = tracing::field::Empty,
         gen_ai.output.messages = tracing::field::Empty,
     )
 )]
@@ -397,6 +400,15 @@ pub(crate) async fn stream_response_from_provider_in_span(
         span.record("gen_ai.input.messages", input_messages.as_str());
         let system_instructions = gen_ai_telemetry::system_instructions_json(system_prompt);
         span.record("gen_ai.system_instructions", system_instructions.as_str());
+        // With toolshim the tools travel in the system prompt instead; record
+        // whichever set the model was given.
+        let offered = if toolshim_tools.is_empty() {
+            tools
+        } else {
+            toolshim_tools
+        };
+        let tool_definitions = gen_ai_telemetry::tool_definitions_json(offered);
+        span.record("gen_ai.tool.definitions", tool_definitions.as_str());
     }
 
     // Clone owned data to move into the async stream
@@ -411,6 +423,7 @@ pub(crate) async fn stream_response_from_provider_in_span(
     let model_config =
         model_config.with_default_thinking_effort(Config::global().get_goose_thinking_effort());
     let request_started = std::time::Instant::now();
+    let request_started_at = chrono::Utc::now();
     debug!("WAITING_LLM_STREAM_START");
     let stream_result = crate::session_context::with_session_id(
         Some(session_id.clone()),
@@ -547,6 +560,7 @@ pub(crate) async fn stream_response_from_provider_in_span(
             if let Some(usage) = final_usage.as_mut() {
                 fill_stream_timing(usage, request_started, first_content_at);
                 gen_ai_telemetry::record_provider_usage(&span, usage);
+                gen_ai_telemetry::record_stream_timing(&span, request_started_at, usage);
             }
 
             if let Some(msg) = accumulated_message {
@@ -578,6 +592,7 @@ pub(crate) async fn stream_response_from_provider_in_span(
                 if let Some(usage) = usage.as_mut() {
                     fill_stream_timing(usage, request_started, first_content_at);
                     gen_ai_telemetry::record_provider_usage(&span, usage);
+                    gen_ai_telemetry::record_stream_timing(&span, request_started_at, usage);
                 }
                 if capture_message_content {
                     if let Some(message) = message.as_ref() {

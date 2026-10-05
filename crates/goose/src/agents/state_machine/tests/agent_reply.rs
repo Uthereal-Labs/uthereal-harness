@@ -536,3 +536,153 @@ async fn bang_shell_visibility_is_enforced_when_state_machine_is_enabled() -> Re
     let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", Some("1"))]);
     assert_bang_shell_uses_only_user_visible_content().await
 }
+
+#[tokio::test]
+async fn both_loops_wait_for_durable_editor_result_before_finishing() -> Result<()> {
+    for state_machine in [false, true] {
+        let _guard = env_lock::lock_env([(
+            "GOOSE_STATE_MACHINE",
+            Some(if state_machine { "1" } else { "0" }),
+        )]);
+        let (agent, api, parent, directory) = agent_with_dummy_api().await?;
+        let manager = &agent.config.session_manager;
+        let lease = manager
+            .claim_prompt_attempt(&uuid::Uuid::new_v4().to_string(), &"a".repeat(64), &parent)
+            .await?
+            .unwrap();
+        let child = manager
+            .create_session(
+                directory.path().to_path_buf(),
+                "specialist".into(),
+                SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await?;
+        agent
+            .update_provider(
+                agent.provider().await?,
+                ModelConfig::new(goose_providers::openai::OPEN_AI_DEFAULT_MODEL)
+                    .with_canonical_limits("openai"),
+                &child.id,
+            )
+            .await?;
+        let admission = manager
+            .capture_task_admission(&parent, &child.id, "specialist")
+            .await?;
+        let mut data = child.extension_data;
+        let tool = "cortex_document__delegate_editor_task";
+        data.set_extension_state(
+            "summon",
+            "task_admission_v1",
+            serde_json::to_value(admission)?,
+        );
+        data.set_extension_state(
+            "summon",
+            "v1",
+            serde_json::json!({"artifact_key":"document:notes", "artifact_result_tools":[tool]}),
+        );
+        manager
+            .update(&child.id)
+            .parent_session_id(Some(parent.clone()))
+            .extension_data(data)
+            .apply()
+            .await?;
+        manager
+            .add_message(&child.id, &Message::user().with_text("Original assignment"))
+            .await?;
+        manager
+            .add_message(
+                &child.id,
+                &Message::assistant().with_tool_request(
+                    "editor",
+                    Ok(
+                        rmcp::model::CallToolRequestParams::new(tool).with_arguments(
+                            serde_json::json!({"idempotency_key":"notes"})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        ),
+                    ),
+                ),
+            )
+            .await?;
+        manager
+            .add_message(
+                &child.id,
+                &Message::user().with_tool_response(
+                    "editor",
+                    Ok(rmcp::model::CallToolResult::structured(
+                        serde_json::json!({"interrupted":true,"job_id":"job-1"}),
+                    )),
+                ),
+            )
+            .await?;
+        api.on("Try to finish").reply("Premature final report");
+        api.on("Editor finished")
+            .reply("Reviewed durable editor result");
+        let reply = async {
+            let stream = agent
+                .reply(
+                    Message::user().with_text("Try to finish"),
+                    SessionConfig {
+                        id: child.id.clone(),
+                        schedule_id: None,
+                        max_turns: Some(5),
+                        retry_config: None,
+                    },
+                    state_machine,
+                    Some(CancellationToken::new()),
+                )
+                .await?;
+            stream_messages(stream).await
+        };
+        let deliver = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while api.call_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                api.call_count(),
+                1,
+                "waiting must not make more model calls"
+            );
+            assert!(manager
+                .terminal_report_for_child(&parent, &child.id)
+                .await?
+                .is_none());
+            let response = manager.queue_task_notice(&goose_sdk_types::custom_requests::TaskNoticeRequest {
+                attempt_key:lease.key, task_id:Some(child.id.clone()), artifact_keys:vec![], text:"Editor finished".into(), wake:true, refresh_tools:false, dedupe_key:Some("editor:job-1".into()),
+                editor_result:Some(serde_json::json!({"idempotency_key":"notes", "receipt":{"job_id":"job-1","document_id":"notes","document_revision":1,"status":"completed"}})), channel_wait:None,
+            }).await?;
+            assert_eq!(
+                response.status,
+                goose_sdk_types::custom_requests::TaskNoticeStatus::Queued
+            );
+            anyhow::Ok(())
+        };
+        let (messages, delivered) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(reply, deliver)
+        })
+        .await?;
+        delivered?;
+        let messages = messages?;
+        assert!(
+            messages
+                .iter()
+                .map(Message::as_concat_text)
+                .collect::<String>()
+                .contains("Reviewed durable editor result"),
+            "loop={state_machine}, calls={}, messages={messages:?}",
+            api.call_count()
+        );
+        assert_eq!(api.call_count(), 2);
+        assert!(manager
+            .pending_session_messages(&child.id)
+            .await?
+            .is_empty());
+    }
+    Ok(())
+}

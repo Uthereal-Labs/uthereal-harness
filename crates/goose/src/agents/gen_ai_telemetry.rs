@@ -15,6 +15,7 @@ pub(super) fn capture_message_content() -> bool {
 
 pub(super) use goose_agent::telemetry::{
     append_message, input_messages_with_system_json, output_message_json, system_instructions_json,
+    tool_definitions_json,
 };
 
 pub(super) fn simple_input_json(text: &str) -> String {
@@ -57,6 +58,32 @@ pub(super) fn record_provider_usage(span: &Span, usage: &ProviderUsage) {
     }
     if let Some(id) = &usage.response_id {
         span.record("gen_ai.response.id", id.as_str());
+    }
+}
+
+/// Provider stream timing for the generation span: Langfuse shows
+/// `completion_start_time` as time to first token, and the elapsed time marks
+/// when the provider stream ended, separating generation from later agent work.
+pub(super) fn record_stream_timing(
+    span: &Span,
+    request_started_at: chrono::DateTime<chrono::Utc>,
+    usage: &ProviderUsage,
+) {
+    let Some(stats) = usage.stats.as_ref() else {
+        return;
+    };
+    if let Some(first_token_ms) = stats.time_to_first_token_ms {
+        let first_token_at =
+            request_started_at + chrono::Duration::milliseconds(first_token_ms as i64);
+        span.record(
+            "langfuse.observation.completion_start_time",
+            first_token_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                .as_str(),
+        );
+    }
+    if let Some(elapsed_ms) = stats.elapsed_ms {
+        span.record("uthereal.provider_stream.elapsed_ms", elapsed_ms as i64);
     }
 }
 
@@ -491,6 +518,35 @@ mod tests {
         assert_eq!(fields["gen_ai.response.id"], "resp-123");
         assert_eq!(fields["gen_ai.usage.input_tokens"], 10);
         assert_eq!(fields["gen_ai.usage.output_tokens"], 20);
+    }
+
+    #[test]
+    fn record_stream_timing_sets_completion_start_and_elapsed() {
+        let capture = test_support::SpanFieldCapture::new("test_span");
+        let _guard = capture.clone().set_default();
+        let mut usage = ProviderUsage::new("test-model".to_string(), Usage::default());
+        usage.stats = Some(goose_providers::conversation::token_usage::ProviderStats {
+            time_to_first_token_ms: Some(250),
+            elapsed_ms: Some(4000),
+            ..Default::default()
+        });
+        let span = tracing::info_span!(
+            "test_span",
+            "langfuse.observation.completion_start_time" = tracing::field::Empty,
+            "uthereal.provider_stream.elapsed_ms" = tracing::field::Empty,
+        );
+        let started = chrono::DateTime::parse_from_rfc3339("2026-10-04T17:55:56.000Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        record_stream_timing(&span, started, &usage);
+
+        let fields = capture.fields();
+        assert_eq!(
+            fields["langfuse.observation.completion_start_time"],
+            "2026-10-04T17:55:56.250Z"
+        );
+        assert_eq!(fields["uthereal.provider_stream.elapsed_ms"], 4000);
     }
 
     #[test]

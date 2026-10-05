@@ -1136,6 +1136,10 @@ impl McpClientTrait for OAuthStepUpClient {
         self.inner.read().await.get_moim(session_id).await
     }
 
+    async fn notify_task_ended(&self, session_id: &str) -> Result<(), super::mcp_client::Error> {
+        self.inner.read().await.notify_task_ended(session_id).await
+    }
+
     async fn update_working_dir(
         &self,
         new_dir: PathBuf,
@@ -2834,6 +2838,36 @@ impl ExtensionManager {
         for client in clients {
             client.note_reports_delivered(session_id, through_id).await;
         }
+    }
+
+    /// Tell every tool server of this agent that the task `session_id` ended.
+    pub async fn notify_task_ended(&self, session_id: &str) {
+        let clients: Vec<_> = self
+            .extensions
+            .lock()
+            .await
+            .values()
+            .map(|extension| extension.get_client())
+            .collect();
+        futures::future::join_all(clients.into_iter().map(|client| async move {
+            let delivery = async {
+                for attempt in 0..3 {
+                    match client.notify_task_ended(session_id).await {
+                        Ok(()) => return Ok(()),
+                        Err(error) if attempt == 2 => return Err(error),
+                        Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+                    }
+                }
+                unreachable!()
+            };
+            match tokio::time::timeout(Duration::from_secs(5), delivery).await {
+                Ok(Ok(())) => {}
+                outcome => {
+                    tracing::warn!("Task-ended notification failed for {session_id}: {outcome:?}")
+                }
+            }
+        }))
+        .await;
     }
 
     pub async fn shutdown_session(&self, session_id: &str) -> anyhow::Result<()> {

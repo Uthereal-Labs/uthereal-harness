@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
+
+use crate::agents::extension_manager::ExtensionManager;
 
 use crate::agents::state_machine::{
     applied, ends_turn, last_effective_role, messages_since_kickoff, not_applicable, Emitter,
@@ -10,11 +14,18 @@ use crate::session::{Session, SessionManager, SessionType};
 
 pub struct MailboxOperation<'a> {
     session_manager: &'a SessionManager,
+    extension_manager: Arc<ExtensionManager>,
 }
 
 impl<'a> MailboxOperation<'a> {
-    pub(crate) fn new(session_manager: &'a SessionManager) -> Self {
-        Self { session_manager }
+    pub(crate) fn new(
+        session_manager: &'a SessionManager,
+        extension_manager: Arc<ExtensionManager>,
+    ) -> Self {
+        Self {
+            session_manager,
+            extension_manager,
+        }
     }
 }
 
@@ -55,6 +66,13 @@ impl Operation<Session, GooseEffect> for MailboxOperation<'_> {
             return not_applicable();
         }
 
+        if pending.iter().any(|message| message.refreshes_tools()) {
+            // A channel join or leave changed this task's tools; the next
+            // inference lists them again.
+            self.extension_manager
+                .invalidate_tools_cache_and_bump_version()
+                .await;
+        }
         let mut effects = Vec::with_capacity(pending.len());
         for mailbox_message in pending {
             effects.push(GooseEffect::DeliverMailboxMessage {

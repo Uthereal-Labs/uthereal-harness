@@ -1,9 +1,10 @@
-//! Tool calls that a message from the parent task may interrupt.
+//! Tool calls that a message from the parent task or a channel may interrupt.
 //!
 //! A child task blocked in a long wait (for example an editor job) cannot read
 //! its mailbox until the call returns. A tool that declares
 //! [`INTERRUPT_ON_MESSAGE_META_KEY`] in its definition `_meta` is raced against
-//! the child's mailbox: when a parent message is pending,
+//! the child's mailbox: when a parent message or a waking channel notice is
+//! pending,
 //! the call is detached rather than cancelled, so the work it started keeps
 //! running, and the declared notice is returned as the tool result. The agent
 //! then reads the message at its next checkpoint. Cancelling the task still
@@ -18,10 +19,10 @@ use tokio::task::AbortHandle;
 use tracing::Instrument;
 
 use crate::mcp_utils::ToolResult;
-use crate::session::{MailboxMessage, MailboxMessageKind, SessionManager};
+use crate::session::{MailboxMessage, SessionManager};
 
 /// Tool-definition metadata key. Its string value is returned as the tool
-/// result when a parent message interrupts the call.
+/// result when a parent message or a waking channel notice interrupts the call.
 pub const INTERRUPT_ON_MESSAGE_META_KEY: &str = "goose.interruptOnMessage";
 
 /// Tool-result metadata key set on an interrupted call's result.
@@ -29,7 +30,9 @@ pub const INTERRUPTED_META_KEY: &str = "goose.interrupted";
 
 const MAILBOX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// True when a tool result came from an interrupted wait rather than the tool.
+/// True when a tool result says the work it started is still running: a wait
+/// this module interrupted, or a tool server result marked the same way (for
+/// example an editor task that was started and keeps working).
 pub fn was_interrupted(result: &CallToolResult) -> bool {
     result
         .meta
@@ -37,6 +40,12 @@ pub fn was_interrupted(result: &CallToolResult) -> bool {
         .and_then(|meta| meta.0.get(INTERRUPTED_META_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+        || result
+            .structured_content
+            .as_ref()
+            .and_then(|content| content.get("interrupted"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// The interruption notice a tool definition declares, if any.
@@ -49,10 +58,10 @@ pub fn interrupt_notice(tool_meta: Option<&Value>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn newest_parent_message(messages: &[MailboxMessage]) -> Option<i64> {
+fn newest_interrupting_message(messages: &[MailboxMessage]) -> Option<i64> {
     messages
         .iter()
-        .filter(|message| message.kind == MailboxMessageKind::Message)
+        .filter(|message| message.interrupts_wait())
         .map(|message| message.id)
         .max()
 }
@@ -86,7 +95,8 @@ fn interrupted_result(notice: String) -> CallToolResult {
     result
 }
 
-/// Runs `call` until it finishes or pending parent guidance wakes `session_id`.
+/// Runs `call` until it finishes or a pending parent message or waking channel
+/// notice wakes `session_id`.
 pub async fn interruptible_by_parent_message<F>(
     call: F,
     session_manager: Arc<SessionManager>,
@@ -116,7 +126,7 @@ where
                     .pending_session_messages(&session_id)
                     .await
                     .ok()
-                    .and_then(|pending| newest_parent_message(&pending));
+                    .and_then(|pending| newest_interrupting_message(&pending));
                 if newest.is_some() {
                     // Dropping the JoinHandle detaches the call; it keeps running.
                     guard.detach();

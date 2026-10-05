@@ -33,11 +33,11 @@ use crate::agents::retry::{RetryManager, RetryResult};
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
     persist_tool_confirmation_decision, run_goose, BangShellOperation, CompactionOperation,
-    DoctorOperation, Emitter, EndTurnOperation, EntryHookOperation, ExitOnErrorOperation,
-    GooseEffect, GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner,
-    MailboxOperation, MaxTurnsOperation, Operation, ProjectOperation, RecipeOperation,
-    RetryOperation, SkillOperation, SlashCommandOperation, StateMachine, StatusOperation,
-    SteerOperation, SteerQueue, Step, StopHookOperation, ToolApprovalOperation,
+    DoctorOperation, EditorCompletionOperation, Emitter, EndTurnOperation, EntryHookOperation,
+    ExitOnErrorOperation, GooseEffect, GooseInferenceProvider, GooseInferenceRequestPreparer,
+    InferenceRunner, MailboxOperation, MaxTurnsOperation, Operation, ProjectOperation,
+    RecipeOperation, RetryOperation, SkillOperation, SlashCommandOperation, StateMachine,
+    StatusOperation, SteerOperation, SteerQueue, Step, StopHookOperation, ToolApprovalOperation,
     ToolExecutionOperation, ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
 };
 use crate::agents::types::{
@@ -344,14 +344,24 @@ async fn persist_and_push_message_with_id(
     Ok(message)
 }
 
+/// Mailbox messages delivered into the conversation at a checkpoint.
+struct DrainedMailbox {
+    messages: Vec<Message>,
+    /// A delivered channel notice changed which tools the task may use.
+    refresh_tools: bool,
+}
+
 async fn drain_child_mailbox(
     session_manager: &SessionManager,
     session_id: &str,
     conversation: &mut Conversation,
     is_child: bool,
-) -> Result<Vec<Message>> {
+) -> Result<DrainedMailbox> {
     let pending = session_manager.pending_session_messages(session_id).await?;
-    let mut delivered = Vec::with_capacity(pending.len());
+    let mut drained = DrainedMailbox {
+        messages: Vec::with_capacity(pending.len()),
+        refresh_tools: false,
+    };
     for mailbox_message in pending {
         if !is_child && mailbox_message.kind != crate::session::MailboxMessageKind::Steering {
             continue;
@@ -363,10 +373,11 @@ async fn drain_child_mailbox(
             .await?
         {
             conversation.push(message.clone());
-            delivered.push(message);
+            drained.messages.push(message);
+            drained.refresh_tools |= mailbox_message.refreshes_tools();
         }
     }
-    Ok(delivered)
+    Ok(drained)
 }
 
 fn project_message_for_user_event(message: &Message) -> Message {
@@ -1801,7 +1812,10 @@ impl Agent {
             crate::context_mgmt::tool_pair_summarization_enabled() && !manages_own_context;
 
         let mut operations: Vec<Arc<dyn Operation<Session, GooseEffect> + '_>> = vec![
-            Arc::new(MailboxOperation::new(&self.config.session_manager)),
+            Arc::new(MailboxOperation::new(
+                &self.config.session_manager,
+                Arc::clone(&self.extension_manager),
+            )),
             Arc::new(SteerOperation::new(steer_queue, self.hook_manager.clone())),
             Arc::new(MaxTurnsOperation::new(max_turns)),
             Arc::new(BangShellOperation::new()),
@@ -1828,6 +1842,10 @@ impl Agent {
             Arc::new(DoctorOperation),
             Arc::new(ProjectOperation),
             Arc::new(SkillOperation::new(self.hook_manager.clone())),
+            Arc::new(EditorCompletionOperation::new(
+                &self.config.session_manager,
+                cancel.clone(),
+            )),
             Arc::new(RecipeOperation::new(
                 provider.clone(),
                 self.hook_manager.clone(),
@@ -1847,10 +1865,10 @@ impl Agent {
                 std::time::Duration::from_secs(retry_timeout),
                 std::time::Duration::from_secs(on_failure_timeout),
             )),
-            Arc::new(StopHookOperation::new(
-                self.hook_manager.clone(),
-                stop_hook_block_cap,
-            )),
+            Arc::new(
+                StopHookOperation::new(self.hook_manager.clone(), stop_hook_block_cap)
+                    .with_notice_admission(Arc::clone(&self.config.session_manager)),
+            ),
             Arc::new(ExitOnErrorOperation),
         ];
         operations.extend(remaining_operations);
@@ -2721,14 +2739,19 @@ impl Agent {
                 .await?;
             }
             {
-                for message in drain_child_mailbox(
+                let drained = drain_child_mailbox(
                     &session_manager,
                     &session_config.id,
                     &mut conversation,
                     session.session_type == SessionType::SubAgent,
                 )
-                .await?
-                {
+                .await?;
+                if drained.refresh_tools {
+                    self.extension_manager.invalidate_tools_cache_and_bump_version().await;
+                    (tools, toolshim_tools, system_prompt, _) =
+                        self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
+                }
+                for message in drained.messages {
                     yield AgentEvent::Message(message);
                 }
             }
@@ -2742,14 +2765,20 @@ impl Agent {
 
                 if can_drain_pending_steers {
                     {
-                        for message in drain_child_mailbox(
+                        let drained = drain_child_mailbox(
                             &session_manager,
                             &session_config.id,
                             &mut conversation,
                             session.session_type == SessionType::SubAgent,
                         )
-                        .await?
-                        {
+                        .await?;
+                        if drained.refresh_tools {
+                            // A channel join or leave changed this task's tools.
+                            self.extension_manager.invalidate_tools_cache_and_bump_version().await;
+                            (tools, toolshim_tools, system_prompt, _) =
+                                self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
+                        }
+                        for message in drained.messages {
                             yield AgentEvent::Message(message);
                         }
                     }
@@ -2791,12 +2820,25 @@ impl Agent {
                     yield AgentEvent::Message(message.clone());
                     session_manager.add_message(&session_config.id, &message).await?;
                     conversation.push(message);
+                    if session.session_type == SessionType::SubAgent
+                        && !super::platform_extensions::summon::running_editor_tasks(&session, conversation.messages()).is_empty() {
+                        super::platform_extensions::summon::wait_for_editor_notice(
+                            &session_manager, &session_config.id, &cancel_token.clone().unwrap_or_default(), std::time::Duration::from_secs(180),
+                        ).await?;
+                        can_drain_pending_steers = true;
+                        continue;
+                    }
 
                     match self
                         .emit_stop_hook_blocking(&session_config.id, &last_assistant_text, &session.working_dir.to_string_lossy())
                         .await
                     {
                         crate::hooks::HookDecision::Allow => {
+                            if session.session_type == SessionType::SubAgent
+                                && !session_manager.close_task_notice_admission(&session_config.id).await? {
+                                can_drain_pending_steers = true;
+                                continue;
+                            }
                             stop_hook_handled_for_exit = true;
                             completed_successfully = true;
                             break;
@@ -3681,12 +3723,32 @@ impl Agent {
                     exit_chat = false;
                 }
 
+                if exit_chat && session.session_type == SessionType::SubAgent {
+                    let running = super::platform_extensions::summon::running_editor_tasks(
+                        &session, conversation.messages(),
+                    );
+                    if !running.is_empty() {
+                        super::platform_extensions::summon::wait_for_editor_notice(
+                            &session_manager, &session_config.id,
+                            &cancel_token.clone().unwrap_or_default(),
+                            std::time::Duration::from_secs(180),
+                        ).await?;
+                        can_drain_pending_steers = true;
+                        exit_chat = false;
+                    }
+                }
+
                 if exit_chat {
                     match self
                         .emit_stop_hook_blocking(&session_config.id, &last_assistant_text, &session.working_dir.to_string_lossy())
                         .await
                     {
                         crate::hooks::HookDecision::Allow => {
+                            if session.session_type == SessionType::SubAgent
+                                && !session_manager.close_task_notice_admission(&session_config.id).await? {
+                                can_drain_pending_steers = true;
+                                continue;
+                            }
                             stop_hook_handled_for_exit = true;
                             completed_successfully = !provider_errored && !provider_reached_output_token_limit;
                             break;

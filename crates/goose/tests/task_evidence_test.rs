@@ -2,8 +2,8 @@ use goose::config::GooseMode;
 use goose::conversation::message::Message;
 use goose::session::{PromptAttemptLease, SessionManager, SessionType};
 use goose_sdk_types::custom_requests::{
-    PromptAttemptState, TaskAdmission, TaskEvidenceRequest, TaskTerminalStatus,
-    ToolReceiptTransportStatus,
+    PromptAttemptState, TaskAdmission, TaskEvidenceRequest, TaskNoticeRequest, TaskNoticeStatus,
+    TaskTerminalStatus, ToolReceiptTransportStatus,
 };
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use serde_json::{json, Value};
@@ -667,4 +667,190 @@ async fn large_native_review_cannot_crowd_out_compact_terminal_proof() {
         .unwrap();
     assert!(!legacy_task.evidence_complete);
     assert!(legacy_task.receipts[0].structured_result.is_none());
+}
+
+#[tokio::test]
+async fn channel_notices_reach_only_the_running_task_holding_the_artifact() {
+    let f = Fixture::new().await;
+    let task = f.child().await.task_id;
+    let mut data = f
+        .manager
+        .get_session(&task, false)
+        .await
+        .unwrap()
+        .extension_data;
+    data.set_extension_state(
+        "summon",
+        "v1",
+        json!({"artifact_key": "new:document:notes"}),
+    );
+    f.manager
+        .update(&task)
+        .extension_data(data)
+        .apply()
+        .await
+        .unwrap();
+    let notice = |keys: &[&str], dedupe: &str| TaskNoticeRequest {
+        attempt_key: f.lease.key.clone(),
+        task_id: None,
+        artifact_keys: keys.iter().map(|key| key.to_string()).collect(),
+        text: "You were added to channel numina.".into(),
+        wake: true,
+        refresh_tools: true,
+        dedupe_key: Some(dedupe.into()),
+        editor_result: None,
+        channel_wait: Some(goose_sdk_types::custom_requests::ChannelWaitContext {
+            channel_id: "c1".into(),
+            sequence: 2,
+            publications: vec!["deck".into()],
+            replies: vec![],
+        }),
+    };
+
+    // Casing and surrounding whitespace reach the task stored as "new:document:notes".
+    let queued = f
+        .manager
+        .queue_task_notice(&notice(&["document:doc-1", " new:document:Notes "], "c:1"))
+        .await
+        .unwrap();
+    assert_eq!(queued.status, TaskNoticeStatus::Queued);
+    assert_eq!(queued.task_id.as_deref(), Some(task.as_str()));
+    // A retried notice is queued once.
+    f.manager
+        .queue_task_notice(&notice(&["new:document:Notes"], "c:1"))
+        .await
+        .unwrap();
+    let pending = f.manager.pending_session_messages(&task).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].interrupts_wait() && pending[0].refreshes_tools());
+    assert_eq!(
+        pending[0]
+            .channel_notice()
+            .unwrap()
+            .channel_wait
+            .unwrap()
+            .publications,
+        vec!["deck"]
+    );
+    assert_eq!(
+        pending[0].prompt().unwrap().as_concat_text(),
+        "You were added to channel numina."
+    );
+
+    // An editor result rides on a notice to the task by ID; a malformed one is refused.
+    let result = |editor_result: serde_json::Value| TaskNoticeRequest {
+        task_id: Some(task.clone()),
+        artifact_keys: Vec::new(),
+        text: "Your editor task 'notes' ended: completed.".into(),
+        refresh_tools: false,
+        dedupe_key: Some("editor:job-1".into()),
+        editor_result: Some(editor_result),
+        ..notice(&[], "unused")
+    };
+    assert!(f
+        .manager
+        .queue_task_notice(&result(json!({"idempotency_key": "notes"})))
+        .await
+        .is_err());
+    let delivered = f
+        .manager
+        .queue_task_notice(&result(
+            json!({"idempotency_key": "notes", "receipt": {"job_id": "job-1", "status": "completed"}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delivered.status, TaskNoticeStatus::Queued);
+    let pending = f.manager.pending_session_messages(&task).await.unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(pending[1].interrupts_wait() && !pending[1].refreshes_tools());
+    assert_eq!(
+        pending[1]
+            .prompt()
+            .unwrap()
+            .metadata
+            .operation_note(goose::session::EDITOR_RESULT_NOTE, "v1")
+            .and_then(|value| value.get("idempotency_key")),
+        Some(&json!("notes"))
+    );
+
+    let elsewhere = f
+        .manager
+        .queue_task_notice(&notice(&["new:document:Other"], "c:2"))
+        .await
+        .unwrap();
+    assert_eq!(elsewhere.status, TaskNoticeStatus::NotRunning);
+
+    assert!(f
+        .manager
+        .enqueue_task_outcome(&task, "done", TaskTerminalStatus::Completed)
+        .await
+        .is_err());
+    for notice in f.manager.pending_session_messages(&task).await.unwrap() {
+        f.manager
+            .deliver_session_message(&task, notice.id, &notice.prompt().unwrap())
+            .await
+            .unwrap();
+    }
+    f.manager
+        .enqueue_task_outcome(&task, "done", TaskTerminalStatus::Completed)
+        .await
+        .unwrap();
+    let finished = f
+        .manager
+        .queue_task_notice(&notice(&["new:document:Notes"], "c:3"))
+        .await
+        .unwrap();
+    assert_eq!(finished.status, TaskNoticeStatus::NotRunning);
+}
+
+#[tokio::test]
+async fn notice_and_completion_have_one_atomic_winner() {
+    let f = Fixture::new().await;
+    for index in 0..20 {
+        let task = f.child().await.task_id;
+        let request = TaskNoticeRequest {
+            attempt_key: f.lease.key.clone(),
+            task_id: Some(task.clone()),
+            artifact_keys: vec![],
+            text: "Review this before finishing".into(),
+            wake: true,
+            refresh_tools: false,
+            dedupe_key: Some(format!("race:{index}")),
+            editor_result: None,
+            channel_wait: None,
+        };
+        let (notice, completion) = tokio::join!(
+            f.manager.queue_task_notice(&request),
+            f.manager
+                .enqueue_task_outcome(&task, "done", TaskTerminalStatus::Completed),
+        );
+        let accepted = notice.unwrap().status;
+        match accepted {
+            TaskNoticeStatus::Queued => {
+                assert!(
+                    completion.is_err(),
+                    "accepted notice must prevent terminal completion"
+                );
+                assert!(!f.manager.close_task_notice_admission(&task).await.unwrap());
+                let pending = f.manager.pending_session_messages(&task).await.unwrap();
+                assert_eq!(pending.len(), 1);
+                f.manager
+                    .deliver_session_message(&task, pending[0].id, &pending[0].prompt().unwrap())
+                    .await
+                    .unwrap();
+                assert!(f
+                    .manager
+                    .enqueue_task_outcome(&task, "done", TaskTerminalStatus::Completed)
+                    .await
+                    .unwrap());
+            }
+            TaskNoticeStatus::NotRunning => {
+                assert!(completion.unwrap());
+            }
+        }
+        assert_eq!(
+            f.manager.queue_task_notice(&request).await.unwrap().status,
+            accepted
+        );
+    }
 }
