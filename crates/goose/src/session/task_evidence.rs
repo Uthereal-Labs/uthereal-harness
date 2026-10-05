@@ -71,6 +71,20 @@ impl SessionManager {
         Ok(admission)
     }
 
+    /// Seal admission only after every accepted channel notice is durable in
+    /// the conversation. The SQLite writer orders this against new notices.
+    pub async fn close_task_notice_admission(&self, task_id: &str) -> Result<bool> {
+        let pool = self.storage().pool().await?;
+        let result = sqlx::query(
+            r#"UPDATE sessions SET extension_data = json_set(COALESCE(extension_data, '{}'), '$."summon.notice_closed_v1"', json('true'))
+               WHERE id = ? AND NOT EXISTS (
+                 SELECT 1 FROM session_mailbox WHERE recipient_session_id = sessions.id
+                 AND kind = 'channel' AND delivered_at IS NULL
+               )"#,
+        ).bind(task_id).execute(pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn enqueue_task_outcome(
         &self,
         task_id: &str,
@@ -84,12 +98,16 @@ impl SessionManager {
             .task_admission(task_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Task has no immutable async admission"))?;
+        if !self.close_task_notice_admission(task_id).await? {
+            bail!("Task has undelivered channel notices; completion must wait");
+        }
         let outcome = TaskOutcome { admission, status };
         let result = sqlx::query(
             "INSERT OR IGNORE INTO session_mailbox
              (sender_session_id, recipient_session_id, kind, body, outcome_json, dedupe_key)
              SELECT id, parent_session_id, 'completion', ?, ?, ? FROM sessions
-             WHERE id = ? AND parent_session_id = ?",
+             WHERE id = ? AND parent_session_id = ?
+             AND NOT EXISTS (SELECT 1 FROM session_mailbox WHERE recipient_session_id = sessions.id AND kind = 'channel' AND delivered_at IS NULL)",
         )
         .bind(body)
         .bind(serde_json::to_string(&outcome)?)
@@ -220,8 +238,9 @@ impl SessionManager {
     /// Queue a notice (channel news or an editor result) for the attempt's
     /// running task that holds one of the requested artifacts (or has the
     /// requested ID). A task is running
-    /// until its terminal outcome is queued for its parent; a finished task is
-    /// reported as `not_running` and receives nothing.
+    /// until its finish checkpoint seals notice admission. Fresh notices after
+    /// that checkpoint are `not_running`; retries of accepted dedupe keys remain
+    /// `queued`, including after delivery, so callers can acknowledge lost replies.
     pub async fn queue_task_notice(
         &self,
         request: &TaskNoticeRequest,
@@ -254,19 +273,46 @@ impl SessionManager {
             bail!("Invalid task notice request");
         }
         let pool = self.storage().pool().await?;
+        // Acquire the SQLite writer before checking terminal state; completion
+        // insertion uses the same writer lock and cannot interleave admission.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let binding: Option<(String, String)> = sqlx::query_as(
             "SELECT session_id, run_id FROM prompt_attempts
              WHERE attempt_key = ? AND session_id IS NOT NULL AND run_id IS NOT NULL",
         )
         .bind(&request.attempt_key)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some((parent_session_id, parent_run_id)) = binding else {
             bail!("Attempt does not own a parent session and run");
         };
+        if let Some(dedupe_key) = &request.dedupe_key {
+            let accepted: Option<String> = sqlx::query_scalar(
+                r#"SELECT s.id FROM sessions s JOIN session_mailbox m ON m.recipient_session_id = s.id
+                   WHERE m.sender_session_id = ? AND m.kind = 'channel' AND m.dedupe_key = ?
+                   AND s.parent_session_id = ?
+                   AND json_extract(s.extension_data, '$."summon.task_admission_v1".parentSessionId') = ?
+                   AND json_extract(s.extension_data, '$."summon.task_admission_v1".parentRunId') = ?
+                   AND json_extract(s.extension_data, '$."summon.task_admission_v1".attemptKey') = ?
+                   AND json_extract(s.extension_data, '$."summon.task_admission_v1".taskId') = s.id
+                   AND (s.id = ? OR json_extract(s.extension_data, '$."summon.v1".artifact_key') IN (SELECT value FROM json_each(?)))
+                   LIMIT 1"#,
+            ).bind(&parent_session_id).bind(dedupe_key).bind(&parent_session_id).bind(&parent_session_id)
+             .bind(&parent_run_id).bind(&request.attempt_key).bind(request.task_id.as_deref())
+             .bind(serde_json::to_string(&request.artifact_keys.iter().map(|key| normalize_artifact_key(key)).collect::<Vec<_>>())?)
+             .fetch_optional(&mut *tx).await?;
+            if let Some(task_id) = accepted {
+                tx.commit().await?;
+                return Ok(TaskNoticeResponse {
+                    status: TaskNoticeStatus::Queued,
+                    task_id: Some(task_id),
+                });
+            }
+        }
         let task_id: Option<String> = sqlx::query_scalar(
             r#"SELECT id FROM sessions
              WHERE parent_session_id = ?
+              AND COALESCE(json_extract(extension_data, '$."summon.notice_closed_v1"'), 0) = 0
               AND json_extract(extension_data, '$."summon.task_admission_v1".parentSessionId') = ?
               AND json_extract(extension_data, '$."summon.task_admission_v1".parentRunId') = ?
               AND json_extract(extension_data, '$."summon.task_admission_v1".attemptKey') = ?
@@ -293,7 +339,7 @@ impl SessionManager {
                 .map(normalize_artifact_key)
                 .collect::<Vec<_>>(),
         )?)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some(task_id) = task_id else {
             return Ok(TaskNoticeResponse {
@@ -317,8 +363,9 @@ impl SessionManager {
         .bind(&task_id)
         .bind(serde_json::to_string(&notice)?)
         .bind(request.dedupe_key.as_deref())
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(TaskNoticeResponse {
             status: TaskNoticeStatus::Queued,
             task_id: Some(task_id),

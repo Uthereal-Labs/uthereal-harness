@@ -1314,6 +1314,38 @@ pub(crate) fn running_editor_tasks(
         .unwrap_or_default()
 }
 
+/// Wait without another model call until durable news can be reviewed.
+pub(crate) async fn wait_for_editor_notice(
+    manager: &crate::session::SessionManager,
+    session_id: &str,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<()> {
+    let waiting = async {
+        loop {
+            if manager
+                .pending_session_messages(session_id)
+                .await?
+                .iter()
+                .any(|message| {
+                    message.interrupts_wait()
+                        || message.kind == crate::session::MailboxMessageKind::Channel
+                })
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(SPECIALIST_WAIT_POLL).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => anyhow::bail!("Incomplete artifact output: editor wait cancelled"),
+        result = tokio::time::timeout(timeout, waiting) => {
+            result.map_err(|_| anyhow::anyhow!("Incomplete artifact output: editor result deadline exceeded"))?
+        }
+    }
+}
+
 fn running_editor_task_keys(messages: &[Message], tools: &[String]) -> Vec<String> {
     if tools.is_empty() {
         return Vec::new();
@@ -4684,6 +4716,77 @@ mod tests {
                 "layout_issue_count":0,"issues":[],"omitted_checks":0,"omitted_issues":0,"diagnostics_compacted":false},
             "grounding_integrity":{"validation_status":"valid","saved_associations_count":8,"dropped_count":0,"unresolved_count":0}
         })
+    }
+
+    #[test]
+    fn delivered_receipts_preserve_verified_existing_and_partial_outcomes() {
+        let tools = ["cortex_spreadsheet__delegate_editor_task".to_owned()];
+        for status in ["already_satisfied", "partial"] {
+            let mut receipt = verified_partial_receipt();
+            receipt["status"] = serde_json::json!(status);
+            let notice = |receipt: serde_json::Value| {
+                let mut message = Message::user().with_text("Editor result");
+                message.metadata.set_operation_note(
+                    crate::session::EDITOR_RESULT_NOTE,
+                    "v1",
+                    serde_json::json!({"idempotency_key":"budget", "receipt":receipt}),
+                );
+                message
+            };
+            let summary = artifact_result_summary(&[notice(receipt.clone())], &tools);
+            assert_eq!(
+                summary.completion_description(),
+                if status == "partial" {
+                    "ended with partial artifact output"
+                } else {
+                    "completed successfully"
+                }
+            );
+            if status == "already_satisfied" {
+                assert!(summary
+                    .section()
+                    .contains("existing revision 2 unchanged; no new save"));
+                receipt["verification"]["valid"] = serde_json::json!(false);
+                assert_eq!(
+                    artifact_result_summary(&[notice(receipt)], &tools).completion_description(),
+                    "ended without a confirmed artifact outcome"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_wait_wakes_and_fails_truthfully_without_inference() {
+        let (_directory, manager, parent, client) = reliability_fixture().await;
+        let child = reliability_child(&client, &parent, "document:doc", None).await;
+        let cancel = CancellationToken::new();
+        assert!(
+            wait_for_editor_notice(&manager, &child, &cancel, Duration::ZERO)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("deadline")
+        );
+        cancel.cancel();
+        assert!(
+            wait_for_editor_notice(&manager, &child, &cancel, Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        manager
+            .send_to_child(&parent, &child, "Review your editor result")
+            .await
+            .unwrap();
+        wait_for_editor_notice(
+            &manager,
+            &child,
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]

@@ -780,6 +780,17 @@ async fn channel_notices_reach_only_the_running_task_holding_the_artifact() {
         .unwrap();
     assert_eq!(elsewhere.status, TaskNoticeStatus::NotRunning);
 
+    assert!(f
+        .manager
+        .enqueue_task_outcome(&task, "done", TaskTerminalStatus::Completed)
+        .await
+        .is_err());
+    for notice in f.manager.pending_session_messages(&task).await.unwrap() {
+        f.manager
+            .deliver_session_message(&task, notice.id, &notice.prompt().unwrap())
+            .await
+            .unwrap();
+    }
     f.manager
         .enqueue_task_outcome(&task, "done", TaskTerminalStatus::Completed)
         .await
@@ -790,4 +801,56 @@ async fn channel_notices_reach_only_the_running_task_holding_the_artifact() {
         .await
         .unwrap();
     assert_eq!(finished.status, TaskNoticeStatus::NotRunning);
+}
+
+#[tokio::test]
+async fn notice_and_completion_have_one_atomic_winner() {
+    let f = Fixture::new().await;
+    for index in 0..20 {
+        let task = f.child().await.task_id;
+        let request = TaskNoticeRequest {
+            attempt_key: f.lease.key.clone(),
+            task_id: Some(task.clone()),
+            artifact_keys: vec![],
+            text: "Review this before finishing".into(),
+            wake: true,
+            refresh_tools: false,
+            dedupe_key: Some(format!("race:{index}")),
+            editor_result: None,
+            channel_wait: None,
+        };
+        let (notice, completion) = tokio::join!(
+            f.manager.queue_task_notice(&request),
+            f.manager
+                .enqueue_task_outcome(&task, "done", TaskTerminalStatus::Completed),
+        );
+        let accepted = notice.unwrap().status;
+        match accepted {
+            TaskNoticeStatus::Queued => {
+                assert!(
+                    completion.is_err(),
+                    "accepted notice must prevent terminal completion"
+                );
+                assert!(!f.manager.close_task_notice_admission(&task).await.unwrap());
+                let pending = f.manager.pending_session_messages(&task).await.unwrap();
+                assert_eq!(pending.len(), 1);
+                f.manager
+                    .deliver_session_message(&task, pending[0].id, &pending[0].prompt().unwrap())
+                    .await
+                    .unwrap();
+                assert!(f
+                    .manager
+                    .enqueue_task_outcome(&task, "done", TaskTerminalStatus::Completed)
+                    .await
+                    .unwrap());
+            }
+            TaskNoticeStatus::NotRunning => {
+                assert!(completion.unwrap());
+            }
+        }
+        assert_eq!(
+            f.manager.queue_task_notice(&request).await.unwrap().status,
+            accepted
+        );
+    }
 }

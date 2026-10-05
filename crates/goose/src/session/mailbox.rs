@@ -315,6 +315,9 @@ impl SessionManager {
         body: &str,
     ) -> Result<bool> {
         validate_body(body)?;
+        if !self.close_task_notice_admission(child_session_id).await? {
+            bail!("Task has undelivered channel notices; completion must wait");
+        }
         let pool = self.storage().pool().await?;
         let result = sqlx::query(
             r#"

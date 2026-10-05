@@ -190,7 +190,9 @@ pub trait McpClientTrait: Send + Sync {
 
     /// Tell the tool server that the task `session_id` ended, so it stops the
     /// work the task started there (best effort; failures are only logged).
-    async fn notify_task_ended(&self, _session_id: &str) {}
+    async fn notify_task_ended(&self, _session_id: &str) -> Result<(), Error> {
+        Ok(())
+    }
 
     async fn update_working_dir(&self, _new_dir: PathBuf) -> Result<(), Error> {
         Ok(())
@@ -856,15 +858,13 @@ impl McpClientTrait for McpClient {
         self.server_info.as_ref()
     }
 
-    async fn notify_task_ended(&self, session_id: &str) {
+    async fn notify_task_ended(&self, session_id: &str) -> Result<(), Error> {
         let notification = ClientNotification::CustomNotification(CustomNotification::new(
             TASK_ENDED_NOTIFICATION,
             Some(serde_json::json!({ "taskId": session_id })),
         ));
         let client = self.client.lock().await;
-        if let Err(error) = client.peer().send_notification(notification).await {
-            tracing::debug!("Task-ended notification for {session_id} was not sent: {error}");
-        }
+        client.peer().send_notification(notification).await
     }
 
     async fn list_resources(

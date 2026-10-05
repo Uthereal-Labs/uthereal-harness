@@ -33,11 +33,11 @@ use crate::agents::retry::{RetryManager, RetryResult};
 use crate::agents::state_machine::{
     has_unapplied_tool_confirmation_response, pending_tool_confirmations,
     persist_tool_confirmation_decision, run_goose, BangShellOperation, CompactionOperation,
-    DoctorOperation, Emitter, EndTurnOperation, EntryHookOperation, ExitOnErrorOperation,
-    GooseEffect, GooseInferenceProvider, GooseInferenceRequestPreparer, InferenceRunner,
-    MailboxOperation, MaxTurnsOperation, Operation, ProjectOperation, RecipeOperation,
-    RetryOperation, SkillOperation, SlashCommandOperation, StateMachine, StatusOperation,
-    SteerOperation, SteerQueue, Step, StopHookOperation, ToolApprovalOperation,
+    DoctorOperation, EditorCompletionOperation, Emitter, EndTurnOperation, EntryHookOperation,
+    ExitOnErrorOperation, GooseEffect, GooseInferenceProvider, GooseInferenceRequestPreparer,
+    InferenceRunner, MailboxOperation, MaxTurnsOperation, Operation, ProjectOperation,
+    RecipeOperation, RetryOperation, SkillOperation, SlashCommandOperation, StateMachine,
+    StatusOperation, SteerOperation, SteerQueue, Step, StopHookOperation, ToolApprovalOperation,
     ToolExecutionOperation, ToolPairCompactionOperation, UnknownToolOperation, MAX_TURNS_MESSAGE,
 };
 use crate::agents::types::{
@@ -164,23 +164,6 @@ Address this policy hook denial before trying to stop again."
     );
     Message::user()
         .with_text(nudge)
-        .with_visibility(false, true)
-}
-
-/// How many times a specialist is told not to finish while its editor task runs.
-const MAX_RUNNING_EDITOR_REMINDERS: u32 = 3;
-
-pub(crate) fn running_editor_message(keys: &[String]) -> Message {
-    let (tasks, verb) = if keys.len() == 1 {
-        ("task", "is")
-    } else {
-        ("tasks", "are")
-    };
-    Message::user()
-        .with_text(format!(
-            "Your editor {tasks} {} {verb} still running, so do not finish yet. Call wait: each editor result is delivered to you when the editor finishes; review it before your final report.",
-            keys.join(", ")
-        ))
         .with_visibility(false, true)
 }
 
@@ -1859,6 +1842,10 @@ impl Agent {
             Arc::new(DoctorOperation),
             Arc::new(ProjectOperation),
             Arc::new(SkillOperation::new(self.hook_manager.clone())),
+            Arc::new(EditorCompletionOperation::new(
+                &self.config.session_manager,
+                cancel.clone(),
+            )),
             Arc::new(RecipeOperation::new(
                 provider.clone(),
                 self.hook_manager.clone(),
@@ -1878,10 +1865,10 @@ impl Agent {
                 std::time::Duration::from_secs(retry_timeout),
                 std::time::Duration::from_secs(on_failure_timeout),
             )),
-            Arc::new(StopHookOperation::new(
-                self.hook_manager.clone(),
-                stop_hook_block_cap,
-            )),
+            Arc::new(
+                StopHookOperation::new(self.hook_manager.clone(), stop_hook_block_cap)
+                    .with_notice_admission(Arc::clone(&self.config.session_manager)),
+            ),
             Arc::new(ExitOnErrorOperation),
         ];
         operations.extend(remaining_operations);
@@ -2726,7 +2713,6 @@ impl Agent {
             let mut completed_successfully = false;
             let mut retrying_after_stop_hook_denial = false;
             let mut consecutive_stop_hook_blocks = 0u32;
-            let mut running_editor_reminders = 0u32;
             let stop_hook_block_cap = self.stop_hook_block_cap();
             let mut can_drain_pending_steers = false;
             let turn_start = chrono::Local::now();
@@ -2834,12 +2820,25 @@ impl Agent {
                     yield AgentEvent::Message(message.clone());
                     session_manager.add_message(&session_config.id, &message).await?;
                     conversation.push(message);
+                    if session.session_type == SessionType::SubAgent
+                        && !super::platform_extensions::summon::running_editor_tasks(&session, conversation.messages()).is_empty() {
+                        super::platform_extensions::summon::wait_for_editor_notice(
+                            &session_manager, &session_config.id, &cancel_token.clone().unwrap_or_default(), std::time::Duration::from_secs(180),
+                        ).await?;
+                        can_drain_pending_steers = true;
+                        continue;
+                    }
 
                     match self
                         .emit_stop_hook_blocking(&session_config.id, &last_assistant_text, &session.working_dir.to_string_lossy())
                         .await
                     {
                         crate::hooks::HookDecision::Allow => {
+                            if session.session_type == SessionType::SubAgent
+                                && !session_manager.close_task_notice_admission(&session_config.id).await? {
+                                can_drain_pending_steers = true;
+                                continue;
+                            }
                             stop_hook_handled_for_exit = true;
                             completed_successfully = true;
                             break;
@@ -3724,26 +3723,17 @@ impl Agent {
                     exit_chat = false;
                 }
 
-                // A specialist whose editor task still runs would report
-                // without the editor's result: remind it to wait, a bounded
-                // number of times.
-                if exit_chat
-                    && session.session_type == SessionType::SubAgent
-                    && running_editor_reminders < MAX_RUNNING_EDITOR_REMINDERS
-                {
+                if exit_chat && session.session_type == SessionType::SubAgent {
                     let running = super::platform_extensions::summon::running_editor_tasks(
-                        &session,
-                        conversation.messages(),
+                        &session, conversation.messages(),
                     );
                     if !running.is_empty() {
-                        running_editor_reminders += 1;
-                        persist_and_push_message_with_id(
-                            &session_manager,
-                            &session_config.id,
-                            &mut conversation,
-                            running_editor_message(&running),
-                        )
-                        .await?;
+                        super::platform_extensions::summon::wait_for_editor_notice(
+                            &session_manager, &session_config.id,
+                            &cancel_token.clone().unwrap_or_default(),
+                            std::time::Duration::from_secs(180),
+                        ).await?;
+                        can_drain_pending_steers = true;
                         exit_chat = false;
                     }
                 }
@@ -3754,6 +3744,11 @@ impl Agent {
                         .await
                     {
                         crate::hooks::HookDecision::Allow => {
+                            if session.session_type == SessionType::SubAgent
+                                && !session_manager.close_task_notice_admission(&session_config.id).await? {
+                                can_drain_pending_steers = true;
+                                continue;
+                            }
                             stop_hook_handled_for_exit = true;
                             completed_successfully = !provider_errored && !provider_reached_output_token_limit;
                             break;

@@ -47,6 +47,7 @@ fn block_cap_warning(plugin: &str, cap: u32) -> Message {
 pub struct StopHookOperation {
     hook_manager: HookManager,
     block_cap: u32,
+    notice_manager: Option<std::sync::Arc<crate::session::SessionManager>>,
 }
 
 impl StopHookOperation {
@@ -54,7 +55,16 @@ impl StopHookOperation {
         Self {
             hook_manager,
             block_cap,
+            notice_manager: None,
         }
+    }
+
+    pub fn with_notice_admission(
+        mut self,
+        manager: std::sync::Arc<crate::session::SessionManager>,
+    ) -> Self {
+        self.notice_manager = Some(manager);
+        self
     }
 
     fn trailing_assistant_text(messages: &[Message]) -> String {
@@ -97,7 +107,16 @@ impl Operation<Session, GooseEffect> for StopHookOperation {
             .emit_blocking(HookEvent::Stop, context)
             .await
         {
-            HookDecision::Allow => yielded(),
+            HookDecision::Allow => {
+                if session.session_type == crate::session::SessionType::SubAgent {
+                    if let Some(manager) = &self.notice_manager {
+                        if !manager.close_task_notice_admission(&session.id).await? {
+                            return applied([]);
+                        }
+                    }
+                }
+                yielded()
+            }
             HookDecision::Deny { reason, plugin } => {
                 let blocks = messages
                     .iter()

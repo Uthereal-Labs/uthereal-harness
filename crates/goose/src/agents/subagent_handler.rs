@@ -142,6 +142,62 @@ fn extract_response_text(messages: &Conversation, return_last_only: bool) -> Str
 pub const SUBAGENT_TOOL_REQUEST_TYPE: &str = "subagent_tool_request";
 pub const SUBAGENT_TOOL_RESPONSE_TYPE: &str = "subagent_tool_response";
 
+struct TaskCleanup {
+    signal: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+impl TaskCleanup {
+    fn new(agent: Arc<Agent>, session_id: String) -> Self {
+        let (signal, receiver) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            // Sender drop (including cancellation and panic) starts cleanup too.
+            let _ = receiver.await;
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(6),
+                agent.extension_manager.notify_task_ended(&session_id),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("Task {session_id} tool-server cleanup deadline exceeded");
+            }
+            let settle = async {
+                loop {
+                    let manager = &agent.config.session_manager;
+                    if manager.close_task_notice_admission(&session_id).await? {
+                        return anyhow::Ok(());
+                    }
+                    for notice in manager.pending_session_messages(&session_id).await? {
+                        if notice.kind == crate::session::MailboxMessageKind::Channel {
+                            manager
+                                .deliver_session_message(&session_id, notice.id, &notice.prompt()?)
+                                .await?;
+                        }
+                    }
+                }
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(5), settle).await {
+                Ok(Ok(())) => {}
+                outcome => {
+                    tracing::warn!("Task {session_id} mailbox cleanup did not settle: {outcome:?}")
+                }
+            }
+        });
+        Self {
+            signal: Some(signal),
+            handle: Some(handle),
+        }
+    }
+    async fn finish(mut self) {
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
 fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
     Box::pin(async move {
         let SubagentRunParams {
@@ -254,6 +310,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             retry_config: recipe.retry,
         };
 
+        let cleanup = TaskCleanup::new(Arc::clone(&agent), session_id.clone());
         let mut stream =
             crate::session_context::with_session_id(Some(session_id.to_string()), async {
                 agent
@@ -279,7 +336,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
         drop(stream);
         // The task's tool servers stop the work it started (such as editor
         // tasks) and settle what it owed others.
-        agent.extension_manager.notify_task_ended(&session_id).await;
+        cleanup.finish().await;
         streamed?;
 
         let final_output = get_final_output(&agent, has_response_schema).await;
@@ -405,6 +462,116 @@ mod tests {
     use crate::conversation::Conversation;
     use rmcp::model::{CallToolRequestParams, ServerNotification};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn dropped_execution_settles_durable_notices_and_closes_admission() -> anyhow::Result<()>
+    {
+        use crate::agents::{Agent, AgentConfig, GoosePlatform};
+        use crate::config::{permission::PermissionManager, GooseMode};
+        use crate::session::{SessionManager, SessionType};
+        use std::sync::Arc;
+        let directory = tempfile::tempdir()?;
+        let manager = Arc::new(SessionManager::new(directory.path().to_path_buf()));
+        let parent = manager
+            .create_session(
+                directory.path().into(),
+                "parent".into(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await?;
+        let lease = manager
+            .claim_prompt_attempt(
+                &uuid::Uuid::new_v4().to_string(),
+                &"a".repeat(64),
+                &parent.id,
+            )
+            .await?
+            .unwrap();
+        let child = manager
+            .create_session(
+                directory.path().into(),
+                "child".into(),
+                SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await?;
+        let admission = manager
+            .capture_task_admission(&parent.id, &child.id, "specialist")
+            .await?;
+        let mut data = child.extension_data;
+        data.set_extension_state(
+            "summon",
+            "task_admission_v1",
+            serde_json::to_value(admission)?,
+        );
+        manager
+            .update(&child.id)
+            .parent_session_id(Some(parent.id))
+            .extension_data(data)
+            .apply()
+            .await?;
+        let notice = goose_sdk_types::custom_requests::TaskNoticeRequest {
+            attempt_key: lease.key,
+            task_id: Some(child.id.clone()),
+            artifact_keys: vec![],
+            text: "Durable notice".into(),
+            wake: true,
+            refresh_tools: false,
+            dedupe_key: Some("cleanup:notice".into()),
+            editor_result: None,
+            channel_wait: None,
+        };
+        manager.queue_task_notice(&notice).await?;
+        let agent = Arc::new(Agent::with_config(AgentConfig::new(
+            Arc::clone(&manager),
+            Arc::new(PermissionManager::new(directory.path().join("permissions"))),
+            None,
+            GooseMode::Auto,
+            true,
+            GoosePlatform::GooseCli,
+        )));
+        let cleanup = super::TaskCleanup::new(agent, child.id.clone());
+        drop(cleanup);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let session = manager.get_session(&child.id, true).await?;
+                if session
+                    .extension_data
+                    .get_extension_state("summon", "notice_closed_v1")
+                    == Some(&json!(true))
+                {
+                    assert!(manager
+                        .pending_session_messages(&child.id)
+                        .await?
+                        .is_empty());
+                    assert!(session
+                        .conversation
+                        .unwrap()
+                        .messages()
+                        .iter()
+                        .any(|message| message.as_concat_text() == "Durable notice"));
+                    return anyhow::Ok(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        // Retried acceptance remains acknowledged, while a new notice is refused.
+        assert_eq!(
+            manager.queue_task_notice(&notice).await?.status,
+            goose_sdk_types::custom_requests::TaskNoticeStatus::Queued
+        );
+        let fresh = goose_sdk_types::custom_requests::TaskNoticeRequest {
+            dedupe_key: Some("cleanup:fresh".into()),
+            ..notice
+        };
+        assert_eq!(
+            manager.queue_task_notice(&fresh).await?.status,
+            goose_sdk_types::custom_requests::TaskNoticeStatus::NotRunning
+        );
+        Ok(())
+    }
 
     #[test]
     #[expect(deprecated)]
