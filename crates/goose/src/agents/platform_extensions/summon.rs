@@ -23,8 +23,8 @@ use goose_sdk_types::custom_requests::{
     ChannelWaitContext, SourceEntry, SourceType, TaskTerminalStatus,
 };
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, InitializeResult, JsonObject, ListToolsResult,
-    MetaObject, Role, ServerCapabilities, ServerNotification, Tool,
+    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, InitializeResult,
+    JsonObject, ListToolsResult, MetaObject, Role, ServerCapabilities, ServerNotification, Tool,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -73,7 +73,7 @@ fn asks_question(message: &str) -> bool {
 
 /// How the parent continues a specialist that can no longer receive messages.
 fn redelegate_hint(task_id: &str) -> String {
-    format!("A message cannot reach it. To have its work continue, delegate it again with previous_task_id set to '{task_id}' and an instruction that includes what you meant to send.")
+    format!("A message cannot reach task {task_id}. To have its work continue, delegate its artifact again with the same artifact_key and an instruction that includes what you meant to send.")
 }
 
 fn durable_assistant_turn_count(conversation: &crate::conversation::Conversation) -> u32 {
@@ -116,7 +116,12 @@ pub struct DelegateParams {
     pub source: Option<String>,
     pub artifact_key: Option<String>,
     pub artifact_title: Option<String>,
+    /// Set by delegate, never by the caller: the artifact's last task, which a follow-up continues.
+    #[serde(skip)]
     pub previous_task_id: Option<String>,
+    /// Set by delegate from the artifact tool: "new" while the artifact has no document yet.
+    #[serde(skip)]
+    pub artifact_status: Option<String>,
     pub parameters: Option<HashMap<String, serde_json::Value>>,
     pub extensions: Option<Vec<String>>,
     pub provider: Option<String>,
@@ -297,7 +302,6 @@ const DELEGATE_TOP_LEVEL_FIELDS: &[&str] = &[
     "source",
     "artifact_key",
     "artifact_title",
-    "previous_task_id",
     "context",
     "async",
     "max_turns",
@@ -395,6 +399,14 @@ struct AgentMetadata {
     delegate_only: bool,
     #[serde(default)]
     artifact_result_tools: Vec<String>,
+    /// The parent tool delegate calls to give a delegated artifact its ID.
+    #[serde(default)]
+    artifact_tool: Option<String>,
+    /// The parent tool that connects artifact tasks, and the one-time reminder to use it.
+    #[serde(default)]
+    connect_tool: Option<String>,
+    #[serde(default)]
+    connect_reminder: Option<String>,
 }
 
 fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
@@ -457,6 +469,15 @@ fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
         "artifact_result_tools".to_string(),
         serde_json::json!(metadata.artifact_result_tools),
     );
+    for (key, value) in [
+        ("artifact_tool", metadata.artifact_tool),
+        ("connect_tool", metadata.connect_tool),
+        ("connect_reminder", metadata.connect_reminder),
+    ] {
+        if let Some(value) = value {
+            properties.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
 
     Some(SourceEntry {
         source_type: SourceType::Agent,
@@ -802,14 +823,19 @@ const ARTIFACT_RESULTS_HEADING: &str = "## Artifact results";
 const ARTIFACT_TEXT_BUDGET: usize = 400;
 const ARTIFACT_RECEIPT_PREFIX: &str = "  Saved artifact receipt: ";
 
-/// A conversation document handle, such as `document-3`: how Cortex models name an existing document.
-fn is_document_handle(key: &str) -> bool {
-    key.strip_prefix("document-").is_some_and(|number| {
-        !number.is_empty()
-            && number.len() <= 9
-            && !number.starts_with('0')
-            && number.bytes().all(|byte| byte.is_ascii_digit())
-    })
+/// An artifact ID, such as `presentation-3`: how Cortex names an artifact for its whole
+/// conversation. `kind` limits it to the artifacts one specialist role works on.
+fn is_artifact_id(key: &str, kind: Option<&str>) -> bool {
+    let Some((prefix, number)) = key.rsplit_once('-') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && prefix.bytes().all(|byte| byte.is_ascii_lowercase())
+        && kind.is_none_or(|kind| kind == prefix)
+        && !number.is_empty()
+        && number.len() <= 9
+        && !number.starts_with('0')
+        && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn artifact_assignment(params: &DelegateParams, previous_results: Option<&str>) -> Option<String> {
@@ -818,20 +844,15 @@ fn artifact_assignment(params: &DelegateParams, previous_results: Option<&str>) 
     }
     let mut lines = vec!["Assigned artifact (set by the coordinator for this task):".to_string()];
     if let Some(key) = params.artifact_key.as_deref() {
-        if is_document_handle(key) {
-            lines.push(format!(
-                "- Existing document: {key}. Revise this document; do not create another."
-            ));
+        let new = params
+            .artifact_status
+            .as_deref()
+            .map_or(key.starts_with("new:"), |status| status == "new");
+        lines.push(if new {
+            format!("- Artifact: {key}, a new artifact requested in this turn. Create it.")
         } else {
-            match key.strip_prefix("document:") {
-                Some(id) => lines.push(format!(
-                    "- Existing document ID: {id}. Revise this document; do not create another."
-                )),
-                None => lines.push(format!(
-                    "- Artifact key: {key} (a new artifact requested in this turn)"
-                )),
-            }
-        }
+            format!("- Artifact: {key}, which already exists. Revise it; do not create another.")
+        });
     }
     if let Some(title) = params.artifact_title.as_deref() {
         lines.push(format!("- Title: {title}"));
@@ -868,7 +889,8 @@ fn artifact_target(arguments: Option<&JsonObject>) -> String {
     match (argument("document_id"), argument("title")) {
         (Some(id), _) => format!("document {id}"),
         (None, Some(title)) => format!("a new document titled \"{title}\""),
-        (None, None) => "a new document".to_string(),
+        // A revision names no document: the task's artifact is its target.
+        (None, None) => "the task's artifact".to_string(),
     }
 }
 
@@ -880,6 +902,27 @@ fn tool_result_text(result: &CallToolResult) -> String {
         .map(|text| text.text.as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The artifact tool's answer: the artifact ID and "new" or "existing", given as
+/// structured content and as JSON text.
+fn artifact_resolution(result: &CallToolResult) -> Result<(String, String), String> {
+    let text = tool_result_text(result);
+    if result.is_error == Some(true) {
+        return Err(text);
+    }
+    let value = result
+        .structured_content
+        .clone()
+        .or_else(|| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    match (value["artifact"].as_str(), value["status"].as_str()) {
+        (Some(artifact), Some(status)) => Ok((
+            crate::session::normalize_artifact_key(artifact),
+            status.to_string(),
+        )),
+        _ => Err(format!("The artifact_key could not be resolved: {text}")),
+    }
 }
 
 fn editor_result_value(result: &CallToolResult) -> Option<serde_json::Value> {
@@ -1597,24 +1640,28 @@ impl SummonClient {
         }))
     }
 
+    /// The artifact a delegation names: an artifact ID of the source's kind
+    /// (`presentation-3` for cortex-presentation), or `new:<kind>` for a new artifact
+    /// (anything after the kind is ignored once the artifact tool gives it its ID).
     fn artifact_key(params: &DelegateParams) -> Result<String, String> {
         let role = params
             .source
             .as_deref()
             .and_then(|name| name.strip_prefix("cortex-"))
             .ok_or_else(|| "Artifact-guarded sources must have a cortex role".to_string())?;
-        let new_prefix = format!("new:{role}:");
         let key = params
-                .artifact_key
-                .as_deref()
-                .map(crate::session::normalize_artifact_key)
-                .filter(|key| {
-                    key.strip_prefix("document:").is_some_and(|id| !id.is_empty())
-                        || is_document_handle(key)
-                        || key.strip_prefix(new_prefix.as_str()).is_some_and(|title| !title.is_empty())
-                })
-                .filter(|key| key.len() <= 300)
-                .ok_or_else(|| format!("Office delegation requires artifact_key: the document handle (document-N) of an existing document or {new_prefix}<title>"))?;
+            .artifact_key
+            .as_deref()
+            .map(crate::session::normalize_artifact_key)
+            .filter(|key| {
+                is_artifact_id(key, Some(role))
+                    || key
+                        .strip_prefix("new:")
+                        .and_then(|rest| rest.strip_prefix(role))
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+            })
+            .filter(|key| key.len() <= 300)
+            .ok_or_else(|| format!("Office delegation requires artifact_key: the artifact ID ({role}-N) of an artifact that has one, or new:{role} for a new one"))?;
         if params
             .artifact_title
             .as_ref()
@@ -1625,49 +1672,64 @@ impl SummonClient {
         Ok(key)
     }
 
-    /// Resolves a supplied previous_task_id before anything looks it up. A
-    /// value that cannot name an earlier task for this artifact (none exists in
-    /// this session) is dropped, and the returned note tells the caller; a value
-    /// that names the wrong task is rejected with the right one.
-    async fn normalize_previous_task_id(
+    /// A follow-up continues its artifact's last task: delegate sets previous_task_id
+    /// to the task that owns the artifact in this session, whatever the caller passed.
+    async fn derive_previous_task_id(
         &self,
         session_id: &str,
         artifact_keys: &[String],
         params: &mut DelegateParams,
-    ) -> Result<Option<String>, String> {
-        let Some(previous) = params.previous_task_id.clone() else {
-            return Ok(None);
-        };
+    ) -> Result<(), String> {
+        params.previous_task_id = None;
         if artifact_keys.is_empty() {
-            let task = self
-                .context
-                .session_manager
-                .get_session(&previous, false)
-                .await
-                .map_err(|_| "Unknown previous_task_id".to_string())?;
-            if task.parent_session_id.as_deref() != Some(session_id)
-                || task.session_type != SessionType::SubAgent
-            {
-                return Err(
-                    "previous_task_id must name a task delegated in this session".to_string(),
-                );
-            }
-            return Ok(None);
+            return Ok(());
         }
         let mut artifact_tasks = self.artifact_tasks.lock().await;
         self.reconstruct_artifact_tasks(session_id, &mut artifact_tasks, artifact_keys)
             .await?;
-        let owners: Vec<String> = artifact_keys
+        params.previous_task_id = artifact_keys
             .iter()
-            .filter_map(|key| artifact_tasks.get(&(session_id.to_string(), key.clone())))
-            .cloned()
-            .collect();
-        drop(artifact_tasks);
-        let note = super::coordinator_fixes::previous_task_id_for_artifact(&previous, &owners)?;
-        if note.is_some() {
-            params.previous_task_id = None;
-        }
-        Ok(note)
+            .find_map(|key| artifact_tasks.get(&(session_id.to_string(), key.clone())))
+            .cloned();
+        Ok(())
+    }
+
+    /// Asks the parent's artifact tool (a source's `artifact_tool`) for the artifact ID a
+    /// delegation names: `new:<kind>` reserves the next one, an artifact ID is checked.
+    /// Returns the ID and whether its document exists yet ("new" or "existing").
+    async fn resolve_artifact(
+        &self,
+        session_id: &str,
+        working_dir: &Path,
+        tool: &str,
+        key: &str,
+        kind: &str,
+    ) -> Result<(String, String), String> {
+        let manager = self
+            .context
+            .extension_manager
+            .as_ref()
+            .and_then(|manager| manager.upgrade())
+            .ok_or_else(|| "Artifact IDs are unavailable in this session.".to_string())?;
+        let ctx = ToolCallContext::new(
+            session_id.to_string(),
+            Some(working_dir.to_path_buf()),
+            None,
+        );
+        let mut arguments = JsonObject::new();
+        arguments.insert("artifact_key".to_string(), serde_json::json!(key));
+        arguments.insert("kind".to_string(), serde_json::json!(kind));
+        let call = CallToolRequestParams::new(tool.to_string()).with_arguments(arguments);
+        let dispatched = manager
+            .dispatch_tool_call(&ctx, call, CancellationToken::new())
+            .await
+            .map_err(|error| {
+                format!("The artifact_key could not be resolved: {}", error.message)
+            })?;
+        let result = dispatched.result.await.map_err(|error| {
+            format!("The artifact_key could not be resolved: {}", error.message)
+        })?;
+        artifact_resolution(&result)
     }
 
     async fn check_artifact_owners(
@@ -1967,15 +2029,11 @@ impl SummonClient {
                 },
                 "artifact_key": {
                     "type": "string",
-                    "description": "Stable artifact key: the document handle (document-N) of an existing document, or new:<role>:<requested title>. Keep the same new key throughout the originating turn, including follow-ups after saving."
+                    "description": "The artifact ID (such as presentation-4) of an artifact that has one, including one from an earlier turn, or new:<kind> (document, spreadsheet or presentation) for a new one. The result names a new artifact's ID: use that ID for it from then on, including follow-ups, which continue its last task's saved work."
                 },
                 "artifact_title": {
                     "type": "string",
                     "description": "Current saved or requested title, used only as a display label. Titles do not establish artifact identity."
-                },
-                "previous_task_id": {
-                    "type": "string",
-                    "description": "Only for a follow-up on a task you delegated earlier in this turn: the ID of that finished task, whose result you reviewed. Omit it otherwise, including for an artifact from an earlier turn."
                 },
                 "parameters": {
                     "type": "object",
@@ -2112,10 +2170,16 @@ impl SummonClient {
         result
     }
 
-    fn create_specialist_wait_tool(&self) -> Tool {
+    /// The specialist wait tool; channel rules only for a task in a channel.
+    fn create_specialist_wait_tool(&self, in_channel: bool) -> Tool {
+        let description = if in_channel {
+            "Wait for an outstanding dependency: an editor task you started, the first publication from a live member you follow, a reply to your open channel question/request, or an answer to a successfully sent message_parent question. Already-pending coordinator or waking channel news is delivered immediately. What woke you arrives after this result. A channel membership, followers, an unrelated tool call, or a plan you already received does not permit waiting. If you need a further publication, ask its owner with channel_post kind ask first. Never wait for followers, rendering by another member, or finished members. Once your editor results have been reviewed and channel obligations answered, write your final report. On timeout, wait again only for a dependency still outstanding."
+        } else {
+            "Wait for an outstanding dependency: an editor task you started, or an answer to a successfully sent message_parent question. Already-pending coordinator news is delivered immediately. What woke you arrives after this result. An unrelated tool call does not permit waiting. Once your editor results have been reviewed, write your final report. On timeout, wait again only for a dependency still outstanding."
+        };
         Tool::new(
             "wait",
-            "Wait for an outstanding dependency: an editor task you started, the first publication from a live member you follow, a reply to your open channel question/request, or an answer to a successfully sent message_parent question. Already-pending coordinator or waking channel news is delivered immediately. What woke you arrives after this result. A channel membership, followers, an unrelated tool call, or a plan you already received does not permit waiting. If you need a further publication, ask its owner with channel_post kind ask first. Never wait for followers, rendering by another member, or finished members. Once your editor results have been reviewed and channel obligations answered, write your final report. On timeout, wait again only for a dependency still outstanding.".to_string(),
+            description.to_string(),
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2302,7 +2366,9 @@ impl SummonClient {
             .map(|conversation| conversation.messages().to_vec())
             .unwrap_or_default();
         let running = running_editor_tasks(&session, &messages);
-        let channel_waiting = Self::channel_wait_contexts(&messages)
+        let channel_contexts = Self::channel_wait_contexts(&messages);
+        let in_channel = !channel_contexts.is_empty();
+        let channel_waiting = channel_contexts
             .values()
             .any(ChannelWaitContext::is_waiting);
         let parent_waiting = Self::parent_reply_pending(&messages);
@@ -2323,9 +2389,13 @@ impl SummonClient {
                 }
             }
             if running.is_empty() && !channel_waiting && !parent_waiting {
-                return CallToolResult::error(vec![ContentBlock::text(
-                    "Error: Nothing to wait for: no editor task of yours is running, no first upstream publication is outstanding, and no channel question/request or successfully sent parent question awaits a reply. Channel membership and followers do not permit waiting. If you need a further publication, ask its owner with channel_post kind ask; otherwise finish your review, answer any channel obligations, and write your final report.",
-                )]);
+                // Channel wording only for a task that is in a channel.
+                let text = if in_channel {
+                    "Error: Nothing to wait for: no editor task of yours is running, no first upstream publication is outstanding, and no channel question/request or successfully sent parent question awaits a reply. Channel membership and followers do not permit waiting. If you need a further publication, ask its owner with channel_post kind ask; otherwise finish your review, answer any channel obligations, and write your final report."
+                } else {
+                    "Error: Nothing to wait for: no editor task of yours is running and no successfully sent parent question awaits a reply. Finish your review and write your final report."
+                };
+                return CallToolResult::error(vec![ContentBlock::text(text)]);
             }
             if started.elapsed() >= Duration::from_secs(timeout) {
                 let still = if running.is_empty() {
@@ -3107,8 +3177,7 @@ impl SummonClient {
 
         let working_dir = session.working_dir.clone();
         let mut params = params;
-        self.normalize_previous_task_id(session_id, &[], &mut params)
-            .await?;
+        params.previous_task_id = None;
         let recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
             .await?;
@@ -4051,14 +4120,31 @@ impl SummonClient {
         // parallel: shown when two or more artifact tasks run and the parent has not
         // called the connecting tool.
         let connect_reminder = source_text("connect_reminder").zip(source_text("connect_tool"));
-        let artifact_keys = if source_flag("artifact_guard") {
+        let mut artifact_keys = if source_flag("artifact_guard") {
             vec![Self::artifact_key(&params)?]
         } else {
             Vec::new()
         };
-        let correction = self
-            .normalize_previous_task_id(session_id, &artifact_keys, &mut params)
+        // The parent's artifact tool gives a new artifact its ID and checks an existing one.
+        if let (Some(tool), Some(key), Some(kind)) = (
+            source_text("artifact_tool"),
+            artifact_keys.first().cloned(),
+            params
+                .source
+                .as_deref()
+                .and_then(|name| name.strip_prefix("cortex-"))
+                .map(str::to_string),
+        ) {
+            let (artifact, status) = self
+                .resolve_artifact(session_id, &working_dir, &tool, &key, &kind)
+                .await?;
+            artifact_keys = vec![artifact.clone()];
+            params.artifact_key = Some(artifact);
+            params.artifact_status = Some(status);
+        }
+        self.derive_previous_task_id(session_id, &artifact_keys, &mut params)
             .await?;
+        let artifact = artifact_keys.first().cloned();
         let recipe = self
             .build_delegate_recipe(&params, session_id, &working_dir)
             .await?;
@@ -4232,13 +4318,15 @@ impl SummonClient {
                  Once you have delegated everything and finished any independent work, tell the user once, in their terms, what you are working on, then call wait. \
                  Use send(task_id: \"{task_id}\", message: \"...\") only to steer it with new guidance or answer its question."
             ))];
+            if let Some(key) = artifact.as_deref() {
+                content.push(ContentBlock::text(format!(
+                    "The task works on artifact {key}: name it {key} from now on, in follow-ups, channels and your answer."
+                )));
+            }
             if let Some(reminder) = reminder {
                 content.push(ContentBlock::text(reminder));
             }
-            return Ok((
-                super::coordinator_fixes::with_correction(content, correction),
-                task_id,
-            ));
+            return Ok((content, task_id));
         }
         let retrieval = if non_blocking {
             format!(
@@ -4253,10 +4341,7 @@ impl SummonClient {
             "Task {task_id} started in background: \"{description}\"\n\
              Continue with other work. {retrieval} Use send(task_id: \"{task_id}\", message: \"...\") to provide new guidance."
         ))];
-        Ok((
-            super::coordinator_fixes::with_correction(content, correction),
-            task_id,
-        ))
+        Ok((content, task_id))
     }
 }
 
@@ -4291,7 +4376,19 @@ impl McpClientTrait for SummonClient {
                 .and_then(SummonTaskPolicy::from_session)
                 .is_some_and(|policy| !policy.artifact_result_tools.is_empty())
             {
-                tools.push(self.create_specialist_wait_tool());
+                // A channel notice or channel tool result records the task's
+                // membership; Goose lists tools again when membership changes.
+                let in_channel = self
+                    .context
+                    .session_manager
+                    .get_session(session_id, true)
+                    .await
+                    .ok()
+                    .and_then(|session| session.conversation)
+                    .is_some_and(|conversation| {
+                        !Self::channel_wait_contexts(conversation.messages()).is_empty()
+                    });
+                tools.push(self.create_specialist_wait_tool(in_channel));
             }
         } else {
             let working_dir = self.get_working_dir(session_id).await;
@@ -4631,7 +4728,7 @@ impl McpClientTrait for SummonClient {
 
         if has_running {
             lines.push(if event_driven && turn_ends_task {
-                "\n→ A task in the report above has ended while others still run. Unless that report is unrelated to the current request: if it shows that a requested artifact failed or is incomplete and another attempt can still succeed in this turn, delegate its follow-up now, with previous_task_id set to that task, before you write. Then write a brief update giving the current status of every requested artifact, each one finished so far and each one still in progress, then call wait. You are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
+                "\n→ A task in the report above has ended while others still run. Unless that report is unrelated to the current request: if it shows that a requested artifact failed, or names requested content still missing or wrong in it, and another attempt can still succeed in this turn, delegate its follow-up now with the same artifact_key, before you write. A partial result that names no such concrete gap is reported to the user as it is, not delegated again. Then write a brief update giving the current status of every requested artifact, each one finished so far and each one still in progress, then call wait. You are resumed for each terminal report and for each specialist question. Use send only to give a running specialist new guidance or answer its question."
                     .to_string()
             } else if event_driven && turn_asks_question {
                 "\n→ The report above is a specialist question and no task has ended. Answer it with send when the request, research, or conversation settles it, then call wait without writing; ask the user only when only they can decide. You are resumed for each terminal report and for each specialist question."
@@ -5587,7 +5684,8 @@ mod tests {
     #[test]
     fn a_send_to_a_task_that_cannot_receive_it_says_how_to_continue() {
         let hint = redelegate_hint("20261003_4");
-        assert!(hint.contains("previous_task_id set to '20261003_4'"));
+        assert!(hint.contains("task 20261003_4"));
+        assert!(hint.contains("the same artifact_key"));
     }
 
     #[test]
@@ -5602,48 +5700,54 @@ mod tests {
         );
 
         let follow_up = DelegateParams {
-            artifact_key: Some("new:document:Speaker Notes".to_string()),
+            artifact_key: Some("document-4".to_string()),
             artifact_title: Some("Speaker Notes".to_string()),
             previous_task_id: Some("20260929_14".to_string()),
+            artifact_status: Some("existing".to_string()),
             ..Default::default()
         };
         let assignment = artifact_assignment(&follow_up, previous).unwrap();
-        assert!(assignment.contains("Artifact key: new:document:Speaker Notes"));
+        assert!(assignment.contains("Artifact: document-4, which already exists. Revise it"));
         assert!(assignment.contains("Title: Speaker Notes"));
         assert!(assignment.contains("Follow-up to task 20260929_14"));
         assert!(assignment.contains("document doc-1, saved revision 2"));
         assert!(assignment.contains("continue that document"));
 
-        let existing = DelegateParams {
-            artifact_key: Some("document:doc-9".to_string()),
+        let new = DelegateParams {
+            artifact_key: Some("presentation-3".to_string()),
+            artifact_status: Some("new".to_string()),
             ..Default::default()
         };
-        assert!(artifact_assignment(&existing, None)
-            .unwrap()
-            .contains("Existing document ID: doc-9"));
-        let handle = DelegateParams {
-            artifact_key: Some("document-3".to_string()),
+        assert!(artifact_assignment(&new, None).unwrap().contains(
+            "Artifact: presentation-3, a new artifact requested in this turn. Create it."
+        ));
+        // Without an artifact tool, a new: key stays the artifact key.
+        let unresolved = DelegateParams {
+            artifact_key: Some("new:slides:quarterly".to_string()),
             ..Default::default()
         };
-        assert!(artifact_assignment(&handle, None)
+        assert!(artifact_assignment(&unresolved, None)
             .unwrap()
-            .contains("Existing document: document-3. Revise this document"));
-        assert!(is_document_handle("document-12"));
+            .contains("a new artifact requested in this turn"));
+        assert!(is_artifact_id("document-12", None));
+        assert!(is_artifact_id("presentation-3", Some("presentation")));
+        assert!(!is_artifact_id("presentation-3", Some("document")));
         for key in [
             "document-0",
             "document-",
             "document-3a",
             "document:3",
             "new:document:3",
+            "-3",
         ] {
-            assert!(!is_document_handle(key), "{key}");
+            assert!(!is_artifact_id(key, None), "{key}");
         }
         assert!(describe_editor_result(&serde_json::json!({"document_id": "3beac1e9", "document": "document-3", "status": "completed", "document_revision": 2}))
             .starts_with("- Editor job completed: document document-3, saved revision 2"));
         assert!(artifact_assignment(&DelegateParams::default(), None).is_none());
 
         let source = parse_agent_content(
-            "---\nname: cortex-document\nartifact_result_tools: [cortex_document__delegate_editor_task]\n---\nWrite.",
+            "---\nname: cortex-document\nartifact_result_tools: [cortex_document__delegate_editor_task]\nartifact_tool: uthereal_cortex__resolve_artifact\nconnect_tool: uthereal_cortex__open_channel\nconnect_reminder: Connect them.\n---\nWrite.",
             Path::new("document.md"),
         )
         .unwrap();
@@ -5651,6 +5755,25 @@ mod tests {
             source.properties["artifact_result_tools"],
             serde_json::json!(["cortex_document__delegate_editor_task"])
         );
+        // Source properties delegate reads come through the agent file.
+        assert_eq!(
+            source.properties["artifact_tool"],
+            serde_json::json!("uthereal_cortex__resolve_artifact")
+        );
+        assert_eq!(
+            source.properties["connect_tool"],
+            serde_json::json!("uthereal_cortex__open_channel")
+        );
+        assert_eq!(
+            source.properties["connect_reminder"],
+            serde_json::json!("Connect them.")
+        );
+        let plain = parse_agent_content(
+            "---\nname: cortex-internet\n---\nSearch.",
+            Path::new("internet.md"),
+        )
+        .unwrap();
+        assert!(plain.properties.get("artifact_tool").is_none());
     }
 
     fn create_test_context() -> PlatformExtensionContext {
@@ -6077,43 +6200,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unusable_previous_task_id_is_dropped_and_a_wrong_one_names_the_right_task() {
+    async fn a_follow_up_continues_the_artifacts_last_task_whatever_the_caller_passed() {
         let (_directory, _manager, parent, coordinator) = reliability_fixture().await;
-        let unowned = vec!["document:earlier-turn".to_string()];
         let mut params = DelegateParams {
             previous_task_id: Some("(not available)".to_string()),
             ..Default::default()
         };
-        let note = coordinator
-            .normalize_previous_task_id(&parent, &unowned, &mut params)
+        coordinator
+            .derive_previous_task_id(&parent, &["presentation-9".to_string()], &mut params)
             .await
-            .unwrap()
             .unwrap();
         assert!(params.previous_task_id.is_none());
-        assert!(note.contains("was ignored automatically"));
 
-        let key = "new:presentation:deck".to_string();
+        let key = "presentation-4".to_string();
         let owner = reliability_child(&coordinator, &parent, &key, None).await;
-        let owned = vec![key];
-        let mut wrong = DelegateParams {
+        let mut follow_up = DelegateParams {
             previous_task_id: Some("20260101_1".to_string()),
             ..Default::default()
         };
-        let error = coordinator
-            .normalize_previous_task_id(&parent, &owned, &mut wrong)
+        coordinator
+            .derive_previous_task_id(&parent, &[key], &mut follow_up)
             .await
-            .unwrap_err();
-        assert!(error.contains(&format!("Use previous_task_id: \"{owner}\"")));
-        let mut right = DelegateParams {
-            previous_task_id: Some(owner.clone()),
+            .unwrap();
+        assert_eq!(follow_up.previous_task_id.as_deref(), Some(owner.as_str()));
+    }
+
+    #[test]
+    fn the_artifact_tool_answer_gives_the_id_and_whether_it_is_new() {
+        let answer = r#"{"artifact": "Presentation-1", "status": "new"}"#;
+        let mut structured = CallToolResult::success(vec![ContentBlock::text(answer)]);
+        structured.structured_content = Some(serde_json::from_str(answer).unwrap());
+        let text_only = CallToolResult::success(vec![ContentBlock::text(answer)]);
+        for result in [structured, text_only] {
+            assert_eq!(
+                artifact_resolution(&result).unwrap(),
+                ("presentation-1".to_string(), "new".to_string())
+            );
+        }
+        let refused = CallToolResult::error(vec![ContentBlock::text(
+            "presentation-1 is a presentation; the document specialist works on document artifacts.",
+        )]);
+        assert!(artifact_resolution(&refused)
+            .unwrap_err()
+            .starts_with("presentation-1 is a presentation"));
+        let malformed = CallToolResult::success(vec![ContentBlock::text("{}")]);
+        assert!(artifact_resolution(&malformed)
+            .unwrap_err()
+            .contains("could not be resolved"));
+    }
+
+    #[test]
+    fn a_delegation_names_an_artifact_of_its_specialists_kind_or_asks_for_a_new_one() {
+        let params = |key: &str| DelegateParams {
+            source: Some("cortex-presentation".to_string()),
+            artifact_key: Some(key.to_string()),
             ..Default::default()
         };
-        assert!(coordinator
-            .normalize_previous_task_id(&parent, &owned, &mut right)
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(right.previous_task_id.as_deref(), Some(owner.as_str()));
+        assert_eq!(
+            SummonClient::artifact_key(&params("Presentation-4")).unwrap(),
+            "presentation-4"
+        );
+        assert_eq!(
+            SummonClient::artifact_key(&params("new:presentation")).unwrap(),
+            "new:presentation"
+        );
+        assert_eq!(
+            SummonClient::artifact_key(&params("new:presentation:Deck")).unwrap(),
+            "new:presentation:deck"
+        );
+        for key in [
+            "document-4",
+            "new:document",
+            "new:presentations",
+            "document:abc",
+            "deck",
+        ] {
+            let error = SummonClient::artifact_key(&params(key)).unwrap_err();
+            assert!(error.contains("presentation-N"), "{key}: {error}");
+        }
     }
 
     #[tokio::test]
@@ -6376,12 +6540,12 @@ mod tests {
         let (_directory, _manager, parent, client) = reliability_fixture().await;
         let params = |id: &str| DelegateParams {
             source: Some("cortex-slides".to_string()),
-            artifact_key: Some(format!("document:{id}")),
+            artifact_key: Some(format!("slides-{id}")),
             artifact_title: Some("Quarterly report".to_string()),
             ..Default::default()
         };
-        let first_key = SummonClient::artifact_key(&params("one")).unwrap();
-        let second_key = SummonClient::artifact_key(&params("two")).unwrap();
+        let first_key = SummonClient::artifact_key(&params("1")).unwrap();
+        let second_key = SummonClient::artifact_key(&params("2")).unwrap();
         assert_ne!(first_key, second_key);
         let first = reliability_child(&client, &parent, &first_key, None).await;
         let owners = HashMap::from([((parent.clone(), first_key), first)]);
