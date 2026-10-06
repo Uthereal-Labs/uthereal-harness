@@ -802,19 +802,35 @@ const ARTIFACT_RESULTS_HEADING: &str = "## Artifact results";
 const ARTIFACT_TEXT_BUDGET: usize = 400;
 const ARTIFACT_RECEIPT_PREFIX: &str = "  Saved artifact receipt: ";
 
+/// A conversation document handle, such as `document-3`: how Cortex models name an existing document.
+fn is_document_handle(key: &str) -> bool {
+    key.strip_prefix("document-").is_some_and(|number| {
+        !number.is_empty()
+            && number.len() <= 9
+            && !number.starts_with('0')
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 fn artifact_assignment(params: &DelegateParams, previous_results: Option<&str>) -> Option<String> {
     if params.artifact_key.is_none() && params.artifact_title.is_none() {
         return None;
     }
     let mut lines = vec!["Assigned artifact (set by the coordinator for this task):".to_string()];
     if let Some(key) = params.artifact_key.as_deref() {
-        match key.strip_prefix("document:") {
-            Some(id) => lines.push(format!(
-                "- Existing document ID: {id}. Revise this document; do not create another."
-            )),
-            None => lines.push(format!(
-                "- Artifact key: {key} (a new artifact requested in this turn)"
-            )),
+        if is_document_handle(key) {
+            lines.push(format!(
+                "- Existing document: {key}. Revise this document; do not create another."
+            ));
+        } else {
+            match key.strip_prefix("document:") {
+                Some(id) => lines.push(format!(
+                    "- Existing document ID: {id}. Revise this document; do not create another."
+                )),
+                None => lines.push(format!(
+                    "- Artifact key: {key} (a new artifact requested in this turn)"
+                )),
+            }
         }
     }
     if let Some(title) = params.artifact_title.as_deref() {
@@ -904,10 +920,12 @@ fn describe_editor_result(value: &serde_json::Value) -> String {
                 }
             },
         );
-    let mut line = format!(
-        "- Editor job {status}: document {}, {revision}",
-        text("document_id")
-    );
+    // Reports name the document by its conversation handle when the receipt carries one.
+    let document = match text("document") {
+        "" => text("document_id"),
+        handle => handle,
+    };
+    let mut line = format!("- Editor job {status}: document {document}, {revision}");
     for (label, key) in [("Summary", "summary"), ("Remaining work", "remaining_work")] {
         let field = text(key).trim();
         if !field.is_empty() {
@@ -942,8 +960,20 @@ struct EditorArtifactReceipt {
     #[serde(default)]
     job_id: Option<String>,
     document_id: String,
+    /// The document's conversation handle (document-3), which the model uses in its calls.
+    #[serde(default)]
+    document: Option<String>,
     status: EditorArtifactStatus,
     document_revision: Option<u64>,
+}
+
+/// One artifact's identity across calls and receipts: its conversation handle when known, so a
+/// call naming `document-3` and the receipt for that document's ID are the same artifact.
+fn artifact_identity(document_id: &str, document: Option<&str>) -> String {
+    document
+        .filter(|handle| !handle.is_empty())
+        .unwrap_or(document_id)
+        .to_owned()
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1020,6 +1050,8 @@ impl ArtifactIntegrity {
 struct SavedArtifactReceipt {
     job_id: Option<String>,
     document_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document: Option<String>,
     status: EditorArtifactStatus,
     document_revision: u64,
     saved_revision_id: Option<String>,
@@ -1060,6 +1092,9 @@ fn saved_artifact_receipt(value: &serde_json::Value) -> Option<SavedArtifactRece
     Some(SavedArtifactReceipt {
         job_id: receipt.job_id.filter(|id| id.len() <= 200),
         document_id: receipt.document_id,
+        document: receipt
+            .document
+            .filter(|handle| !handle.is_empty() && handle.len() <= 40),
         status: receipt.status,
         document_revision,
         saved_revision_id,
@@ -1229,7 +1264,12 @@ fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactRe
     let inherited = predecessor_receipts(messages);
     let mut current: HashMap<_, _> = inherited
         .iter()
-        .map(|receipt| (receipt.document_id.clone(), Some(receipt.status)))
+        .map(|receipt| {
+            (
+                artifact_identity(&receipt.document_id, receipt.document.as_deref()),
+                Some(receipt.status),
+            )
+        })
         .collect();
     let mut lines: Vec<String> = inherited
         .iter()
@@ -1252,7 +1292,7 @@ fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactRe
                         .and_then(editor_result_value)
                         .filter(|value| confirmed_editor_status(value).is_some())
                         .and_then(|value| serde_json::from_value::<EditorArtifactReceipt>(value).ok())
-                        .is_some_and(|receipt| receipt.job_id.is_some_and(|job| !job.is_empty()) && !receipt.document_id.is_empty() && (!matches!(receipt.status, EditorArtifactStatus::Completed | EditorArtifactStatus::Partial) || receipt.document_revision.is_some_and(|revision| revision > 0)) && arguments.and_then(|args| args.get("document_id")).and_then(serde_json::Value::as_str).is_none_or(|document| document == receipt.document_id))
+                        .is_some_and(|receipt| receipt.job_id.is_some_and(|job| !job.is_empty()) && !receipt.document_id.is_empty() && (!matches!(receipt.status, EditorArtifactStatus::Completed | EditorArtifactStatus::Partial) || receipt.document_revision.is_some_and(|revision| revision > 0)) && arguments.and_then(|args| args.get("document_id")).and_then(serde_json::Value::as_str).is_none_or(|document| document == receipt.document_id || receipt.document.as_deref() == Some(document)))
             })
         })
         .map(|(_, (id, arguments))| (*id, *arguments))
@@ -1268,7 +1308,7 @@ fn artifact_result_summary(messages: &[Message], tools: &[String]) -> ArtifactRe
                 );
             }
             let receipt = responses.get(id).and_then(|response| response.as_ref().ok()).and_then(editor_result_value).and_then(|value| serde_json::from_value::<EditorArtifactReceipt>(value).ok());
-            let identity = receipt.as_ref().map(|receipt| receipt.document_id.clone()).or_else(|| arguments.and_then(|arguments| arguments.get("document_id")).and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_else(|| format!("call:{id}"));
+            let identity = receipt.as_ref().map(|receipt| artifact_identity(&receipt.document_id, receipt.document.as_deref())).or_else(|| arguments.and_then(|arguments| arguments.get("document_id")).and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_else(|| format!("call:{id}"));
             let rejected = responses.get(id).and_then(|response| response.as_ref().ok()).is_some_and(|result| {
                 serde_json::from_str::<serde_json::Value>(&tool_result_text(result)).ok().is_some_and(|value| value.get("code").and_then(serde_json::Value::as_str) == Some("editor_policy_exhausted"))
             });
@@ -1570,10 +1610,11 @@ impl SummonClient {
                 .map(crate::session::normalize_artifact_key)
                 .filter(|key| {
                     key.strip_prefix("document:").is_some_and(|id| !id.is_empty())
+                        || is_document_handle(key)
                         || key.strip_prefix(new_prefix.as_str()).is_some_and(|title| !title.is_empty())
                 })
                 .filter(|key| key.len() <= 300)
-                .ok_or_else(|| format!("Office delegation requires artifact_key: document:<saved ID> or {new_prefix}<title>"))?;
+                .ok_or_else(|| format!("Office delegation requires artifact_key: the document handle (document-N) of an existing document or {new_prefix}<title>"))?;
         if params
             .artifact_title
             .as_ref()
@@ -1926,7 +1967,7 @@ impl SummonClient {
                 },
                 "artifact_key": {
                     "type": "string",
-                    "description": "Stable artifact key: document:<saved ID> or new:<role>:<requested title>. Keep the same new key throughout the originating turn, including follow-ups after saving."
+                    "description": "Stable artifact key: the document handle (document-N) of an existing document, or new:<role>:<requested title>. Keep the same new key throughout the originating turn, including follow-ups after saving."
                 },
                 "artifact_title": {
                     "type": "string",
@@ -5265,6 +5306,48 @@ mod tests {
         assert!(lines[0].contains("completed") && lines[0].contains("doc-1"));
     }
 
+    #[test]
+    fn a_call_naming_a_document_handle_is_settled_by_the_receipt_for_that_document() {
+        let delegate = "cortex_document__delegate_editor_task";
+        let mut started = CallToolResult::success(vec![ContentBlock::text("queued")]);
+        started.structured_content =
+            Some(serde_json::json!({ "interrupted": true, "job_id": "job-2" }));
+        let mut delivered = Message::user()
+            .with_text("Your editor task notes-fix finished.")
+            .with_visibility(false, true);
+        delivered.metadata.set_operation_note(
+            crate::session::EDITOR_RESULT_NOTE,
+            "v1",
+            serde_json::json!({
+                "idempotency_key": "notes-fix",
+                "receipt": {
+                    "job_id": "job-2", "status": "completed", "summary": "Notes",
+                    "document_id": "723070dc", "document": "document-2", "document_revision": 3,
+                },
+            }),
+        );
+        let tools = [delegate.to_string()];
+        let messages = vec![
+            Message::assistant().with_tool_request(
+                "c1",
+                Ok(rmcp::model::CallToolRequestParams::new(delegate.to_string()).with_arguments(
+                    serde_json::json!({"editor": "quire", "document_id": "document-2", "instruction": "Fix", "idempotency_key": "notes-fix"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )),
+            ),
+            Message::user().with_tool_response("c1", Ok(started)),
+            delivered,
+        ];
+        let lines = artifact_result_lines(&messages, &tools);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("completed") && lines[0].contains("document document-2"),
+            "{lines:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_specialist_wait_is_offered_with_editor_tools_and_refuses_with_nothing_to_wait_for() {
         let (_directory, manager, parent, client) = reliability_fixture().await;
@@ -5538,6 +5621,25 @@ mod tests {
         assert!(artifact_assignment(&existing, None)
             .unwrap()
             .contains("Existing document ID: doc-9"));
+        let handle = DelegateParams {
+            artifact_key: Some("document-3".to_string()),
+            ..Default::default()
+        };
+        assert!(artifact_assignment(&handle, None)
+            .unwrap()
+            .contains("Existing document: document-3. Revise this document"));
+        assert!(is_document_handle("document-12"));
+        for key in [
+            "document-0",
+            "document-",
+            "document-3a",
+            "document:3",
+            "new:document:3",
+        ] {
+            assert!(!is_document_handle(key), "{key}");
+        }
+        assert!(describe_editor_result(&serde_json::json!({"document_id": "3beac1e9", "document": "document-3", "status": "completed", "document_revision": 2}))
+            .starts_with("- Editor job completed: document document-3, saved revision 2"));
         assert!(artifact_assignment(&DelegateParams::default(), None).is_none());
 
         let source = parse_agent_content(
