@@ -61,6 +61,27 @@ pub(super) fn record_provider_usage(span: &Span, usage: &ProviderUsage) {
     }
 }
 
+/// Ends a span when dropped.
+///
+/// tracing-opentelemetry ends a span at its last exit. A provider stream is
+/// read after the instrumented function that created it returned, without
+/// entering its span, so the generation would otherwise end when the stream
+/// opened rather than when it finished. Entering and leaving the span here
+/// moves its end to the moment the stream is done.
+pub(super) struct EndSpanOnDrop(Span);
+
+impl EndSpanOnDrop {
+    pub(super) fn new(span: Span) -> Self {
+        Self(span)
+    }
+}
+
+impl Drop for EndSpanOnDrop {
+    fn drop(&mut self) {
+        let _entered = self.0.enter();
+    }
+}
+
 /// Provider stream timing for the generation span: Langfuse shows
 /// `completion_start_time` as time to first token, and the elapsed time marks
 /// when the provider stream ended, separating generation from later agent work.

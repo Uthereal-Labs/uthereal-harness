@@ -4011,6 +4011,9 @@ impl SummonClient {
         } else if let Some(temp) = recipe.settings.as_ref().and_then(|s| s.temperature) {
             model_config = model_config.with_temperature(Some(temp));
         }
+        if let Some(max_tokens) = Config::global().get_goose_subagent_max_tokens()? {
+            model_config = model_config.with_max_tokens(Some(max_tokens));
+        }
 
         Ok(model_config)
     }

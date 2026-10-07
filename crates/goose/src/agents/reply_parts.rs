@@ -452,6 +452,9 @@ pub(crate) async fn stream_response_from_provider_in_span(
     };
 
     Ok(Box::pin(try_stream! {
+        // The stream is consumed after this function returned, outside the
+        // span; stamp the span's end when the stream is finished or dropped.
+        let _end_span = gen_ai_telemetry::EndSpanOnDrop::new(span.clone());
         if !provider.manages_own_context() {
             let retry_config = provider.retry_config().transient_only();
             let mut attempts = 0;
