@@ -2691,6 +2691,7 @@ impl Agent {
                 let input_messages = gen_ai_telemetry::input_messages_with_system_json(
                     &system_prompt,
                     std::slice::from_ref(last_user_msg),
+                    model_config.supports_vision.unwrap_or_default(),
                 );
                 reply_stream_span.record("gen_ai.input.messages", input_messages.as_str());
             }
