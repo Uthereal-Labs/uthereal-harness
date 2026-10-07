@@ -378,6 +378,18 @@ pub struct TaskToolReceipt {
     pub structured_result: Option<serde_json::Value>,
 }
 
+/// A read-only reference a task was delegated with: an artifact it may read, frozen at
+/// the saved revision it had at delegation, until a later task is delegated to edit it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskReference {
+    pub artifact: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<String>,
+    /// A task delegated after this one edits the artifact: the read access is revoked for good.
+    pub revoked: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskEvidence {
@@ -385,6 +397,8 @@ pub struct TaskEvidence {
     pub artifact_key: Option<String>,
     #[serde(default)]
     pub previous_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_artifacts: Vec<TaskReference>,
     pub admission: TaskAdmission,
     pub outcome: Option<TaskOutcome>,
     pub receipts: Vec<TaskToolReceipt>,

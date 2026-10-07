@@ -212,7 +212,7 @@ status of every requested artifact before `wait`; when the turn carries only a
 child's question, it asks for an answer through `send` and a silent `wait`.
 
 A `send` to a task that has finished or is not running fails with how to
-continue its work: delegate it again with `previous_task_id` set to that task
+continue its work: delegate its artifact again with the same `artifact_key`
 and an instruction that includes the message (`redelegate_hint`).
 
 A `delegate` whose `source` is unknown fails with the sources the caller can
@@ -296,10 +296,25 @@ received the receipt. Every delivered notice also carries a `mailbox`/`kind`
 note (`channel` or `editor_result`). Cortex uses notices for editor results and
 specialist channels; see `specialist_communications.md` in the Cortex harness.
 
-`delegate` checks `previous_task_id` before anything looks it up. A value that
-cannot name an earlier task for the artifact (none exists in this session) is
-dropped, and the result says so as an automatic correction; a value naming the
-wrong task is rejected with the right ID.
+An artifact delegation names its artifact by ID (`presentation-3`) or asks
+for a new one with `new:<kind>`. When the source declares an `artifact_tool`,
+`delegate` calls that parent tool first: it gives a new artifact its ID and
+checks an existing one, and the result tells the parent the ID. The caller
+does not pass `previous_task_id`: `delegate` sets it to the task that last
+worked on the artifact in this session, so a follow-up continues that task's
+saved work.
+
+`reference_artifacts` lists existing artifacts the task may read but not edit
+(at most 8). `delegate` resolves each through the same `artifact_tool`: it
+must exist with a saved revision, must not be the task's own artifact, and no
+running task of the parent may be editing it: otherwise the whole delegation is
+rejected, telling the coordinator to align the two through a channel. The
+task's `summon.v1` policy stores each reference with that revision ID, its
+assignment lists them, and task evidence reports them as `referenceArtifacts`.
+A reference is revoked for good once a later task of the same parent (task
+IDs `YYYYMMDD_N` order delegations) edits that artifact
+(`SessionManager::reference_revoked`); the delegation that does so tells the
+coordinator which running tasks lost access and queues each of them a notice.
 
 The interactive CLI on macOS/Linux checks for reports while its prompt is idle.
 Once the user begins typing, normal line editing owns the terminal until
