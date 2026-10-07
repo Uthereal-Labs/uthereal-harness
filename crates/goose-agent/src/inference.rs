@@ -403,6 +403,7 @@ impl<S: Sync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> 
                 let input_messages = crate::telemetry::input_messages_with_system_json(
                     &system_prompt,
                     conversation_for_provider.messages(),
+                    self.model_config.supports_vision.unwrap_or_default(),
                 );
                 let span = tracing::Span::current();
                 span.record("gen_ai.input.messages", input_messages.as_str());

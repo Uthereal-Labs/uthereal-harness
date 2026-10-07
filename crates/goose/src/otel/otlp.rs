@@ -102,15 +102,62 @@ struct LangfuseSpanExporter {
     environment: Option<String>,
 }
 
+/// A generation's Langfuse input, set explicitly instead of left to Langfuse's
+/// attribute mapping: the messages the model reads (`gen_ai.input.messages`) and,
+/// when the model was offered tools, their definitions (`gen_ai.tool.definitions`).
+fn langfuse_generation_input(attributes: &[KeyValue]) -> Option<String> {
+    let text = |key: &str| {
+        attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == key)
+            .map(|attribute| attribute.value.as_str().into_owned())
+    };
+    if text("langfuse.observation.input").is_some() {
+        return None;
+    }
+    let messages: serde_json::Value = serde_json::from_str(&text("gen_ai.input.messages")?).ok()?;
+    let mut input = serde_json::json!({ "messages": messages });
+    if let Some(tools) = text("gen_ai.tool.definitions")
+        .and_then(|tools| serde_json::from_str::<serde_json::Value>(&tools).ok())
+    {
+        input["tools"] = tools;
+    }
+    Some(input.to_string())
+}
+
+/// A generation's Langfuse output, set alongside its explicit input: once a span
+/// carries `langfuse.observation.input`, Langfuse reads its output only from
+/// `langfuse.observation.output` and no longer maps `gen_ai.output.messages`.
+fn langfuse_generation_output(attributes: &[KeyValue]) -> Option<String> {
+    let text = |key: &str| {
+        attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == key)
+            .map(|attribute| attribute.value.as_str().into_owned())
+    };
+    if text("langfuse.observation.output").is_some() {
+        return None;
+    }
+    text("gen_ai.output.messages")
+}
+
 impl opentelemetry_sdk::trace::SpanExporter for LangfuseSpanExporter {
     async fn export(
         &self,
         mut batch: Vec<opentelemetry_sdk::trace::SpanData>,
     ) -> opentelemetry_sdk::error::OTelSdkResult {
-        if let Some(environment) = &self.environment {
-            for span in &mut batch {
+        for span in &mut batch {
+            if let Some(environment) = &self.environment {
                 span.attributes
                     .push(KeyValue::new("langfuse.environment", environment.clone()));
+            }
+            if let Some(input) = langfuse_generation_input(&span.attributes) {
+                if let Some(output) = langfuse_generation_output(&span.attributes) {
+                    span.attributes
+                        .push(KeyValue::new("langfuse.observation.output", output));
+                }
+                span.attributes
+                    .push(KeyValue::new("langfuse.observation.input", input));
             }
         }
         self.inner.export(batch).await
@@ -761,6 +808,58 @@ mod tests {
     use test_case::test_case;
     use tracing::{Event, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
+
+    #[test]
+    fn a_generation_input_holds_its_messages_and_offered_tools() {
+        let attributes = vec![
+            KeyValue::new("gen_ai.input.messages", r#"[{"role":"user","parts":[]}]"#),
+            KeyValue::new(
+                "gen_ai.tool.definitions",
+                r#"[{"type":"function","name":"search"}]"#,
+            ),
+        ];
+        let input: serde_json::Value =
+            serde_json::from_str(&langfuse_generation_input(&attributes).unwrap()).unwrap();
+        assert_eq!(
+            input,
+            serde_json::json!({
+                "messages": [{"role": "user", "parts": []}],
+                "tools": [{"type": "function", "name": "search"}],
+            })
+        );
+        // Without tools the input is the messages alone; an explicit input is kept.
+        let messages_only: serde_json::Value =
+            serde_json::from_str(&langfuse_generation_input(&attributes[..1]).unwrap()).unwrap();
+        assert_eq!(
+            messages_only,
+            serde_json::json!({"messages": [{"role": "user", "parts": []}]})
+        );
+        let explicit = vec![
+            attributes[0].clone(),
+            KeyValue::new("langfuse.observation.input", "{}"),
+        ];
+        assert!(langfuse_generation_input(&explicit).is_none());
+        assert!(langfuse_generation_input(&[]).is_none());
+    }
+
+    #[test]
+    fn a_generation_with_an_explicit_input_keeps_its_output() {
+        let output = r#"[{"role":"assistant","parts":[{"type":"text","content":"Done."}]}]"#;
+        let attributes = vec![
+            KeyValue::new("gen_ai.input.messages", "[]"),
+            KeyValue::new("gen_ai.output.messages", output),
+        ];
+        assert_eq!(
+            langfuse_generation_output(&attributes).as_deref(),
+            Some(output)
+        );
+        let explicit = vec![
+            attributes[1].clone(),
+            KeyValue::new("langfuse.observation.output", "{}"),
+        ];
+        assert!(langfuse_generation_output(&explicit).is_none());
+        assert!(langfuse_generation_output(&attributes[..1]).is_none());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn langfuse_and_primary_receive_the_same_span_with_separate_auth() {

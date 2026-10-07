@@ -396,6 +396,7 @@ pub(crate) async fn stream_response_from_provider_in_span(
         let input_messages = gen_ai_telemetry::input_messages_with_system_json(
             system_prompt,
             messages_for_provider.messages(),
+            model_config.supports_vision.unwrap_or_default(),
         );
         span.record("gen_ai.input.messages", input_messages.as_str());
         let system_instructions = gen_ai_telemetry::system_instructions_json(system_prompt);

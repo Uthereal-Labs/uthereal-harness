@@ -333,7 +333,8 @@ mod tests {
         ];
 
         let value: Value =
-            serde_json::from_str(&input_messages_with_system_json("System", &messages)).unwrap();
+            serde_json::from_str(&input_messages_with_system_json("System", &messages, false))
+                .unwrap();
         assert_eq!(value[0]["role"], "system");
         assert_eq!(value[1]["role"], "user");
         assert_eq!(value[1]["parts"][0]["type"], "text");
@@ -355,9 +356,12 @@ mod tests {
     #[test]
     fn input_messages_include_the_actual_system_prompt() {
         let messages = vec![Message::user().with_text("Hello")];
-        let value: Value =
-            serde_json::from_str(&input_messages_with_system_json("System prompt", &messages))
-                .unwrap();
+        let value: Value = serde_json::from_str(&input_messages_with_system_json(
+            "System prompt",
+            &messages,
+            false,
+        ))
+        .unwrap();
 
         assert_eq!(value[0]["role"], "system");
         assert_eq!(value[0]["parts"][0]["content"], "System prompt");

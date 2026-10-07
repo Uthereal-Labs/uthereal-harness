@@ -63,6 +63,35 @@ fn output_token_limit_tool_error(function_name: &str, id: &str) -> ErrorData {
     }
 }
 
+const IMAGE_SENT_SEPARATELY: &str =
+    "This tool result included an image that is uploaded in the next message.";
+const IMAGE_OMITTED: &str =
+    "This tool result included an image that was omitted as the model does not support vision.";
+
+/// The text a chat-completions `tool` message carries for a tool result, exactly as
+/// the model receives it: text blocks, an embedded resource's text and a placeholder
+/// for each image, joined by spaces. Structured content and `_meta` never reach the
+/// model. Telemetry records this same text, so traces show what the model saw.
+pub fn tool_result_text(result: &rmcp::model::CallToolResult, supports_vision: bool) -> String {
+    result
+        .content
+        .iter()
+        .map(|content| match content {
+            ContentBlock::Image(_) if supports_vision => IMAGE_SENT_SEPARATELY.to_string(),
+            ContentBlock::Image(_) => IMAGE_OMITTED.to_string(),
+            ContentBlock::Resource(resource) => extract_text_from_resource(&resource.resource),
+            ContentBlock::Text(text) => text.text.clone(),
+            _ => String::new(),
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// The text a chat-completions `tool` message carries for a failed tool call.
+pub fn tool_error_text(error: &str) -> String {
+    format!("The tool call returned the following error:\n{error}")
+}
+
 pub fn is_reserved_request_param_key(key: &str) -> bool {
     matches!(key, "messages" | "model" | "stream" | "stream_options")
 }
@@ -352,44 +381,24 @@ pub fn format_messages_with_options(
                 MessageContentBlock::ToolResponse(response) => {
                     match &response.tool_result {
                         Ok(result) => {
-                            // Process all content, replacing images with placeholder text
-                            let mut tool_content = Vec::new();
-                            let mut image_messages = Vec::new();
-
-                            for content in result.content.iter() {
-                                match content {
-                                    ContentBlock::Image(image) => {
-                                        if options.supports_vision {
-                                            // Add placeholder text in the tool response
-                                            tool_content.push(ContentBlock::text("This tool result included an image that is uploaded in the next message."));
-
-                                            // Create a separate image message
-                                            image_messages.push(json!({
-                                                "role": "user",
-                                                "content": [convert_image(&image.clone(), image_format)]
-                                            }));
-                                        } else {
-                                            // Add placeholder text in the tool response
-                                            tool_content.push(ContentBlock::text("This tool result included an image that was omitted as the model does not support vision."));
-                                        }
-                                    }
-                                    ContentBlock::Resource(resource) => {
-                                        let text = extract_text_from_resource(&resource.resource);
-                                        tool_content.push(ContentBlock::text(text));
-                                    }
-                                    _ => {
-                                        tool_content.push(content.clone());
-                                    }
-                                }
-                            }
-                            let tool_response_content: Value = json!(tool_content
-                                .iter()
-                                .map(|content| match content {
-                                    ContentBlock::Text(text) => text.text.clone(),
-                                    _ => String::new(),
-                                })
-                                .collect::<Vec<String>>()
-                                .join(" "));
+                            // Images travel in separate user messages after the tool message.
+                            let image_messages: Vec<Value> = if options.supports_vision {
+                                result
+                                    .content
+                                    .iter()
+                                    .filter_map(|content| match content {
+                                        ContentBlock::Image(image) => Some(json!({
+                                            "role": "user",
+                                            "content": [convert_image(&image.clone(), image_format)]
+                                        })),
+                                        _ => None,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            let tool_response_content =
+                                json!(tool_result_text(result, options.supports_vision));
 
                             // First add the tool response with all content
                             output.push(json!({
@@ -404,7 +413,7 @@ pub fn format_messages_with_options(
                             // A tool result error is shown as output so the model can interpret the error message
                             output.push(json!({
                                 "role": "tool",
-                                "content": format!("The tool call returned the following error:\n{}", e),
+                                "content": tool_error_text(&e.to_string()),
                                 "tool_call_id": response.id
                             }));
                         }
