@@ -2,8 +2,8 @@ use super::SessionManager;
 use anyhow::{bail, Result};
 use goose_sdk_types::custom_requests::{
     TaskAdmission, TaskEvidence, TaskEvidenceRequest, TaskEvidenceResponse, TaskNoticeRequest,
-    TaskNoticeResponse, TaskNoticeStatus, TaskOutcome, TaskTerminalStatus, TaskToolReceipt,
-    ToolReceiptTransportStatus,
+    TaskNoticeResponse, TaskNoticeStatus, TaskOutcome, TaskReference, TaskTerminalStatus,
+    TaskToolReceipt, ToolReceiptTransportStatus,
 };
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
@@ -29,6 +29,58 @@ pub fn normalize_artifact_key(key: &str) -> String {
 const NOTICE_ARTIFACT_KEYS_LIMIT: usize = 4;
 
 impl SessionManager {
+    /// Whether a task's read-only reference to an artifact is revoked: a sibling task
+    /// (same parent) delegated after it edits that artifact. Task IDs are
+    /// `YYYYMMDD_N` with N increasing, so they order delegations; the answer only
+    /// changes from false to true, which makes revocation permanent.
+    pub async fn reference_revoked(
+        &self,
+        parent_session_id: &str,
+        task_id: &str,
+        artifact: &str,
+    ) -> Result<bool> {
+        let later: Option<String> = sqlx::query_scalar(
+            r#"SELECT id FROM sessions
+             WHERE parent_session_id = ?
+               AND json_extract(extension_data, '$."summon.v1".artifact_key') = ?
+               AND (SUBSTR(id, 1, 8) > SUBSTR(?, 1, 8)
+                    OR (SUBSTR(id, 1, 8) = SUBSTR(?, 1, 8)
+                        AND CAST(SUBSTR(id, 10) AS INTEGER) > CAST(SUBSTR(?, 10) AS INTEGER)))
+             LIMIT 1"#,
+        )
+        .bind(parent_session_id)
+        .bind(normalize_artifact_key(artifact))
+        .bind(task_id)
+        .bind(task_id)
+        .bind(task_id)
+        .fetch_optional(self.storage().pool().await?)
+        .await?;
+        Ok(later.is_some())
+    }
+
+    /// A task's read-only references with their revocation state.
+    pub async fn task_references(
+        &self,
+        parent_session_id: &str,
+        task_id: &str,
+        policy: &serde_json::Value,
+    ) -> Result<Vec<TaskReference>> {
+        let mut references = Vec::new();
+        for reference in policy["references"].as_array().into_iter().flatten() {
+            let Some(artifact) = reference["artifact"].as_str() else {
+                continue;
+            };
+            references.push(TaskReference {
+                artifact: artifact.to_string(),
+                revision_id: reference["revision_id"].as_str().map(str::to_owned),
+                revoked: self
+                    .reference_revoked(parent_session_id, task_id, artifact)
+                    .await?,
+            });
+        }
+        Ok(references)
+    }
+
     pub async fn capture_task_admission(
         &self,
         parent_session_id: &str,
@@ -206,9 +258,13 @@ impl SessionManager {
             let extension_data: serde_json::Value =
                 serde_json::from_str(&row.try_get::<String, _>("extension_data")?)?;
             let policy = &extension_data["summon.v1"];
+            let reference_artifacts = self
+                .task_references(&response.parent_session_id, &task_id, policy)
+                .await?;
             let mut task = TaskEvidence {
                 artifact_key: policy["artifact_key"].as_str().map(str::to_owned),
                 previous_task_id: policy["previous_task_id"].as_str().map(str::to_owned),
+                reference_artifacts,
                 admission,
                 outcome,
                 receipts: Vec::new(),
