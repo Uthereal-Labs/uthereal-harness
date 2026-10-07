@@ -132,7 +132,8 @@ fn base_model_config_from_user_config(
         toolshim_model: get_goose_toolshim_model(config)?,
         request_params: None,
         reasoning: None,
-        supports_vision: None,
+        // An explicit setting wins over the model catalog, which does not know gateway model names.
+        supports_vision: get_goose_supports_vision(config)?,
         request_headers: None,
     };
     if provider_name != goose_providers::azure_foundry::AZURE_FOUNDRY_PROVIDER_NAME {
@@ -175,6 +176,14 @@ fn get_goose_temperature(config: &Config) -> Result<Option<f32>> {
             "Value for 'GOOSE_TEMPERATURE' is out of valid range: {temp}"
         )),
         Ok(temp) => Ok(Some(temp)),
+        Err(ConfigError::NotFound(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn get_goose_supports_vision(config: &Config) -> Result<Option<bool>> {
+    match config.get_param::<serde_yaml::Value>("GOOSE_SUPPORTS_VISION") {
+        Ok(value) => parse_yaml_bool_config("GOOSE_SUPPORTS_VISION", value).map(Some),
         Err(ConfigError::NotFound(_)) => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -313,6 +322,31 @@ mod cache_ttl_tests {
         )
         .unwrap();
         assert_eq!(model.cache_ttl().as_deref(), Some("5m"));
+    }
+}
+
+#[cfg(test)]
+mod supports_vision_tests {
+    use super::*;
+
+    #[test]
+    fn env_var_sets_vision_for_a_model_the_catalog_does_not_know() {
+        let _guard = env_lock::lock_env([("GOOSE_SUPPORTS_VISION", Some("true"))]);
+        let model = model_config_from_user_config("openai", "gateway/unknown-model").unwrap();
+        assert_eq!(model.supports_vision, Some(true));
+    }
+
+    #[test]
+    fn absent_env_var_leaves_vision_to_the_catalog() {
+        let _guard = env_lock::lock_env([("GOOSE_SUPPORTS_VISION", None::<&str>)]);
+        let config = base_model_config_from_user_config("openai", "gateway/unknown-model").unwrap();
+        assert_eq!(config.supports_vision, None);
+    }
+
+    #[test]
+    fn invalid_env_var_is_rejected() {
+        let _guard = env_lock::lock_env([("GOOSE_SUPPORTS_VISION", Some("maybe"))]);
+        assert!(base_model_config_from_user_config("openai", "gateway/unknown-model").is_err());
     }
 }
 
