@@ -80,6 +80,8 @@ pub(super) fn tool_span(tool_name: &str, tool_call_id: &str, session_id: &str) -
         "gen_ai.tool.call.arguments" = tracing::field::Empty,
         "gen_ai.tool.call.result" = tracing::field::Empty,
         "error.type" = tracing::field::Empty,
+        "langfuse.observation.level" = tracing::field::Empty,
+        "langfuse.observation.status_message" = tracing::field::Empty,
         session.id = %telemetry_session_id,
         goose.execution.session.id = %session_id,
     )
@@ -259,6 +261,7 @@ pub(super) fn with_post_tool_hooks(
             crate::agents::large_response_handler::process_tool_response(result.result.await);
         crate::agents::gen_ai_telemetry::record_tool_result(&tracing::Span::current(), &result);
         match &result {
+            _ if crate::agents::gen_ai_telemetry::is_rule_rejection(&result) => {}
             Ok(result) if result.is_error == Some(true) => {
                 tracing::Span::current().record("error.type", "tool_error");
             }

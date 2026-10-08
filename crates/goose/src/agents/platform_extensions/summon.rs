@@ -2620,7 +2620,7 @@ impl SummonClient {
                 } else {
                     "Error: Nothing to wait for: no editor task of yours is running and no successfully sent parent question awaits a reply. Finish your review and write your final report."
                 };
-                return CallToolResult::error(vec![ContentBlock::text(text)]);
+                return crate::agents::gen_ai_telemetry::rule_rejection(text);
             }
             if started.elapsed() >= Duration::from_secs(timeout) {
                 let still = if running.is_empty() {
