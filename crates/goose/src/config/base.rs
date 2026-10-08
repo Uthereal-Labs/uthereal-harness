@@ -1336,6 +1336,19 @@ impl Config {
         }
     }
 
+    /// Output token limit for delegated agents, overriding GOOSE_MAX_TOKENS for
+    /// them; a lower limit bounds how long a runaway delegate generation lasts.
+    pub fn get_goose_subagent_max_tokens(&self) -> Result<Option<i32>, ConfigError> {
+        match self.get_param::<i32>("GOOSE_SUBAGENT_MAX_TOKENS") {
+            Ok(tokens) if tokens <= 0 => Err(ConfigError::DeserializeError(
+                "GOOSE_SUBAGENT_MAX_TOKENS must be greater than 0".to_string(),
+            )),
+            Ok(tokens) => Ok(Some(tokens)),
+            Err(ConfigError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn get_goose_docs_root(&self) -> Result<Option<String>, ConfigError> {
         match self.get_param::<String>("GOOSE_DOCS_ROOT") {
             Ok(root) => Ok(Some(root.trim().to_string()).filter(|root| !root.is_empty())),
@@ -2840,6 +2853,33 @@ extensions:
 
             assert!(matches!(
                 config.get_goose_max_tokens().unwrap_err(),
+                ConfigError::DeserializeError(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn get_goose_subagent_max_tokens_reads_env_and_rejects_invalid_values() {
+        {
+            let _guard = env_lock::lock_env([("GOOSE_SUBAGENT_MAX_TOKENS", Some("6144"))]);
+            assert_eq!(
+                new_test_config().get_goose_subagent_max_tokens().unwrap(),
+                Some(6144)
+            );
+        }
+        {
+            let _guard = env_lock::lock_env([("GOOSE_SUBAGENT_MAX_TOKENS", None::<&str>)]);
+            assert_eq!(
+                new_test_config().get_goose_subagent_max_tokens().unwrap(),
+                None
+            );
+        }
+        for value in ["not_a_number", "0", "-100"] {
+            let _guard = env_lock::lock_env([("GOOSE_SUBAGENT_MAX_TOKENS", Some(value))]);
+            assert!(matches!(
+                new_test_config()
+                    .get_goose_subagent_max_tokens()
+                    .unwrap_err(),
                 ConfigError::DeserializeError(_)
             ));
         }

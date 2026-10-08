@@ -1142,6 +1142,8 @@ impl Agent {
             gen_ai.tool.call.arguments = tracing::field::Empty,
             gen_ai.tool.call.result = tracing::field::Empty,
             error.type = tracing::field::Empty,
+            langfuse.observation.level = tracing::field::Empty,
+            langfuse.observation.status_message = tracing::field::Empty,
         )
     )]
     pub async fn dispatch_tool_call(

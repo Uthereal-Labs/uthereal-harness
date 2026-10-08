@@ -2620,7 +2620,7 @@ impl SummonClient {
                 } else {
                     "Error: Nothing to wait for: no editor task of yours is running and no successfully sent parent question awaits a reply. Finish your review and write your final report."
                 };
-                return CallToolResult::error(vec![ContentBlock::text(text)]);
+                return crate::agents::gen_ai_telemetry::rule_rejection(text);
             }
             if started.elapsed() >= Duration::from_secs(timeout) {
                 let still = if running.is_empty() {
@@ -4010,6 +4010,9 @@ impl SummonClient {
             model_config = model_config.with_temperature(Some(temp));
         } else if let Some(temp) = recipe.settings.as_ref().and_then(|s| s.temperature) {
             model_config = model_config.with_temperature(Some(temp));
+        }
+        if let Some(max_tokens) = Config::global().get_goose_subagent_max_tokens()? {
+            model_config = model_config.with_max_tokens(Some(max_tokens));
         }
 
         Ok(model_config)

@@ -107,8 +107,10 @@ struct LangfuseSpanExporter {
 /// when the model was offered tools, their definitions (`gen_ai.tool.definitions`).
 fn langfuse_generation_input(attributes: &[KeyValue]) -> Option<String> {
     let text = |key: &str| {
+        // A field recorded again while streaming is appended, not replaced: the last value is current.
         attributes
             .iter()
+            .rev()
             .find(|attribute| attribute.key.as_str() == key)
             .map(|attribute| attribute.value.as_str().into_owned())
     };
@@ -130,8 +132,10 @@ fn langfuse_generation_input(attributes: &[KeyValue]) -> Option<String> {
 /// `langfuse.observation.output` and no longer maps `gen_ai.output.messages`.
 fn langfuse_generation_output(attributes: &[KeyValue]) -> Option<String> {
     let text = |key: &str| {
+        // A field recorded again while streaming is appended, not replaced: the last value is current.
         attributes
             .iter()
+            .rev()
             .find(|attribute| attribute.key.as_str() == key)
             .map(|attribute| attribute.value.as_str().into_owned())
     };
@@ -859,6 +863,24 @@ mod tests {
         ];
         assert!(langfuse_generation_output(&explicit).is_none());
         assert!(langfuse_generation_output(&attributes[..1]).is_none());
+    }
+
+    #[test]
+    fn a_generation_output_recorded_while_streaming_is_its_final_value() {
+        let full =
+            r#"[{"role":"assistant","parts":[{"type":"text","content":"I will look it up."}]}]"#;
+        let attributes = vec![
+            KeyValue::new("gen_ai.input.messages", "[]"),
+            KeyValue::new(
+                "gen_ai.output.messages",
+                r#"[{"role":"assistant","parts":[{"type":"text","content":"I"}]}]"#,
+            ),
+            KeyValue::new("gen_ai.output.messages", full),
+        ];
+        assert_eq!(
+            langfuse_generation_output(&attributes).as_deref(),
+            Some(full)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

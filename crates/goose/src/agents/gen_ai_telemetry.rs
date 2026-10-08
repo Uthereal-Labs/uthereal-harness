@@ -61,6 +61,27 @@ pub(super) fn record_provider_usage(span: &Span, usage: &ProviderUsage) {
     }
 }
 
+/// Ends a span when dropped.
+///
+/// tracing-opentelemetry ends a span at its last exit. A provider stream is
+/// read after the instrumented function that created it returned, without
+/// entering its span, so the generation would otherwise end when the stream
+/// opened rather than when it finished. Entering and leaving the span here
+/// moves its end to the moment the stream is done.
+pub(super) struct EndSpanOnDrop(Span);
+
+impl EndSpanOnDrop {
+    pub(super) fn new(span: Span) -> Self {
+        Self(span)
+    }
+}
+
+impl Drop for EndSpanOnDrop {
+    fn drop(&mut self) {
+        let _entered = self.0.enter();
+    }
+}
+
 /// Provider stream timing for the generation span: Langfuse shows
 /// `completion_start_time` as time to first token, and the elapsed time marks
 /// when the provider stream ended, separating generation from later agent work.
@@ -110,9 +131,35 @@ pub(super) fn record_tool_arguments(span: &Span, tool_call: &CallToolRequestPara
     }
 }
 
+/// `_meta` key of a tool result whose call a rule refused. The agent gets the
+/// refusal as an error result telling it what to do instead, but nothing
+/// failed, so traces show it as a warning rather than an error.
+pub(crate) const TOOL_REJECTION_META_KEY: &str = "uthereal/rejection";
+
+/// An error result for a call a rule refused (see [`TOOL_REJECTION_META_KEY`]).
+pub(crate) fn rule_rejection(text: impl Into<String>) -> CallToolResult {
+    let mut result = CallToolResult::error(vec![rmcp::model::ContentBlock::text(text.into())]);
+    let mut meta = result.meta.take().unwrap_or_else(rmcp::model::MetaObject::new);
+    meta.0.insert(TOOL_REJECTION_META_KEY.to_string(), json!("rule"));
+    result.meta = Some(meta);
+    result
+}
+
+/// Whether a tool result is a rule's refusal rather than a failure.
+pub(crate) fn is_rule_rejection(result: &ToolResult<CallToolResult>) -> bool {
+    matches!(result, Ok(result) if result.is_error == Some(true)
+        && result.meta.as_ref().is_some_and(|meta| meta.0.contains_key(TOOL_REJECTION_META_KEY)))
+}
+
 pub(super) fn record_tool_result(span: &Span, result: &ToolResult<CallToolResult>) {
     let failed = !matches!(result, Ok(result) if result.is_error != Some(true));
-    if failed {
+    if is_rule_rejection(result) {
+        span.record("langfuse.observation.level", "WARNING");
+        span.record(
+            "langfuse.observation.status_message",
+            "Refused by a rule; the agent was told what to do instead",
+        );
+    } else if failed {
         span.record("error.type", "tool_execution_error");
         #[cfg(feature = "otel")]
         {
@@ -492,6 +539,30 @@ mod tests {
         let result: Value =
             serde_json::from_str(fields2["gen_ai.tool.call.result"].as_str().unwrap()).unwrap();
         assert!(result["error"].as_str().unwrap().contains("failed"));
+    }
+
+    #[test]
+    fn a_rule_rejection_is_recorded_as_a_warning_not_an_error() {
+        let capture = test_support::SpanFieldCapture::new("rejected_span");
+        let _guard = capture.clone().set_default();
+        let rejected: ToolResult<CallToolResult> = Ok(rule_rejection("Nothing to wait for."));
+        assert!(is_rule_rejection(&rejected));
+        let span = tracing::info_span!(
+            "rejected_span",
+            "error.type" = tracing::field::Empty,
+            "langfuse.observation.level" = tracing::field::Empty,
+            "langfuse.observation.status_message" = tracing::field::Empty,
+        );
+        record_tool_result(&span, &rejected);
+        let fields = capture.fields();
+        assert_eq!(fields["langfuse.observation.level"], "WARNING");
+        assert!(!fields.contains_key("error.type"));
+
+        // A plain error result is still an error.
+        let failed: ToolResult<CallToolResult> = Ok(CallToolResult::error(vec![
+            rmcp::model::ContentBlock::text("failed"),
+        ]));
+        assert!(!is_rule_rejection(&failed));
     }
 
     #[test]
