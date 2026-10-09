@@ -336,9 +336,10 @@ const DELEGATE_TOP_LEVEL_FIELDS: &[&str] = &[
 /// Move delegate's own fields that a call nested under `parameters` to the top level.
 ///
 /// Only when the call cannot mean them as a recipe's parameters (no source, or
-/// instructions or artifact_key nested) and none of them is also given at the
-/// top level; otherwise the arguments stay as they are and validation explains
-/// the expected shape.
+/// instructions or artifact_key nested). A nested field that the top level also
+/// gives with the same value is a repeat and is dropped; one given there with a
+/// different value leaves the arguments as they are, and validation explains the
+/// expected shape.
 fn lift_nested_delegate_fields(mut arguments: JsonObject) -> JsonObject {
     let Some(serde_json::Value::Object(mut nested)) = arguments.get("parameters").cloned() else {
         return arguments;
@@ -351,13 +352,17 @@ fn lift_nested_delegate_fields(mut arguments: JsonObject) -> JsonObject {
     let misplaced = !arguments.contains_key("source")
         || fields.contains(&"instructions")
         || fields.contains(&"artifact_key");
-    if fields.is_empty() || !misplaced || fields.iter().any(|field| arguments.contains_key(*field))
-    {
+    let conflicting = fields.iter().any(|field| {
+        arguments
+            .get(*field)
+            .is_some_and(|value| Some(value) != nested.get(*field))
+    });
+    if fields.is_empty() || !misplaced || conflicting {
         return arguments;
     }
     for field in fields {
         if let Some(value) = nested.remove(field) {
-            arguments.insert(field.to_string(), value);
+            arguments.entry(field.to_string()).or_insert(value);
         }
     }
     if nested.is_empty() {
@@ -8112,7 +8117,21 @@ You review code."#;
         let kept = lift_nested_delegate_fields(recipe.clone());
         assert_eq!(kept, recipe);
 
-        // A field given both at the top level and nested is left for validation to explain.
+        // A field repeated with the same value at the top level is lifted with the rest.
+        let repeated = serde_json::json!({
+            "source": "cortex-document",
+            "parameters": {"source": "cortex-document", "instructions": "Write it.", "async": true}
+        });
+        let serde_json::Value::Object(repeated) = repeated else {
+            unreachable!()
+        };
+        let lifted = lift_nested_delegate_fields(repeated);
+        assert_eq!(
+            serde_json::Value::Object(lifted),
+            serde_json::json!({"source": "cortex-document", "instructions": "Write it.", "async": true})
+        );
+
+        // A field given both at the top level and nested with different values is left for validation to explain.
         let both = serde_json::json!({"instructions": "A", "parameters": {"instructions": "B"}});
         let serde_json::Value::Object(both) = both else {
             unreachable!()
