@@ -115,6 +115,13 @@ pub(super) fn record_request_params(span: &Span, model_config: &ModelConfig) {
     if let Some(max_tokens) = model_config.max_tokens {
         span.record("gen_ai.request.max_tokens", max_tokens as i64);
     }
+    // The session's effort level (off, low, medium, high, max); providers map it to their own values.
+    if let Some(effort) = model_config.thinking_effort() {
+        span.record(
+            "gen_ai.request.reasoning_effort",
+            effort.to_string().as_str(),
+        );
+    }
 }
 
 pub(super) fn record_tool_arguments(span: &Span, tool_call: &CallToolRequestParams) {
@@ -431,23 +438,26 @@ mod tests {
     }
 
     #[test]
-    fn record_request_params_records_temperature_and_max_tokens() {
+    fn record_request_params_records_temperature_max_tokens_and_reasoning_effort() {
         let capture = test_support::SpanFieldCapture::new("test_span");
         let _guard = capture.clone().set_default();
 
         let config = ModelConfig::new("test-model")
             .with_temperature(Some(0.5))
-            .with_max_tokens(Some(4096));
+            .with_max_tokens(Some(4096))
+            .with_thinking_effort(goose_providers::thinking::ThinkingEffort::Medium);
         let span = tracing::info_span!(
             "test_span",
             "gen_ai.request.temperature" = tracing::field::Empty,
             "gen_ai.request.max_tokens" = tracing::field::Empty,
+            "gen_ai.request.reasoning_effort" = tracing::field::Empty,
         );
         record_request_params(&span, &config);
 
         let fields = capture.fields();
         assert_eq!(fields["gen_ai.request.temperature"], 0.5);
         assert_eq!(fields["gen_ai.request.max_tokens"], 4096);
+        assert_eq!(fields["gen_ai.request.reasoning_effort"], "medium");
     }
 
     #[test]
@@ -460,12 +470,14 @@ mod tests {
             "test_span",
             "gen_ai.request.temperature" = tracing::field::Empty,
             "gen_ai.request.max_tokens" = tracing::field::Empty,
+            "gen_ai.request.reasoning_effort" = tracing::field::Empty,
         );
         record_request_params(&span, &config);
 
         let fields = capture.fields();
         assert!(!fields.contains_key("gen_ai.request.temperature"));
         assert!(!fields.contains_key("gen_ai.request.max_tokens"));
+        assert!(!fields.contains_key("gen_ai.request.reasoning_effort"));
     }
 
     #[test]

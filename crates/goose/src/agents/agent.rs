@@ -2670,6 +2670,7 @@ impl Agent {
             gen_ai.request.model = %model_config.model_name,
             gen_ai.request.temperature = tracing::field::Empty,
             gen_ai.request.max_tokens = tracing::field::Empty,
+            gen_ai.request.reasoning_effort = tracing::field::Empty,
             gen_ai.provider.name = %provider_name,
             gen_ai.input.messages = tracing::field::Empty,
             gen_ai.system_instructions = tracing::field::Empty,
