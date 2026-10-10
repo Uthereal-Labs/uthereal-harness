@@ -139,10 +139,7 @@ pub(crate) const TOOL_REJECTION_META_KEY: &str = "uthereal/rejection";
 /// An error result for a call a rule refused (see [`TOOL_REJECTION_META_KEY`]).
 pub(crate) fn rule_rejection(text: impl Into<String>) -> CallToolResult {
     let mut result = CallToolResult::error(vec![rmcp::model::ContentBlock::text(text.into())]);
-    let mut meta = result
-        .meta
-        .take()
-        .unwrap_or_else(rmcp::model::MetaObject::new);
+    let mut meta = result.meta.take().unwrap_or_default();
     meta.0
         .insert(TOOL_REJECTION_META_KEY.to_string(), json!("rule"));
     result.meta = Some(meta);

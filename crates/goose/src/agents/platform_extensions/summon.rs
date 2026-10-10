@@ -6061,7 +6061,7 @@ mod tests {
             Path::new("internet.md"),
         )
         .unwrap();
-        assert!(plain.properties.get("artifact_tool").is_none());
+        assert!(!plain.properties.contains_key("artifact_tool"));
     }
 
     fn create_test_context() -> PlatformExtensionContext {
