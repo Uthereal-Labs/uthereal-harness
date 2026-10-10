@@ -327,6 +327,7 @@ pub(crate) fn prepare_tools_for_provider(
         gen_ai.request.stream = true,
         gen_ai.request.temperature = tracing::field::Empty,
         gen_ai.request.max_tokens = tracing::field::Empty,
+        gen_ai.request.reasoning_effort = tracing::field::Empty,
         gen_ai.response.model = tracing::field::Empty,
         gen_ai.response.model.upstream = tracing::field::Empty,
         gen_ai.response.finish_reasons = tracing::field::Empty,
