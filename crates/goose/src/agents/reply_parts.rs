@@ -1445,8 +1445,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn categorize_tool_requests_keeps_thinking_when_not_previously_streamed() {
+    #[tokio::test]
+    async fn categorize_tool_requests_keeps_thinking_when_not_previously_streamed() {
         let agent = crate::agents::Agent::new();
         let tool = Tool::new("test_tool", "a test tool", object!({ "type": "object" }));
         let mut response = Message::assistant()
@@ -1473,8 +1473,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn categorize_tool_requests_drops_replayed_thinking_after_streaming() {
+    #[tokio::test]
+    async fn categorize_tool_requests_drops_replayed_thinking_after_streaming() {
         let agent = crate::agents::Agent::new();
         let tool = Tool::new("test_tool", "a test tool", object!({ "type": "object" }));
         let response = Message::assistant()
@@ -1495,8 +1495,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn categorize_tool_requests_excludes_assistant_only_text_from_user_events() {
+    #[tokio::test]
+    async fn categorize_tool_requests_excludes_assistant_only_text_from_user_events() {
         let agent = crate::agents::Agent::new();
         let assistant_only = TextContent::new("assistant-only")
             .with_annotations(Annotations::default().with_audience(vec![Role::Assistant]));
@@ -1515,8 +1515,8 @@ mod tests {
             .any(|content| matches!(content, MessageContent::Thinking(_))));
     }
 
-    #[test]
-    fn categorize_tool_requests_skips_externally_dispatched_and_preserves_marker() {
+    #[tokio::test]
+    async fn categorize_tool_requests_skips_externally_dispatched_and_preserves_marker() {
         // External requests must (1) survive coercion with goose.external_dispatch
         // intact, (2) be excluded from dispatch, (3) stay in filtered_message.
         use crate::conversation::message::TOOL_META_EXTERNAL_DISPATCH_KEY;
@@ -1579,8 +1579,8 @@ mod tests {
             .is_some_and(|request| request.tool_call.is_ok()));
     }
 
-    #[test]
-    fn categorize_tool_requests_rejects_unadvertised_executable_tools() {
+    #[tokio::test]
+    async fn categorize_tool_requests_rejects_unadvertised_executable_tools() {
         let agent = crate::agents::Agent::new();
         let response = Message::assistant()
             .with_tool_request(
@@ -1609,8 +1609,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn categorize_tool_requests_dispatches_advertised_tools() {
+    #[tokio::test]
+    async fn categorize_tool_requests_dispatches_advertised_tools() {
         let agent = crate::agents::Agent::new();
         let regular_tool = Tool::new(
             "regular_tool",
@@ -1651,8 +1651,8 @@ mod tests {
         assert_eq!(tool_requests.len(), 3);
     }
 
-    #[test]
-    fn categorize_tool_requests_canonicalizes_mangled_unprefixed_tool_name() {
+    #[tokio::test]
+    async fn categorize_tool_requests_canonicalizes_mangled_unprefixed_tool_name() {
         // GLM's documented reproduction (#9486): a default Developer-extension
         // tool is advertised unprefixed ("shell"), owner only in metadata, and
         // the model emits "developer.shell". This must be rewritten to the
@@ -1693,8 +1693,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn categorize_tool_requests_canonicalizes_mangled_non_extension_manager_tool_name() {
+    #[tokio::test]
+    async fn categorize_tool_requests_canonicalizes_mangled_non_extension_manager_tool_name() {
         // recipe__final_output is appended by Agent::list_tools outside the
         // extension manager (see #9486 review); it must recover the same way.
         let agent = crate::agents::Agent::new();
@@ -1723,8 +1723,8 @@ mod tests {
         assert_eq!(tool_call.name, "recipe__final_output");
     }
 
-    #[test]
-    fn categorize_tool_requests_rejects_unrecoverable_unadvertised_name() {
+    #[tokio::test]
+    async fn categorize_tool_requests_rejects_unrecoverable_unadvertised_name() {
         let agent = crate::agents::Agent::new();
         let tool = Tool::new(
             "shell",
@@ -1753,8 +1753,8 @@ mod tests {
         assert!(tool_call.message.contains("totally_unknown_tool"));
     }
 
-    #[test]
-    fn categorize_tool_requests_dedups_duplicate_ids_in_provider_order() {
+    #[tokio::test]
+    async fn categorize_tool_requests_dedups_duplicate_ids_in_provider_order() {
         // A malformed provider repeats id "dup". The first occurrence wins, the
         // later duplicate is dropped from both the dispatch bucket and the
         // filtered (history) message, and unique ids are kept.
