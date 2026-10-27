@@ -87,6 +87,20 @@ export CLAUDE_THINKING_TYPE=disabled
 To see Claude's thinking output in the **CLI**, you also need to set `GOOSE_CLI_SHOW_THINKING=1`. In **goose Desktop**, thinking output is shown automatically in a collapsible "Show reasoning" toggle.
 :::
 
+### OpenAI-compatible Entra authentication
+
+For an HTTPS endpoint protected by Microsoft Entra, keep `GOOSE_PROVIDER=openai`
+and set `OPENAI_AUTH_MODE=entra`. Configure `OPENAI_BASE_URL` for the gateway and
+`OPENAI_ENTRA_SCOPE` to its application resource URI followed by `/.default`.
+Supply `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` through the
+deployment's secret configuration; leave `OPENAI_API_KEY` unset.
+
+goose obtains a service-principal access token before sending requests and caches
+it until one minute before expiry. Concurrent requests share token acquisition.
+The exchange has a 15-second deadline and does not follow redirects or retry.
+Authentication failure stops dispatch; credentials are never sent across gateway
+origins. This mode does not require Azure CLI or an external credential command.
+
 ### Provider Retries
 
 Configurable retry parameters for LLM providers. 
