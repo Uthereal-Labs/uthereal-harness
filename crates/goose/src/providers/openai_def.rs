@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::providers::base::{ProviderDef, DEFAULT_PROVIDER_TIMEOUT_SECS};
 use crate::providers::command_auth::CommandAuthProvider;
 use crate::providers::custom_provider_config::ConfigKeyResolver;
+use crate::providers::entra_auth::EntraAuthProvider;
 use crate::session_context::{
     session_id_request_builder, session_id_request_builder_with_header_override,
 };
@@ -108,9 +109,29 @@ pub async fn from_env(
         .get_param("OPENAI_TIMEOUT")
         .unwrap_or(DEFAULT_PROVIDER_TIMEOUT_SECS);
 
-    let auth = match api_key {
-        Some(key) if !key.is_empty() => AuthMethod::BearerToken(key),
-        _ => AuthMethod::NoAuth,
+    let auth_mode: String = config
+        .get_param("OPENAI_AUTH_MODE")
+        .unwrap_or_else(|_| "api_key".into());
+    let auth = match auth_mode.as_str() {
+        "entra" => {
+            anyhow::ensure!(
+                api_key.as_ref().is_none_or(String::is_empty),
+                "OPENAI_API_KEY must be unset in Entra mode"
+            );
+            let origin = url::Url::parse(&parsed.host)?;
+            anyhow::ensure!(
+                origin.scheme() == "https"
+                    && origin.username().is_empty()
+                    && origin.password().is_none(),
+                "Entra-authenticated OpenAI endpoints require HTTPS without URL credentials"
+            );
+            AuthMethod::Custom(Box::new(EntraAuthProvider::from_config(config)?))
+        }
+        "api_key" => match api_key {
+            Some(key) if !key.is_empty() => AuthMethod::BearerToken(key),
+            _ => AuthMethod::NoAuth,
+        },
+        _ => anyhow::bail!("OPENAI_AUTH_MODE must be api_key or entra"),
     };
     let mut api_client = ApiClient::with_timeout_and_tls(
         parsed.host,
@@ -119,6 +140,10 @@ pub async fn from_env(
         tls_config,
     )?
     .with_request_builder(session_id_request_builder());
+
+    if auth_mode == "entra" {
+        api_client = api_client.with_same_origin_redirects()?;
+    }
 
     if !parsed.query_params.is_empty() {
         api_client = api_client.with_query(parsed.query_params);
