@@ -386,12 +386,224 @@ export type SetSessionSystemPromptRequest_unstable = {
 export type SessionSystemPromptMode = 'set' | 'append';
 
 /**
+ * Read scoped outcomes and selected canonical tool receipts without activating an agent.
+ */
+export type TaskEvidenceRequest_unstable = {
+    taskId?: string | null;
+    attemptKey: string;
+    toolNames?: Array<string>;
+    afterTaskId?: string | null;
+};
+
+export type TaskEvidenceResponse_unstable = {
+    attemptKey: string;
+    parentSessionId: string;
+    parentRunId: string;
+    tasks: Array<TaskEvidence>;
+    nextTaskId?: string | null;
+    evidenceComplete: boolean;
+};
+
+export type TaskEvidence = {
+    artifactKey?: string | null;
+    previousTaskId?: string | null;
+    referenceArtifacts?: Array<TaskReference>;
+    admission: TaskAdmission;
+    outcome?: TaskOutcome | null;
+    receipts: Array<TaskToolReceipt>;
+    evidenceComplete: boolean;
+};
+
+/**
+ * A read-only reference a task was delegated with: an artifact it may read, frozen at
+ * the saved revision it had at delegation, until a later task is delegated to edit it.
+ */
+export type TaskReference = {
+    artifact: string;
+    revisionId?: string | null;
+    /**
+     * A task delegated after this one edits the artifact: the read access is revoked for good.
+     */
+    revoked: boolean;
+};
+
+export type TaskAdmission = {
+    taskId: string;
+    parentSessionId: string;
+    parentRunId?: string | null;
+    attemptKey?: string | null;
+    sourceName: string;
+    artifactKey?: string | null;
+    previousTaskId?: string | null;
+};
+
+export type TaskOutcome = {
+    taskId: string;
+    parentSessionId: string;
+    parentRunId?: string | null;
+    attemptKey?: string | null;
+    sourceName: string;
+    artifactKey?: string | null;
+    previousTaskId?: string | null;
+    status: TaskTerminalStatus;
+};
+
+export type TaskTerminalStatus = 'completed' | 'failed' | 'panicked' | 'cancelled';
+
+export type TaskToolReceipt = {
+    taskId: string;
+    callId: string;
+    toolName: string;
+    transportStatus: ToolReceiptTransportStatus;
+    isError?: boolean | null;
+    structuredResult?: unknown;
+};
+
+export type ToolReceiptTransportStatus = 'success' | 'error';
+
+/**
+ * Read receipts for an authoritative native run without creating an attempt.
+ */
+export type RunTaskEvidenceRequest_unstable = {
+    parentSessionId: string;
+    parentRunId: string;
+    taskId?: string | null;
+    toolNames?: Array<string>;
+    afterTaskId?: string | null;
+};
+
+export type RunTaskEvidenceResponse_unstable = {
+    attemptKey?: string | null;
+    parentSessionId: string;
+    parentRunId: string;
+    tasks: Array<TaskEvidence>;
+    nextTaskId?: string | null;
+    evidenceComplete: boolean;
+};
+
+/**
+ * Queue a notice for the running task of an attempt that holds one of the
+ * given artifacts (or has the given task ID): channel news, or the result of
+ * an editor task it started. The task reads it at its next checkpoint; `wake`
+ * also ends its wait, and `refresh_tools` re-lists the task's tools first (for
+ * example after it joins a channel).
+ */
+export type TaskNoticeRequest_unstable = {
+    attemptKey: string;
+    taskId?: string | null;
+    artifactKeys?: Array<string>;
+    text: string;
+    wake?: boolean;
+    refreshTools?: boolean;
+    /**
+     * Makes a retried notice idempotent for its recipient.
+     */
+    dedupeKey?: string | null;
+    /**
+     * The result of an editor task the recipient started, delivered with the
+     * notice: `{"idempotency_key": ..., "receipt": {...}}`. Goose counts it as
+     * that task's result (artifact results, finish guard) once delivered.
+     */
+    editorResult?: unknown;
+    channelWait?: ChannelWaitContext | null;
+};
+
+/**
+ * Outstanding channel dependencies, independent of publication versions or status.
+ */
+export type ChannelWaitContext = {
+    channelId: string;
+    /**
+     * Orders mailbox and tool-result delivery, never artifact alignment.
+     */
+    sequence: number;
+    publications?: Array<string>;
+    replies?: Array<string>;
+};
+
+export type TaskNoticeResponse_unstable = {
+    status: TaskNoticeStatus;
+    taskId?: string | null;
+};
+
+export type TaskNoticeStatus = 'queued' | 'not_running';
+
+/**
+ * Read a bounded fragment of persisted transcript JSON without activating an agent.
+ */
+export type PromptAttemptTranscriptRequest_unstable = {
+    attemptKey: string;
+    after?: number;
+    offset?: number;
+};
+
+export type PromptAttemptTranscriptResponse_unstable = {
+    messageId?: number | null;
+    data: string;
+    nextAfter: number;
+    nextOffset: number;
+    done: boolean;
+};
+
+/**
+ * Observe an attempt without loading a session or resuming tool execution.
+ */
+export type PromptAttemptStatusRequest_unstable = {
+    attemptKey: string;
+};
+
+export type PromptAttemptResponse_unstable = {
+    state?: PromptAttemptState | null;
+    sessionId?: string | null;
+    runId?: string | null;
+    /**
+     * False until the executor has released its process lock after cleanup.
+     */
+    stopped: boolean;
+    result?: unknown;
+};
+
+export type PromptAttemptState = 'running' | 'cancel_requested' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
+
+/**
+ * Persist cancellation even when the corresponding prompt has not arrived yet.
+ */
+export type PromptAttemptCancelRequest_unstable = {
+    attemptKey: string;
+};
+
+export type SteeringStatusRequest_unstable = {
+    attemptKey: string;
+    deliveryId: string;
+};
+
+export type SteeringStatusResponse_unstable = {
+    receipt?: SteerSessionResponse_unstable | null;
+};
+
+export type SteerSessionResponse_unstable = {
+    runId: string;
+    /**
+     * Stable id of the queued steer message. The same id later appears as
+     * `messageId` on the streamed `UserMessageChunk` (with `_meta.goose.steer`),
+     * letting clients correlate a queued steer with its pickup.
+     */
+    messageId: string;
+    deliveryState?: SteeringDeliveryState;
+};
+
+export type SteeringDeliveryState = 'queued' | 'consumed';
+
+/**
  * Add user input to the currently active prompt without starting a new prompt.
  */
 export type SteerSessionRequest_unstable = {
     sessionId: string;
     prompt?: Array<ContentBlock>;
     expectedRunId: string;
+    attemptKey?: string | null;
+    deliveryId?: string | null;
+    requestDigest?: string | null;
 };
 
 /**
@@ -666,16 +878,6 @@ export type EmbeddedResource = {
     _meta?: {
         [key: string]: unknown;
     } | null;
-};
-
-export type SteerSessionResponse_unstable = {
-    runId: string;
-    /**
-     * Stable id of the queued steer message. The same id later appears as
-     * `messageId` on the streamed `UserMessageChunk` (with `_meta.goose.steer`),
-     * letting clients correlate a queued steer with its pickup.
-     */
-    messageId: string;
 };
 
 /**
@@ -2745,14 +2947,14 @@ export type RecipeParamsAction = 'submit' | 'cancel';
 export type ExtRequest = {
     id: string;
     method: string;
-    params?: AddSessionExtensionRequest_unstable | RemoveSessionExtensionRequest_unstable | GetToolsRequest_unstable | SetToolPermissionsRequest_unstable | GooseToolCallRequest_unstable | ReadResourceRequest_unstable | AppsListRequest_unstable | AppsExportRequest_unstable | AppsImportRequest_unstable | AppsDeleteRequest_unstable | UpdateWorkingDirRequest_unstable | SetSessionSystemPromptRequest_unstable | SteerSessionRequest_unstable | DiagnosticsGetRequest_unstable | ListPromptsRequest_unstable | GetPromptRequest_unstable | SavePromptRequest_unstable | ResetPromptRequest_unstable | GetConfigExtensionsRequest_unstable | AddConfigExtensionRequest_unstable | RemoveConfigExtensionRequest_unstable | SetConfigExtensionEnabledRequest_unstable | GetSessionExtensionsRequest_unstable | ListProvidersRequest_unstable | ProviderSupportedModelsListRequest_unstable | ProviderCatalogListRequest_unstable | ProviderSetupCatalogListRequest_unstable | ProviderCatalogTemplateRequest_unstable | CustomProviderCreateRequest_unstable | CustomProviderReadRequest_unstable | CustomProviderUpdateRequest_unstable | CustomProviderDeleteRequest_unstable | RefreshProviderInventoryRequest_unstable | ProviderReadinessCheckRequest_unstable | ProviderConfigReadRequest_unstable | ProviderConfigStatusRequest_unstable | ProviderConfigSaveRequest_unstable | ProviderConfigDeleteRequest_unstable | ProviderConfigAuthenticateRequest_unstable | ProviderSecretsListRequest_unstable | ProviderSecretDeleteRequest_unstable | CanonicalModelInfoRequest_unstable | PreferencesReadRequest_unstable | PreferencesSaveRequest_unstable | ConfigReadRequest_unstable | ConfigUpsertRequest_unstable | ConfigRemoveRequest_unstable | ConfigReadAllRequest_unstable | DefaultsReadRequest_unstable | DefaultsSaveRequest_unstable | DefaultsClearRequest_unstable | OnboardingImportScanRequest_unstable | OnboardingImportApplyRequest_unstable | ExportSessionRequest_unstable | ImportSessionRequest_unstable | ShareSessionNostrRequest_unstable | EncodeRecipeRequest_unstable | DecodeRecipeRequest_unstable | ScanRecipeRequest_unstable | ListRecipesRequest_unstable | DeleteRecipeRequest_unstable | ScheduleRecipeRequest_unstable | SetRecipeSlashCommandRequest_unstable | SaveRecipeRequest_unstable | ParseRecipeRequest_unstable | RecipeToYamlRequest_unstable | ListSchedulesRequest_unstable | ListScheduleSessionsRequest_unstable | CreateScheduleRequest_unstable | DeleteScheduleRequest_unstable | PauseScheduleRequest_unstable | UnpauseScheduleRequest_unstable | UpdateScheduleRequest_unstable | RunScheduleNowRequest_unstable | KillRunningJobRequest_unstable | InspectRunningJobRequest_unstable | GetSessionInfoRequest_unstable | TruncateSessionConversationRequest_unstable | UpdateSessionProjectRequest_unstable | RenameSessionRequest_unstable | ArchiveSessionRequest_unstable | UnarchiveSessionRequest_unstable | CreateSourceRequest_unstable | ListSourcesRequest_unstable | ListAgentMentionsRequest_unstable | ListSlashCommandsRequest_unstable | UpdateSourceRequest_unstable | DeleteSourceRequest_unstable | ExportSourceRequest_unstable | ImportSourcesRequest_unstable | DictationTranscribeRequest_unstable | DictationConfigRequest_unstable | DictationModelsListRequest_unstable | DictationModelDownloadRequest_unstable | DictationModelDownloadProgressRequest_unstable | DictationModelCancelRequest_unstable | DictationModelDeleteRequest_unstable | LocalInferenceModelsListRequest_unstable | LocalInferenceModelDownloadRequest_unstable | LocalInferenceModelDownloadProgressRequest_unstable | LocalInferenceModelDownloadCancelRequest_unstable | LocalInferenceModelDeleteRequest_unstable | LocalInferenceModelEvictRequest_unstable | LocalInferenceModelSettingsReadRequest_unstable | LocalInferenceModelSettingsUpdateRequest_unstable | LocalInferenceHuggingFaceSearchRequest_unstable | LocalInferenceHuggingFaceRepoVariantsRequest_unstable | LocalInferenceBuiltinChatTemplatesListRequest_unstable | {
+    params?: AddSessionExtensionRequest_unstable | RemoveSessionExtensionRequest_unstable | GetToolsRequest_unstable | SetToolPermissionsRequest_unstable | GooseToolCallRequest_unstable | ReadResourceRequest_unstable | AppsListRequest_unstable | AppsExportRequest_unstable | AppsImportRequest_unstable | AppsDeleteRequest_unstable | UpdateWorkingDirRequest_unstable | SetSessionSystemPromptRequest_unstable | TaskEvidenceRequest_unstable | RunTaskEvidenceRequest_unstable | TaskNoticeRequest_unstable | PromptAttemptTranscriptRequest_unstable | PromptAttemptStatusRequest_unstable | PromptAttemptCancelRequest_unstable | SteeringStatusRequest_unstable | SteerSessionRequest_unstable | DiagnosticsGetRequest_unstable | ListPromptsRequest_unstable | GetPromptRequest_unstable | SavePromptRequest_unstable | ResetPromptRequest_unstable | GetConfigExtensionsRequest_unstable | AddConfigExtensionRequest_unstable | RemoveConfigExtensionRequest_unstable | SetConfigExtensionEnabledRequest_unstable | GetSessionExtensionsRequest_unstable | ListProvidersRequest_unstable | ProviderSupportedModelsListRequest_unstable | ProviderCatalogListRequest_unstable | ProviderSetupCatalogListRequest_unstable | ProviderCatalogTemplateRequest_unstable | CustomProviderCreateRequest_unstable | CustomProviderReadRequest_unstable | CustomProviderUpdateRequest_unstable | CustomProviderDeleteRequest_unstable | RefreshProviderInventoryRequest_unstable | ProviderReadinessCheckRequest_unstable | ProviderConfigReadRequest_unstable | ProviderConfigStatusRequest_unstable | ProviderConfigSaveRequest_unstable | ProviderConfigDeleteRequest_unstable | ProviderConfigAuthenticateRequest_unstable | ProviderSecretsListRequest_unstable | ProviderSecretDeleteRequest_unstable | CanonicalModelInfoRequest_unstable | PreferencesReadRequest_unstable | PreferencesSaveRequest_unstable | ConfigReadRequest_unstable | ConfigUpsertRequest_unstable | ConfigRemoveRequest_unstable | ConfigReadAllRequest_unstable | DefaultsReadRequest_unstable | DefaultsSaveRequest_unstable | DefaultsClearRequest_unstable | OnboardingImportScanRequest_unstable | OnboardingImportApplyRequest_unstable | ExportSessionRequest_unstable | ImportSessionRequest_unstable | ShareSessionNostrRequest_unstable | EncodeRecipeRequest_unstable | DecodeRecipeRequest_unstable | ScanRecipeRequest_unstable | ListRecipesRequest_unstable | DeleteRecipeRequest_unstable | ScheduleRecipeRequest_unstable | SetRecipeSlashCommandRequest_unstable | SaveRecipeRequest_unstable | ParseRecipeRequest_unstable | RecipeToYamlRequest_unstable | ListSchedulesRequest_unstable | ListScheduleSessionsRequest_unstable | CreateScheduleRequest_unstable | DeleteScheduleRequest_unstable | PauseScheduleRequest_unstable | UnpauseScheduleRequest_unstable | UpdateScheduleRequest_unstable | RunScheduleNowRequest_unstable | KillRunningJobRequest_unstable | InspectRunningJobRequest_unstable | GetSessionInfoRequest_unstable | TruncateSessionConversationRequest_unstable | UpdateSessionProjectRequest_unstable | RenameSessionRequest_unstable | ArchiveSessionRequest_unstable | UnarchiveSessionRequest_unstable | CreateSourceRequest_unstable | ListSourcesRequest_unstable | ListAgentMentionsRequest_unstable | ListSlashCommandsRequest_unstable | UpdateSourceRequest_unstable | DeleteSourceRequest_unstable | ExportSourceRequest_unstable | ImportSourcesRequest_unstable | DictationTranscribeRequest_unstable | DictationConfigRequest_unstable | DictationModelsListRequest_unstable | DictationModelDownloadRequest_unstable | DictationModelDownloadProgressRequest_unstable | DictationModelCancelRequest_unstable | DictationModelDeleteRequest_unstable | LocalInferenceModelsListRequest_unstable | LocalInferenceModelDownloadRequest_unstable | LocalInferenceModelDownloadProgressRequest_unstable | LocalInferenceModelDownloadCancelRequest_unstable | LocalInferenceModelDeleteRequest_unstable | LocalInferenceModelEvictRequest_unstable | LocalInferenceModelSettingsReadRequest_unstable | LocalInferenceModelSettingsUpdateRequest_unstable | LocalInferenceHuggingFaceSearchRequest_unstable | LocalInferenceHuggingFaceRepoVariantsRequest_unstable | LocalInferenceBuiltinChatTemplatesListRequest_unstable | {
         [key: string]: unknown;
     } | null;
 };
 
 export type ExtResponse = {
     id: string;
-    result?: EmptyResponse | GetToolsResponse_unstable | SetToolPermissionsResponse_unstable | GooseToolCallResponse_unstable | ReadResourceResponse_unstable | AppsListResponse_unstable | AppsExportResponse_unstable | AppsImportResponse_unstable | AppsDeleteResponse_unstable | SteerSessionResponse_unstable | DiagnosticsGetResponse_unstable | ListPromptsResponse_unstable | GetPromptResponse_unstable | PromptOperationResponse_unstable | GetConfigExtensionsResponse_unstable | GetSessionExtensionsResponse_unstable | ListProvidersResponse_unstable | ProviderSupportedModelsListResponse_unstable | ProviderCatalogListResponse_unstable | ProviderSetupCatalogListResponse_unstable | ProviderCatalogTemplateResponse_unstable | CustomProviderCreateResponse_unstable | CustomProviderReadResponse_unstable | CustomProviderUpdateResponse_unstable | CustomProviderDeleteResponse_unstable | RefreshProviderInventoryResponse_unstable | ProviderReadinessCheckResponse_unstable | ProviderConfigReadResponse_unstable | ProviderConfigStatusResponse_unstable | ProviderConfigChangeResponse_unstable | ProviderSecretsListResponse_unstable | CanonicalModelInfoResponse_unstable | PreferencesReadResponse_unstable | ConfigReadResponse_unstable | ConfigReadAllResponse_unstable | DefaultsReadResponse_unstable | OnboardingImportScanResponse_unstable | OnboardingImportApplyResponse_unstable | ExportSessionResponse_unstable | ImportSessionResponse_unstable | ShareSessionNostrResponse_unstable | EncodeRecipeResponse_unstable | DecodeRecipeResponse_unstable | ScanRecipeResponse_unstable | ListRecipesResponse_unstable | SaveRecipeResponse_unstable | ParseRecipeResponse_unstable | RecipeToYamlResponse_unstable | ListSchedulesResponse_unstable | ListScheduleSessionsResponse_unstable | CreateScheduleResponse_unstable | UpdateScheduleResponse_unstable | RunScheduleNowResponse_unstable | KillRunningJobResponse_unstable | InspectRunningJobResponse_unstable | GetSessionInfoResponse_unstable | CreateSourceResponse_unstable | ListSourcesResponse_unstable | ListAgentMentionsResponse_unstable | ListSlashCommandsResponse_unstable | UpdateSourceResponse_unstable | ExportSourceResponse_unstable | ImportSourcesResponse_unstable | DictationTranscribeResponse_unstable | DictationConfigResponse_unstable | DictationModelsListResponse_unstable | DictationModelDownloadProgressResponse_unstable | LocalInferenceModelsListResponse_unstable | LocalInferenceModelDownloadResponse_unstable | LocalInferenceModelDownloadProgressResponse_unstable | LocalInferenceModelSettingsReadResponse_unstable | LocalInferenceModelSettingsUpdateResponse_unstable | LocalInferenceHuggingFaceSearchResponse_unstable | LocalInferenceHuggingFaceRepoVariantsResponse_unstable | LocalInferenceBuiltinChatTemplatesListResponse_unstable | unknown;
+    result?: EmptyResponse | GetToolsResponse_unstable | SetToolPermissionsResponse_unstable | GooseToolCallResponse_unstable | ReadResourceResponse_unstable | AppsListResponse_unstable | AppsExportResponse_unstable | AppsImportResponse_unstable | AppsDeleteResponse_unstable | TaskEvidenceResponse_unstable | RunTaskEvidenceResponse_unstable | TaskNoticeResponse_unstable | PromptAttemptTranscriptResponse_unstable | PromptAttemptResponse_unstable | SteeringStatusResponse_unstable | SteerSessionResponse_unstable | DiagnosticsGetResponse_unstable | ListPromptsResponse_unstable | GetPromptResponse_unstable | PromptOperationResponse_unstable | GetConfigExtensionsResponse_unstable | GetSessionExtensionsResponse_unstable | ListProvidersResponse_unstable | ProviderSupportedModelsListResponse_unstable | ProviderCatalogListResponse_unstable | ProviderSetupCatalogListResponse_unstable | ProviderCatalogTemplateResponse_unstable | CustomProviderCreateResponse_unstable | CustomProviderReadResponse_unstable | CustomProviderUpdateResponse_unstable | CustomProviderDeleteResponse_unstable | RefreshProviderInventoryResponse_unstable | ProviderReadinessCheckResponse_unstable | ProviderConfigReadResponse_unstable | ProviderConfigStatusResponse_unstable | ProviderConfigChangeResponse_unstable | ProviderSecretsListResponse_unstable | CanonicalModelInfoResponse_unstable | PreferencesReadResponse_unstable | ConfigReadResponse_unstable | ConfigReadAllResponse_unstable | DefaultsReadResponse_unstable | OnboardingImportScanResponse_unstable | OnboardingImportApplyResponse_unstable | ExportSessionResponse_unstable | ImportSessionResponse_unstable | ShareSessionNostrResponse_unstable | EncodeRecipeResponse_unstable | DecodeRecipeResponse_unstable | ScanRecipeResponse_unstable | ListRecipesResponse_unstable | SaveRecipeResponse_unstable | ParseRecipeResponse_unstable | RecipeToYamlResponse_unstable | ListSchedulesResponse_unstable | ListScheduleSessionsResponse_unstable | CreateScheduleResponse_unstable | UpdateScheduleResponse_unstable | RunScheduleNowResponse_unstable | KillRunningJobResponse_unstable | InspectRunningJobResponse_unstable | GetSessionInfoResponse_unstable | CreateSourceResponse_unstable | ListSourcesResponse_unstable | ListAgentMentionsResponse_unstable | ListSlashCommandsResponse_unstable | UpdateSourceResponse_unstable | ExportSourceResponse_unstable | ImportSourcesResponse_unstable | DictationTranscribeResponse_unstable | DictationConfigResponse_unstable | DictationModelsListResponse_unstable | DictationModelDownloadProgressResponse_unstable | LocalInferenceModelsListResponse_unstable | LocalInferenceModelDownloadResponse_unstable | LocalInferenceModelDownloadProgressResponse_unstable | LocalInferenceModelSettingsReadResponse_unstable | LocalInferenceModelSettingsUpdateResponse_unstable | LocalInferenceHuggingFaceSearchResponse_unstable | LocalInferenceHuggingFaceRepoVariantsResponse_unstable | LocalInferenceBuiltinChatTemplatesListResponse_unstable | unknown;
 } | {
     error: {
         code: number;

@@ -174,7 +174,7 @@ generate-acp-schema:
 # Generate ACP TypeScript types from JSON schema (requires generate-acp-schema first)
 generate-acp-types: generate-acp-schema
     @echo "Generating ACP TypeScript types..."
-    cd ui/goose-acp-client && npx tsx generate-schema.ts
+    cd ui/goose-acp-client && pnpm exec tsx generate-schema.ts
     @echo "ACP TypeScript types generated for the ACP client package."
 
 # Generate ACP documentation from the existing JSON schema and metadata

@@ -287,6 +287,205 @@ export const zSetSessionSystemPromptRequest_unstable = z.object({
 });
 
 /**
+ * Read scoped outcomes and selected canonical tool receipts without activating an agent.
+ */
+export const zTaskEvidenceRequest_unstable = z.object({
+    taskId: z.string().nullish().default(null),
+    attemptKey: z.string(),
+    toolNames: z.array(z.string()).optional().default([]),
+    afterTaskId: z.string().nullish()
+});
+
+/**
+ * A read-only reference a task was delegated with: an artifact it may read, frozen at
+ * the saved revision it had at delegation, until a later task is delegated to edit it.
+ */
+export const zTaskReference = z.object({
+    artifact: z.string(),
+    revisionId: z.string().nullish(),
+    revoked: z.boolean()
+});
+
+export const zTaskAdmission = z.object({
+    taskId: z.string(),
+    parentSessionId: z.string(),
+    parentRunId: z.string().nullish(),
+    attemptKey: z.string().nullish(),
+    sourceName: z.string(),
+    artifactKey: z.string().nullish(),
+    previousTaskId: z.string().nullish()
+});
+
+export const zTaskTerminalStatus = z.enum([
+    'completed',
+    'failed',
+    'panicked',
+    'cancelled'
+]);
+
+export const zTaskOutcome = z.object({
+    taskId: z.string(),
+    parentSessionId: z.string(),
+    parentRunId: z.string().nullish(),
+    attemptKey: z.string().nullish(),
+    sourceName: z.string(),
+    artifactKey: z.string().nullish(),
+    previousTaskId: z.string().nullish(),
+    status: zTaskTerminalStatus
+});
+
+export const zToolReceiptTransportStatus = z.enum(['success', 'error']);
+
+export const zTaskToolReceipt = z.object({
+    taskId: z.string(),
+    callId: z.string(),
+    toolName: z.string(),
+    transportStatus: zToolReceiptTransportStatus,
+    isError: z.boolean().nullish(),
+    structuredResult: z.unknown().optional()
+});
+
+export const zTaskEvidence = z.object({
+    artifactKey: z.string().nullish().default(null),
+    previousTaskId: z.string().nullish().default(null),
+    referenceArtifacts: z.array(zTaskReference).optional(),
+    admission: zTaskAdmission,
+    outcome: zTaskOutcome.nullish(),
+    receipts: z.array(zTaskToolReceipt),
+    evidenceComplete: z.boolean()
+});
+
+export const zTaskEvidenceResponse_unstable = z.object({
+    attemptKey: z.string(),
+    parentSessionId: z.string(),
+    parentRunId: z.string(),
+    tasks: z.array(zTaskEvidence),
+    nextTaskId: z.string().nullish(),
+    evidenceComplete: z.boolean()
+});
+
+/**
+ * Read receipts for an authoritative native run without creating an attempt.
+ */
+export const zRunTaskEvidenceRequest_unstable = z.object({
+    parentSessionId: z.string(),
+    parentRunId: z.string(),
+    taskId: z.string().nullish().default(null),
+    toolNames: z.array(z.string()).optional().default([]),
+    afterTaskId: z.string().nullish()
+});
+
+export const zRunTaskEvidenceResponse_unstable = z.object({
+    attemptKey: z.string().nullish(),
+    parentSessionId: z.string(),
+    parentRunId: z.string(),
+    tasks: z.array(zTaskEvidence),
+    nextTaskId: z.string().nullish(),
+    evidenceComplete: z.boolean()
+});
+
+/**
+ * Outstanding channel dependencies, independent of publication versions or status.
+ */
+export const zChannelWaitContext = z.object({
+    channelId: z.string(),
+    sequence: z.int().gte(0),
+    publications: z.array(z.string()).optional().default([]),
+    replies: z.array(z.string()).optional().default([])
+});
+
+/**
+ * Queue a notice for the running task of an attempt that holds one of the
+ * given artifacts (or has the given task ID): channel news, or the result of
+ * an editor task it started. The task reads it at its next checkpoint; `wake`
+ * also ends its wait, and `refresh_tools` re-lists the task's tools first (for
+ * example after it joins a channel).
+ */
+export const zTaskNoticeRequest_unstable = z.object({
+    attemptKey: z.string(),
+    taskId: z.string().nullish().default(null),
+    artifactKeys: z.array(z.string()).optional().default([]),
+    text: z.string(),
+    wake: z.boolean().optional().default(false),
+    refreshTools: z.boolean().optional().default(false),
+    dedupeKey: z.string().nullish().default(null),
+    editorResult: z.unknown().optional(),
+    channelWait: zChannelWaitContext.nullish()
+});
+
+export const zTaskNoticeStatus = z.enum(['queued', 'not_running']);
+
+export const zTaskNoticeResponse_unstable = z.object({
+    status: zTaskNoticeStatus,
+    taskId: z.string().nullish()
+});
+
+/**
+ * Read a bounded fragment of persisted transcript JSON without activating an agent.
+ */
+export const zPromptAttemptTranscriptRequest_unstable = z.object({
+    attemptKey: z.string(),
+    after: z.int().optional().default(0),
+    offset: z.int().gte(0).optional().default(0)
+});
+
+export const zPromptAttemptTranscriptResponse_unstable = z.object({
+    messageId: z.int().nullish(),
+    data: z.string(),
+    nextAfter: z.int(),
+    nextOffset: z.int().gte(0),
+    done: z.boolean()
+});
+
+/**
+ * Observe an attempt without loading a session or resuming tool execution.
+ */
+export const zPromptAttemptStatusRequest_unstable = z.object({
+    attemptKey: z.string()
+});
+
+export const zPromptAttemptState = z.enum([
+    'running',
+    'cancel_requested',
+    'completed',
+    'failed',
+    'cancelled',
+    'interrupted'
+]);
+
+export const zPromptAttemptResponse_unstable = z.object({
+    state: zPromptAttemptState.nullish(),
+    sessionId: z.string().nullish(),
+    runId: z.string().nullish(),
+    stopped: z.boolean(),
+    result: z.unknown().optional()
+});
+
+/**
+ * Persist cancellation even when the corresponding prompt has not arrived yet.
+ */
+export const zPromptAttemptCancelRequest_unstable = z.object({
+    attemptKey: z.string()
+});
+
+export const zSteeringStatusRequest_unstable = z.object({
+    attemptKey: z.string(),
+    deliveryId: z.string()
+});
+
+export const zSteeringDeliveryState = z.enum(['queued', 'consumed']);
+
+export const zSteerSessionResponse_unstable = z.object({
+    runId: z.string(),
+    messageId: z.string(),
+    deliveryState: zSteeringDeliveryState.optional().default('queued')
+});
+
+export const zSteeringStatusResponse_unstable = z.object({
+    receipt: zSteerSessionResponse_unstable.nullish()
+});
+
+/**
  * The sender or recipient of messages and data in a conversation.
  */
 export const zRole = z.union([
@@ -415,12 +614,10 @@ export const zContentBlock = z.discriminatedUnion('type', [
 export const zSteerSessionRequest_unstable = z.object({
     sessionId: z.string(),
     prompt: z.array(zContentBlock).optional().default([]),
-    expectedRunId: z.string()
-});
-
-export const zSteerSessionResponse_unstable = z.object({
-    runId: z.string(),
-    messageId: z.string()
+    expectedRunId: z.string(),
+    attemptKey: z.string().nullish().default(null),
+    deliveryId: z.string().nullish().default(null),
+    requestDigest: z.string().nullish().default(null)
 });
 
 export const zDiagnosticsReportLevel = z.enum(['summary', 'full']);
@@ -2302,6 +2499,13 @@ export const zExtRequest = z.object({
             zAppsDeleteRequest_unstable,
             zUpdateWorkingDirRequest_unstable,
             zSetSessionSystemPromptRequest_unstable,
+            zTaskEvidenceRequest_unstable,
+            zRunTaskEvidenceRequest_unstable,
+            zTaskNoticeRequest_unstable,
+            zPromptAttemptTranscriptRequest_unstable,
+            zPromptAttemptStatusRequest_unstable,
+            zPromptAttemptCancelRequest_unstable,
+            zSteeringStatusRequest_unstable,
             zSteerSessionRequest_unstable,
             zDiagnosticsGetRequest_unstable,
             zListPromptsRequest_unstable,
@@ -2417,6 +2621,12 @@ export const zExtResponse = z.union([
                 zAppsExportResponse_unstable,
                 zAppsImportResponse_unstable,
                 zAppsDeleteResponse_unstable,
+                zTaskEvidenceResponse_unstable,
+                zRunTaskEvidenceResponse_unstable,
+                zTaskNoticeResponse_unstable,
+                zPromptAttemptTranscriptResponse_unstable,
+                zPromptAttemptResponse_unstable,
+                zSteeringStatusResponse_unstable,
                 zSteerSessionResponse_unstable,
                 zDiagnosticsGetResponse_unstable,
                 zListPromptsResponse_unstable,
