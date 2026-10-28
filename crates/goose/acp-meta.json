@@ -61,6 +61,41 @@
       "responseType": "EmptyResponse"
     },
     {
+      "method": "_goose/unstable/attempt/task-evidence",
+      "requestType": "TaskEvidenceRequest_unstable",
+      "responseType": "TaskEvidenceResponse_unstable"
+    },
+    {
+      "method": "_goose/unstable/session/run-task-evidence",
+      "requestType": "RunTaskEvidenceRequest_unstable",
+      "responseType": "RunTaskEvidenceResponse_unstable"
+    },
+    {
+      "method": "_goose/unstable/attempt/task-notice",
+      "requestType": "TaskNoticeRequest_unstable",
+      "responseType": "TaskNoticeResponse_unstable"
+    },
+    {
+      "method": "_goose/unstable/attempt/transcript",
+      "requestType": "PromptAttemptTranscriptRequest_unstable",
+      "responseType": "PromptAttemptTranscriptResponse_unstable"
+    },
+    {
+      "method": "_goose/unstable/attempt/status",
+      "requestType": "PromptAttemptStatusRequest_unstable",
+      "responseType": "PromptAttemptResponse_unstable"
+    },
+    {
+      "method": "_goose/unstable/attempt/cancel",
+      "requestType": "PromptAttemptCancelRequest_unstable",
+      "responseType": "PromptAttemptResponse_unstable"
+    },
+    {
+      "method": "_goose/unstable/attempt/steering-status",
+      "requestType": "SteeringStatusRequest_unstable",
+      "responseType": "SteeringStatusResponse_unstable"
+    },
+    {
       "method": "_goose/unstable/session/steer",
       "requestType": "SteerSessionRequest_unstable",
       "responseType": "SteerSessionResponse_unstable"

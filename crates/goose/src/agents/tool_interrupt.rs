@@ -149,9 +149,13 @@ where
     let span = tracing::Span::current();
     let session_id = crate::session_context::current_session_id();
     let telemetry_session_id = crate::session_context::current_telemetry_session_id();
-    crate::session_context::with_telemetry_session_id(
-        telemetry_session_id,
-        crate::session_context::with_session_id(session_id, call),
+    let native_run = crate::session_context::current_native_run();
+    crate::session_context::with_native_run(
+        native_run,
+        crate::session_context::with_telemetry_session_id(
+            telemetry_session_id,
+            crate::session_context::with_session_id(session_id, call),
+        ),
     )
     .instrument(span)
 }
@@ -162,6 +166,24 @@ mod tests {
     use crate::config::GooseMode;
     use crate::session::SessionType;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn detached_call_keeps_its_owning_native_run_when_parent_moves_on() {
+        let observed = crate::session_context::with_native_run(
+            Some(("session".into(), "run_first".into())),
+            async {
+                let call =
+                    with_caller_context(async { crate::session_context::current_native_run() });
+                crate::session_context::with_native_run(
+                    Some(("session".into(), "run_second".into())),
+                    async { tokio::spawn(call).await.unwrap() },
+                )
+                .await
+            },
+        )
+        .await;
+        assert_eq!(observed, Some(("session".into(), "run_first".into())));
+    }
 
     #[tokio::test]
     async fn the_call_keeps_the_callers_span_and_session() {

@@ -9161,8 +9161,7 @@ You review code."#;
 
     #[tokio::test]
     async fn test_async_task_result_lifecycle() {
-        let client = SummonClient::new(create_test_context()).unwrap();
-        let temp_dir = TempDir::new().unwrap();
+        let (temp_dir, _manager, parent, client) = reliability_fixture().await;
 
         let result = client
             .handle_load_task_result("20260204_999", false, false, None)
@@ -9286,7 +9285,7 @@ You review code."#;
             },
         );
 
-        let moim = client.get_moim("test").await.unwrap();
+        let moim = client.get_moim(&parent).await.unwrap();
         assert!(moim.contains("20260204_2"));
         assert!(moim.contains("20260204_3"));
         assert!(moim.contains("completion is reported automatically"));
@@ -9298,15 +9297,15 @@ You review code."#;
             .event_driven_parents
             .lock()
             .await
-            .insert("test".to_string());
+            .insert(parent.clone());
         assert!(
-            client.get_moim("test").await.is_none(),
+            client.get_moim(&parent).await.is_none(),
             "delivered reports are not repeated to an event-driven parent"
         );
-        client.event_driven_parents.lock().await.remove("test");
+        client.event_driven_parents.lock().await.remove(&parent);
 
         let discovery = client
-            .handle_load_discovery("test", temp_dir.path())
+            .handle_load_discovery(&parent, temp_dir.path())
             .await
             .unwrap();
         let discovery_text = extract_text(&discovery[0]);
@@ -9353,7 +9352,7 @@ You review code."#;
             .handle_load_task_result("20260204_5", false, false, None)
             .await
             .unwrap();
-        assert!(client.get_moim("test").await.is_none());
+        assert!(client.get_moim(&parent).await.is_none());
     }
 
     #[tokio::test]

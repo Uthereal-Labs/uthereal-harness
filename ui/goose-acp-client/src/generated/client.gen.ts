@@ -126,6 +126,11 @@ import type {
   PreferencesReadRequest_unstable,
   PreferencesReadResponse_unstable,
   PreferencesSaveRequest_unstable,
+  PromptAttemptCancelRequest_unstable,
+  PromptAttemptResponse_unstable,
+  PromptAttemptStatusRequest_unstable,
+  PromptAttemptTranscriptRequest_unstable,
+  PromptAttemptTranscriptResponse_unstable,
   PromptOperationResponse_unstable,
   ProviderCatalogListRequest_unstable,
   ProviderCatalogListResponse_unstable,
@@ -160,6 +165,8 @@ import type {
   ResetPromptRequest_unstable,
   RunScheduleNowRequest_unstable,
   RunScheduleNowResponse_unstable,
+  RunTaskEvidenceRequest_unstable,
+  RunTaskEvidenceResponse_unstable,
   SavePromptRequest_unstable,
   SaveRecipeRequest_unstable,
   SaveRecipeResponse_unstable,
@@ -175,6 +182,12 @@ import type {
   ShareSessionNostrResponse_unstable,
   SteerSessionRequest_unstable,
   SteerSessionResponse_unstable,
+  SteeringStatusRequest_unstable,
+  SteeringStatusResponse_unstable,
+  TaskEvidenceRequest_unstable,
+  TaskEvidenceResponse_unstable,
+  TaskNoticeRequest_unstable,
+  TaskNoticeResponse_unstable,
   TruncateSessionConversationRequest_unstable,
   UnarchiveSessionRequest_unstable,
   UnpauseScheduleRequest_unstable,
@@ -239,6 +252,8 @@ import {
   zOnboardingImportScanResponse_unstable,
   zParseRecipeResponse_unstable,
   zPreferencesReadResponse_unstable,
+  zPromptAttemptResponse_unstable,
+  zPromptAttemptTranscriptResponse_unstable,
   zPromptOperationResponse_unstable,
   zProviderCatalogListResponse_unstable,
   zProviderCatalogTemplateResponse_unstable,
@@ -253,11 +268,15 @@ import {
   zRecipeToYamlResponse_unstable,
   zRefreshProviderInventoryResponse_unstable,
   zRunScheduleNowResponse_unstable,
+  zRunTaskEvidenceResponse_unstable,
   zSaveRecipeResponse_unstable,
   zScanRecipeResponse_unstable,
   zSetToolPermissionsResponse_unstable,
   zShareSessionNostrResponse_unstable,
   zSteerSessionResponse_unstable,
+  zSteeringStatusResponse_unstable,
+  zTaskEvidenceResponse_unstable,
+  zTaskNoticeResponse_unstable,
   zUpdateScheduleResponse_unstable,
   zUpdateSourceResponse_unstable,
 } from './zod.gen.js';
@@ -370,6 +389,90 @@ export class GooseExtClient {
       "_goose/unstable/session/system-prompt/set",
       params,
     );
+  }
+
+  async attemptTaskEvidence_unstable(
+    params: TaskEvidenceRequest_unstable,
+  ): Promise<TaskEvidenceResponse_unstable> {
+    const raw = await this.conn.request(
+      "_goose/unstable/attempt/task-evidence",
+      params,
+    );
+    return zTaskEvidenceResponse_unstable.parse(
+      raw,
+    ) as TaskEvidenceResponse_unstable;
+  }
+
+  async sessionRunTaskEvidence_unstable(
+    params: RunTaskEvidenceRequest_unstable,
+  ): Promise<RunTaskEvidenceResponse_unstable> {
+    const raw = await this.conn.request(
+      "_goose/unstable/session/run-task-evidence",
+      params,
+    );
+    return zRunTaskEvidenceResponse_unstable.parse(
+      raw,
+    ) as RunTaskEvidenceResponse_unstable;
+  }
+
+  async attemptTaskNotice_unstable(
+    params: TaskNoticeRequest_unstable,
+  ): Promise<TaskNoticeResponse_unstable> {
+    const raw = await this.conn.request(
+      "_goose/unstable/attempt/task-notice",
+      params,
+    );
+    return zTaskNoticeResponse_unstable.parse(
+      raw,
+    ) as TaskNoticeResponse_unstable;
+  }
+
+  async attemptTranscript_unstable(
+    params: PromptAttemptTranscriptRequest_unstable,
+  ): Promise<PromptAttemptTranscriptResponse_unstable> {
+    const raw = await this.conn.request(
+      "_goose/unstable/attempt/transcript",
+      params,
+    );
+    return zPromptAttemptTranscriptResponse_unstable.parse(
+      raw,
+    ) as PromptAttemptTranscriptResponse_unstable;
+  }
+
+  async attemptStatus_unstable(
+    params: PromptAttemptStatusRequest_unstable,
+  ): Promise<PromptAttemptResponse_unstable> {
+    const raw = await this.conn.request(
+      "_goose/unstable/attempt/status",
+      params,
+    );
+    return zPromptAttemptResponse_unstable.parse(
+      raw,
+    ) as PromptAttemptResponse_unstable;
+  }
+
+  async attemptCancel_unstable(
+    params: PromptAttemptCancelRequest_unstable,
+  ): Promise<PromptAttemptResponse_unstable> {
+    const raw = await this.conn.request(
+      "_goose/unstable/attempt/cancel",
+      params,
+    );
+    return zPromptAttemptResponse_unstable.parse(
+      raw,
+    ) as PromptAttemptResponse_unstable;
+  }
+
+  async attemptSteeringStatus_unstable(
+    params: SteeringStatusRequest_unstable,
+  ): Promise<SteeringStatusResponse_unstable> {
+    const raw = await this.conn.request(
+      "_goose/unstable/attempt/steering-status",
+      params,
+    );
+    return zSteeringStatusResponse_unstable.parse(
+      raw,
+    ) as SteeringStatusResponse_unstable;
   }
 
   async sessionSteer_unstable(

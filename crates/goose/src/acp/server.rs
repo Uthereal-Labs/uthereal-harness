@@ -2807,6 +2807,17 @@ impl GooseAcpAgent {
             true,
         )
         .await?;
+        self.session_manager
+            .record_acp_run(
+                &session_id,
+                &run_id,
+                run_guard
+                    .attempt
+                    .as_ref()
+                    .map(|attempt| attempt.key.as_str()),
+            )
+            .await
+            .internal_err_ctx("Failed to record native run ownership")?;
 
         if user_message.is_some() {
             if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
@@ -3071,6 +3082,10 @@ impl GooseAcpAgent {
             }
             Ok(outcome)
         };
+        let stream = crate::session_context::with_native_run(
+            Some((session_id.clone(), run_id.clone())),
+            stream,
+        );
         tokio::pin!(stream);
         let stream_result = if let Some(attempt) = &run_guard.attempt {
             let cancellation = async {

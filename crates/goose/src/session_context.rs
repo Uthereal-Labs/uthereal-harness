@@ -8,6 +8,18 @@ pub const WORKING_DIR_HEADER: &str = "agent-working-dir";
 tokio::task_local! {
     pub static SESSION_ID: Option<String>;
     pub static TELEMETRY_SESSION_ID: Option<String>;
+    pub static NATIVE_RUN: Option<(String, String)>;
+}
+
+pub async fn with_native_run<F>(identity: Option<(String, String)>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    NATIVE_RUN.scope(identity, future).await
+}
+
+pub fn current_native_run() -> Option<(String, String)> {
+    NATIVE_RUN.try_with(Clone::clone).ok().flatten()
 }
 
 pub async fn with_session_id<F>(session_id: Option<String>, f: F) -> F::Output

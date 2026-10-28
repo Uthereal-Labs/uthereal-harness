@@ -1,3 +1,6 @@
+//! Live provider conformance: `cargo test -p goose --test providers -- --ignored`.
+//! Ambient credentials or installed agent CLIs never opt the default suite into inference.
+
 use anyhow::Result;
 use dotenvy::dotenv;
 use futures::StreamExt;
@@ -790,6 +793,7 @@ async fn test_provider(config: ProviderTestConfig) -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_openai_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider("openai", OPEN_AI_DEFAULT_MODEL, &["OPENAI_API_KEY"])
         .run()
@@ -797,6 +801,7 @@ async fn test_openai_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_azure_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider(
         "Azure",
@@ -813,6 +818,7 @@ async fn test_azure_provider() -> Result<()> {
 
 #[cfg(feature = "aws-providers")]
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_bedrock_provider_long_term_credentials() -> Result<()> {
     ProviderTestConfig::with_llm_provider(
         "aws_bedrock",
@@ -825,6 +831,7 @@ async fn test_bedrock_provider_long_term_credentials() -> Result<()> {
 
 #[cfg(feature = "aws-providers")]
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_bedrock_provider_aws_profile_credentials() -> Result<()> {
     ProviderTestConfig::with_llm_provider("aws_bedrock", BEDROCK_DEFAULT_MODEL, &["AWS_PROFILE"])
         .clear_env(&["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"])
@@ -834,6 +841,7 @@ async fn test_bedrock_provider_aws_profile_credentials() -> Result<()> {
 
 #[cfg(feature = "aws-providers")]
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_bedrock_provider_bearer_token() -> Result<()> {
     ProviderTestConfig::with_llm_provider(
         "aws_bedrock",
@@ -846,6 +854,7 @@ async fn test_bedrock_provider_bearer_token() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_databricks_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider(
         "Databricks",
@@ -857,6 +866,7 @@ async fn test_databricks_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_ollama_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider("Ollama", "qwen3", &["OLLAMA_HOST"])
         .image_model("qwen3-vl")
@@ -869,6 +879,7 @@ async fn test_ollama_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_anthropic_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider(
         "Anthropic",
@@ -880,6 +891,7 @@ async fn test_anthropic_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_openrouter_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider(
         "OpenRouter",
@@ -892,6 +904,7 @@ async fn test_openrouter_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_google_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider("Google", GOOGLE_DEFAULT_MODEL, &["GOOGLE_API_KEY"])
         .context_length_exceeded(2_600_000)
@@ -900,6 +913,7 @@ async fn test_google_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_snowflake_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider(
         "Snowflake",
@@ -912,6 +926,7 @@ async fn test_snowflake_provider() -> Result<()> {
 
 #[cfg(feature = "aws-providers")]
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_sagemaker_tgi_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider(
         "SageMakerTgi",
@@ -923,6 +938,7 @@ async fn test_sagemaker_tgi_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_litellm_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider("LiteLLM", LITELLM_DEFAULT_MODEL, &["LITELLM_HOST"])
         .run()
@@ -930,6 +946,7 @@ async fn test_litellm_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_xai_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider("Xai", XAI_DEFAULT_MODEL, &["XAI_API_KEY"])
         .run()
@@ -937,6 +954,7 @@ async fn test_xai_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_claude_code_provider() -> Result<()> {
     ProviderTestConfig::with_agentic_provider("claude-code", CLAUDE_CODE_DEFAULT_MODEL, "claude")
         .model_switch_name("sonnet")
@@ -945,6 +963,7 @@ async fn test_claude_code_provider() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_codex_provider() -> Result<()> {
     ProviderTestConfig::with_agentic_provider("codex", CODEX_DEFAULT_MODEL, "codex")
         .test_permissions(false)
@@ -954,6 +973,7 @@ async fn test_codex_provider() -> Result<()> {
 
 // Requires: npm install -g @agentclientprotocol/claude-agent-acp
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_claude_acp_provider() -> Result<()> {
     ProviderTestConfig::with_agentic_provider("claude-acp", ACP_CURRENT_MODEL, "claude-agent-acp")
         .model_switch_name("sonnet")
@@ -964,6 +984,7 @@ async fn test_claude_acp_provider() -> Result<()> {
 
 // Requires: npm install -g @agentclientprotocol/codex-acp
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_codex_acp_provider() -> Result<()> {
     ProviderTestConfig::with_agentic_provider("codex-acp", ACP_CURRENT_MODEL, "codex-acp")
         .model_switch_name("gpt-5.4-mini")
@@ -973,6 +994,7 @@ async fn test_codex_acp_provider() -> Result<()> {
 
 // Requires: npm install -g @github/copilot
 #[tokio::test]
+#[ignore = "live provider inference; run explicitly with --ignored"]
 async fn test_copilot_acp_provider() -> Result<()> {
     ProviderTestConfig::with_agentic_provider("copilot-acp", ACP_CURRENT_MODEL, "copilot")
         .model_switch_name("gpt-4.1")

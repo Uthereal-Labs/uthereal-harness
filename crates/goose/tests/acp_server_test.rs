@@ -1947,3 +1947,55 @@ fn automatic_typed_task_outcome_precedes_parent_reply_in_both_loops() {
         }
     });
 }
+
+#[test]
+fn unfenced_native_run_receipt_rpc_uses_actual_run_identity_in_both_loops() {
+    run_test(async {
+        for state_machine in [false, true] {
+            let openai = OpenAiFixture::new(
+                vec![],
+                std::sync::Arc::new(goose_test_support::IgnoreSessionId),
+            )
+            .await;
+            openai
+                .mount_responder(|_: &wiremock::Request| {
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(include_str!("acp_test_data/openai_basic.txt"))
+                })
+                .await;
+            let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+            let SessionData { session, .. } = conn.new_session().await.unwrap();
+            let mut runs = Vec::new();
+            for _ in 0..2 {
+                let response = conn.cx().send_request(PromptRequest::new(session.session_id().clone(), vec![ContentBlock::Text(TextContent::new("short answer"))])
+                    .meta(serde_json::from_value::<agent_client_protocol::schema::v1::Meta>(serde_json::json!({"goose":{"unrolledAgentLoop":state_machine,"awaitBackgroundTasks":true}})).unwrap())).block_task().await.unwrap();
+                assert_eq!(response.stop_reason, StopReason::EndTurn);
+                let run = session
+                    .session_updates()
+                    .into_iter()
+                    .find_map(|update| {
+                        let SessionUpdate::SessionInfoUpdate(info) = update else {
+                            return None;
+                        };
+                        info.meta
+                            .as_ref()?
+                            .get("goose")?
+                            .get("activeRunId")?
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .expect("actual native run start notification");
+                let evidence = send_custom(conn.cx(), "_goose/unstable/session/run-task-evidence", serde_json::json!({"parentSessionId":session.session_id(),"parentRunId":run,"toolNames":[]})).await.unwrap();
+                assert!(evidence["attemptKey"].is_null());
+                assert_eq!(evidence["evidenceComplete"], true);
+                assert_eq!(evidence["tasks"], serde_json::json!([]));
+                runs.push(run);
+            }
+            assert_ne!(runs[0], runs[1]);
+            let historical = send_custom(conn.cx(), "_goose/unstable/session/run-task-evidence", serde_json::json!({"parentSessionId":session.session_id(),"parentRunId":runs[0],"toolNames":[]})).await.unwrap();
+            assert_eq!(historical["parentRunId"], runs[0]);
+            assert!(send_custom(conn.cx(), "_goose/unstable/session/run-task-evidence", serde_json::json!({"parentSessionId":session.session_id(),"parentRunId":"invented","toolNames":[]})).await.is_err());
+        }
+    });
+}

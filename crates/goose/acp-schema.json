@@ -811,6 +811,679 @@
       ],
       "description": "How a session system prompt update should be applied."
     },
+    "TaskEvidenceRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "attemptKey": {
+          "type": "string"
+        },
+        "toolNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "afterTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "attemptKey"
+      ],
+      "description": "Read scoped outcomes and selected canonical tool receipts without activating an agent.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/attempt/task-evidence"
+    },
+    "TaskEvidenceResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "attemptKey": {
+          "type": "string"
+        },
+        "parentSessionId": {
+          "type": "string"
+        },
+        "parentRunId": {
+          "type": "string"
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskEvidence"
+          }
+        },
+        "nextTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidenceComplete": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "attemptKey",
+        "parentSessionId",
+        "parentRunId",
+        "tasks",
+        "evidenceComplete"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/attempt/task-evidence"
+    },
+    "TaskEvidence": {
+      "type": "object",
+      "properties": {
+        "artifactKey": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "previousTaskId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "referenceArtifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskReference"
+          }
+        },
+        "admission": {
+          "$ref": "#/$defs/TaskAdmission"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "receipts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskToolReceipt"
+          }
+        },
+        "evidenceComplete": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "admission",
+        "receipts",
+        "evidenceComplete"
+      ]
+    },
+    "TaskReference": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string"
+        },
+        "revisionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revoked": {
+          "type": "boolean",
+          "description": "A task delegated after this one edits the artifact: the read access is revoked for good."
+        }
+      },
+      "required": [
+        "artifact",
+        "revoked"
+      ],
+      "description": "A read-only reference a task was delegated with: an artifact it may read, frozen at\nthe saved revision it had at delegation, until a later task is delegated to edit it."
+    },
+    "TaskAdmission": {
+      "type": "object",
+      "properties": {
+        "taskId": {
+          "type": "string"
+        },
+        "parentSessionId": {
+          "type": "string"
+        },
+        "parentRunId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attemptKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceName": {
+          "type": "string"
+        },
+        "artifactKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "previousTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "taskId",
+        "parentSessionId",
+        "sourceName"
+      ]
+    },
+    "TaskOutcome": {
+      "type": "object",
+      "properties": {
+        "taskId": {
+          "type": "string"
+        },
+        "parentSessionId": {
+          "type": "string"
+        },
+        "parentRunId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attemptKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceName": {
+          "type": "string"
+        },
+        "artifactKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "previousTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/TaskTerminalStatus"
+        }
+      },
+      "required": [
+        "taskId",
+        "parentSessionId",
+        "sourceName",
+        "status"
+      ]
+    },
+    "TaskTerminalStatus": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "failed",
+        "panicked",
+        "cancelled"
+      ]
+    },
+    "TaskToolReceipt": {
+      "type": "object",
+      "properties": {
+        "taskId": {
+          "type": "string"
+        },
+        "callId": {
+          "type": "string"
+        },
+        "toolName": {
+          "type": "string"
+        },
+        "transportStatus": {
+          "$ref": "#/$defs/ToolReceiptTransportStatus"
+        },
+        "isError": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "structuredResult": {}
+      },
+      "required": [
+        "taskId",
+        "callId",
+        "toolName",
+        "transportStatus"
+      ]
+    },
+    "ToolReceiptTransportStatus": {
+      "type": "string",
+      "enum": [
+        "success",
+        "error"
+      ]
+    },
+    "RunTaskEvidenceRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "parentSessionId": {
+          "type": "string"
+        },
+        "parentRunId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "toolNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "afterTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "parentSessionId",
+        "parentRunId"
+      ],
+      "description": "Read receipts for an authoritative native run without creating an attempt.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/run-task-evidence"
+    },
+    "RunTaskEvidenceResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "attemptKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parentSessionId": {
+          "type": "string"
+        },
+        "parentRunId": {
+          "type": "string"
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskEvidence"
+          }
+        },
+        "nextTaskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidenceComplete": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "parentSessionId",
+        "parentRunId",
+        "tasks",
+        "evidenceComplete"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/run-task-evidence"
+    },
+    "TaskNoticeRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "attemptKey": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "artifactKeys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "text": {
+          "type": "string"
+        },
+        "wake": {
+          "type": "boolean",
+          "default": false
+        },
+        "refreshTools": {
+          "type": "boolean",
+          "default": false
+        },
+        "dedupeKey": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Makes a retried notice idempotent for its recipient.",
+          "default": null
+        },
+        "editorResult": {
+          "description": "The result of an editor task the recipient started, delivered with the\nnotice: `{\"idempotency_key\": ..., \"receipt\": {...}}`. Goose counts it as\nthat task's result (artifact results, finish guard) once delivered."
+        },
+        "channelWait": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChannelWaitContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "attemptKey",
+        "text"
+      ],
+      "description": "Queue a notice for the running task of an attempt that holds one of the\ngiven artifacts (or has the given task ID): channel news, or the result of\nan editor task it started. The task reads it at its next checkpoint; `wake`\nalso ends its wait, and `refresh_tools` re-lists the task's tools first (for\nexample after it joins a channel).",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/attempt/task-notice"
+    },
+    "ChannelWaitContext": {
+      "type": "object",
+      "properties": {
+        "channelId": {
+          "type": "string"
+        },
+        "sequence": {
+          "type": "integer",
+          "description": "Orders mailbox and tool-result delivery, never artifact alignment.",
+          "minimum": 0
+        },
+        "publications": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "replies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "required": [
+        "channelId",
+        "sequence"
+      ],
+      "description": "Outstanding channel dependencies, independent of publication versions or status."
+    },
+    "TaskNoticeResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/TaskNoticeStatus"
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/attempt/task-notice"
+    },
+    "TaskNoticeStatus": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "not_running"
+      ]
+    },
+    "PromptAttemptTranscriptRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "attemptKey": {
+          "type": "string"
+        },
+        "after": {
+          "type": "integer",
+          "default": 0
+        },
+        "offset": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "attemptKey"
+      ],
+      "description": "Read a bounded fragment of persisted transcript JSON without activating an agent.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/attempt/transcript"
+    },
+    "PromptAttemptTranscriptResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "messageId": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "string"
+        },
+        "nextAfter": {
+          "type": "integer"
+        },
+        "nextOffset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "done": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "data",
+        "nextAfter",
+        "nextOffset",
+        "done"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/attempt/transcript"
+    },
+    "PromptAttemptStatusRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "attemptKey": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attemptKey"
+      ],
+      "description": "Observe an attempt without loading a session or resuming tool execution.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/attempt/status"
+    },
+    "PromptAttemptResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PromptAttemptState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stopped": {
+          "type": "boolean",
+          "description": "False until the executor has released its process lock after cleanup."
+        },
+        "result": {}
+      },
+      "required": [
+        "stopped"
+      ],
+      "x-side": "agent"
+    },
+    "PromptAttemptState": {
+      "type": "string",
+      "enum": [
+        "running",
+        "cancel_requested",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted"
+      ]
+    },
+    "PromptAttemptCancelRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "attemptKey": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attemptKey"
+      ],
+      "description": "Persist cancellation even when the corresponding prompt has not arrived yet.",
+      "x-side": "agent",
+      "x-method": "_goose/unstable/attempt/cancel"
+    },
+    "SteeringStatusRequest_unstable": {
+      "type": "object",
+      "properties": {
+        "attemptKey": {
+          "type": "string"
+        },
+        "deliveryId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attemptKey",
+        "deliveryId"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/attempt/steering-status"
+    },
+    "SteeringStatusResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SteerSessionResponse_unstable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "x-side": "agent",
+      "x-method": "_goose/unstable/attempt/steering-status"
+    },
+    "SteerSessionResponse_unstable": {
+      "type": "object",
+      "properties": {
+        "runId": {
+          "type": "string"
+        },
+        "messageId": {
+          "type": "string",
+          "description": "Stable id of the queued steer message. The same id later appears as\n`messageId` on the streamed `UserMessageChunk` (with `_meta.goose.steer`),\nletting clients correlate a queued steer with its pickup."
+        },
+        "deliveryState": {
+          "$ref": "#/$defs/SteeringDeliveryState",
+          "default": "queued"
+        }
+      },
+      "required": [
+        "runId",
+        "messageId"
+      ],
+      "x-side": "agent",
+      "x-method": "_goose/unstable/session/steer"
+    },
+    "SteeringDeliveryState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "consumed"
+      ]
+    },
     "SteerSessionRequest_unstable": {
       "type": "object",
       "properties": {
@@ -826,6 +1499,27 @@
         },
         "expectedRunId": {
           "type": "string"
+        },
+        "attemptKey": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "deliveryId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "requestDigest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       },
       "required": [
@@ -1280,24 +1974,6 @@
         "resource"
       ],
       "description": "The contents of a resource, embedded into a prompt or tool call result."
-    },
-    "SteerSessionResponse_unstable": {
-      "type": "object",
-      "properties": {
-        "runId": {
-          "type": "string"
-        },
-        "messageId": {
-          "type": "string",
-          "description": "Stable id of the queued steer message. The same id later appears as\n`messageId` on the streamed `UserMessageChunk` (with `_meta.goose.steer`),\nletting clients correlate a queued steer with its pickup."
-        }
-      },
-      "required": [
-        "runId",
-        "messageId"
-      ],
-      "x-side": "agent",
-      "x-method": "_goose/unstable/session/steer"
     },
     "DiagnosticsGetRequest_unstable": {
       "type": "object",
@@ -7092,6 +7768,69 @@
                 {
                   "allOf": [
                     {
+                      "$ref": "#/$defs/TaskEvidenceRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/attempt/task-evidence",
+                  "title": "TaskEvidenceRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/RunTaskEvidenceRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/session/run-task-evidence",
+                  "title": "RunTaskEvidenceRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/TaskNoticeRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/attempt/task-notice",
+                  "title": "TaskNoticeRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/PromptAttemptTranscriptRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/attempt/transcript",
+                  "title": "PromptAttemptTranscriptRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/PromptAttemptStatusRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/attempt/status",
+                  "title": "PromptAttemptStatusRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/PromptAttemptCancelRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/attempt/cancel",
+                  "title": "PromptAttemptCancelRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/SteeringStatusRequest_unstable"
+                    }
+                  ],
+                  "description": "Params for _goose/unstable/attempt/steering-status",
+                  "title": "SteeringStatusRequest_unstable"
+                },
+                {
+                  "allOf": [
+                    {
                       "$ref": "#/$defs/SteerSessionRequest_unstable"
                     }
                   ],
@@ -8054,6 +8793,54 @@
                         }
                       ],
                       "title": "AppsDeleteResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/TaskEvidenceResponse_unstable"
+                        }
+                      ],
+                      "title": "TaskEvidenceResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/RunTaskEvidenceResponse_unstable"
+                        }
+                      ],
+                      "title": "RunTaskEvidenceResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/TaskNoticeResponse_unstable"
+                        }
+                      ],
+                      "title": "TaskNoticeResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/PromptAttemptTranscriptResponse_unstable"
+                        }
+                      ],
+                      "title": "PromptAttemptTranscriptResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/PromptAttemptResponse_unstable"
+                        }
+                      ],
+                      "title": "PromptAttemptResponse_unstable"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/$defs/SteeringStatusResponse_unstable"
+                        }
+                      ],
+                      "title": "SteeringStatusResponse_unstable"
                     },
                     {
                       "allOf": [

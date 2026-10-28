@@ -158,19 +158,16 @@ where
         test_name
     );
 
-    if let Some(parent) = Path::new(&file_path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     let replay_mode = Path::new(&file_path).exists();
     let (provider_arc, provider_for_saving, original_env) = if replay_mode {
         match TestProvider::new_replaying(&file_path) {
             Ok(test_provider) => (Arc::new(test_provider), None, None),
             Err(e) => {
-                let _ = std::fs::remove_file(&file_path);
                 return Err(anyhow::anyhow!(
-                    "Test replay failed for '{}' ({}): {}. File deleted - re-run test to record fresh data.",
-                    test_name, factory_name, e
+                    "Test replay failed for '{}' ({}): {}. Repair the recording explicitly.",
+                    test_name,
+                    factory_name,
+                    e
                 ));
             }
         }
@@ -181,6 +178,14 @@ where
             Did you forget to add the file {} to the repository and were expecting that to replay?",
                 file_path
             );
+        }
+        if std::env::var("GOOSE_RECORD_SCENARIOS").as_deref() != Ok("1") {
+            anyhow::bail!(
+                "Missing scenario recording {file_path}. Live recording requires explicit GOOSE_RECORD_SCENARIOS=1."
+            );
+        }
+        if let Some(parent) = Path::new(&file_path).parent() {
+            std::fs::create_dir_all(parent)?;
         }
 
         let original_env = setup_environment(config)?;
@@ -362,5 +367,29 @@ fn restore_environment(config: &ProviderConfig, original_env: &HashMap<&'static 
                 std::env::remove_var(var);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_missing_recording_never_initializes_a_live_provider_without_opt_in() {
+        let _env = env_lock::lock_env([
+            ("GOOSE_RECORD_SCENARIOS", None::<&str>),
+            ("GITHUB_ACTIONS", None),
+        ]);
+        let config = ProviderConfig::simple("missing-fixture-provider", "unused-model");
+        let message = crate::scenario_tests::message_generator::text("unused prompt");
+        let error = run_provider_scenario_with_validation(
+            &config,
+            "missing_recording_requires_explicit_opt_in",
+            &message,
+            &|_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("GOOSE_RECORD_SCENARIOS=1"));
     }
 }
