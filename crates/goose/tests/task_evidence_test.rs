@@ -2,8 +2,8 @@ use goose::config::GooseMode;
 use goose::conversation::message::Message;
 use goose::session::{PromptAttemptLease, SessionManager, SessionType};
 use goose_sdk_types::custom_requests::{
-    PromptAttemptState, TaskAdmission, TaskEvidenceRequest, TaskNoticeRequest, TaskNoticeStatus,
-    TaskTerminalStatus, ToolReceiptTransportStatus,
+    PromptAttemptState, RunTaskEvidenceRequest, TaskAdmission, TaskEvidenceRequest,
+    TaskNoticeRequest, TaskNoticeStatus, TaskTerminalStatus, ToolReceiptTransportStatus,
 };
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use serde_json::{json, Value};
@@ -853,4 +853,127 @@ async fn notice_and_completion_have_one_atomic_winner() {
             accepted
         );
     }
+}
+
+#[tokio::test]
+async fn unfenced_native_runs_keep_scoped_child_receipts_after_reconstruction() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = SessionManager::new(directory.path().to_path_buf());
+    let parent = manager
+        .create_session(
+            directory.path().to_path_buf(),
+            "native".into(),
+            SessionType::User,
+            GooseMode::Auto,
+        )
+        .await
+        .unwrap()
+        .id;
+    manager
+        .record_acp_run(&parent, "run_first", None)
+        .await
+        .unwrap();
+    let child = manager
+        .create_session(
+            directory.path().to_path_buf(),
+            "private child".into(),
+            SessionType::SubAgent,
+            GooseMode::Auto,
+        )
+        .await
+        .unwrap();
+    manager
+        .record_acp_run(&parent, "run_second", None)
+        .await
+        .unwrap();
+    let admission = goose::session_context::with_native_run(
+        Some((parent.clone(), "run_first".into())),
+        manager.capture_task_admission(&parent, &child.id, "cortex-document"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(admission.parent_run_id.as_deref(), Some("run_first"));
+    assert!(admission.attempt_key.is_none());
+    let mut extension_data = child.extension_data;
+    extension_data.set_extension_state(
+        "summon",
+        "task_admission_v1",
+        serde_json::to_value(&admission).unwrap(),
+    );
+    manager
+        .update(&child.id)
+        .parent_session_id(Some(parent.clone()))
+        .extension_data(extension_data)
+        .apply()
+        .await
+        .unwrap();
+    let request = Message::assistant().with_tool_request(
+        "load",
+        Ok(CallToolRequestParams::new(
+            "cortex_document__load_skill".to_string(),
+        )),
+    );
+    manager.add_message(&child.id, &request).await.unwrap();
+    let mut result = CallToolResult::success(vec![ContentBlock::text("PRIVATE GUIDANCE")]);
+    result.structured_content = Some(
+        json!({"execution_usage":{"coverage":"complete","skill_uses":[{"role":"document","kind":"type","action":"loaded","builtin_skill_id":"brief-memo","count":1}]}}),
+    );
+    manager
+        .add_message(
+            &child.id,
+            &Message::user().with_tool_response("load", Ok(result)),
+        )
+        .await
+        .unwrap();
+    manager
+        .enqueue_task_outcome(&child.id, "PRIVATE RESULT", TaskTerminalStatus::Completed)
+        .await
+        .unwrap();
+    let reconstructed = SessionManager::new(directory.path().to_path_buf());
+    let query = RunTaskEvidenceRequest {
+        parent_session_id: parent.clone(),
+        parent_run_id: "run_first".into(),
+        task_id: None,
+        tool_names: vec!["cortex_document__load_skill".into()],
+        after_task_id: None,
+    };
+    let response = reconstructed.run_task_evidence(&query).await.unwrap();
+    assert!(response.attempt_key.is_none() && response.evidence_complete);
+    assert_eq!(response.tasks.len(), 1);
+    assert_eq!(response.tasks[0].receipts.len(), 1);
+    assert_eq!(response.tasks[0].admission, admission);
+    let wire = serde_json::to_string(&response).unwrap();
+    assert!(!wire.contains("PRIVATE") && !wire.contains("private child"));
+    let second = reconstructed
+        .run_task_evidence(&RunTaskEvidenceRequest {
+            parent_run_id: "run_second".into(),
+            ..query.clone()
+        })
+        .await
+        .unwrap();
+    assert!(second.tasks.is_empty() && second.evidence_complete);
+    assert!(reconstructed
+        .run_task_evidence(&RunTaskEvidenceRequest {
+            parent_run_id: "invented".into(),
+            ..query.clone()
+        })
+        .await
+        .is_err());
+    assert!(reconstructed
+        .run_task_evidence(&RunTaskEvidenceRequest {
+            parent_session_id: child.id.clone(),
+            ..query.clone()
+        })
+        .await
+        .is_err());
+    assert!(reconstructed
+        .run_task_evidence(&RunTaskEvidenceRequest {
+            after_task_id: Some(child.id),
+            parent_run_id: "run_second".into(),
+            ..query.clone()
+        })
+        .await
+        .is_err());
+    reconstructed.delete_session(&parent).await.unwrap();
+    assert!(reconstructed.run_task_evidence(&query).await.is_err());
 }

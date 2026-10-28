@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 20;
+pub const CURRENT_SCHEMA_VERSION: i32 = 21;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
@@ -1140,6 +1140,9 @@ impl SessionStorage {
         sqlx::query(super::prompt_attempt::CREATE_TABLE)
             .execute(&mut *tx)
             .await?;
+        sqlx::query(super::task_evidence::CREATE_RUN_TABLE)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_attempt_session ON prompt_attempts(session_id) WHERE session_id IS NOT NULL")
             .execute(&mut *tx).await?;
 
@@ -1718,6 +1721,15 @@ impl SessionStorage {
                     }
                 }
                 sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_mailbox_steering_delivery ON session_mailbox(steering_attempt_key, dedupe_key) WHERE steering_attempt_key IS NOT NULL").execute(&mut **tx).await?;
+            }
+            21 => {
+                sqlx::query(super::task_evidence::CREATE_RUN_TABLE)
+                    .execute(&mut **tx)
+                    .await?;
+                // Old durable attempts already carry authoritative pairs;
+                // unfenced historical runs have no recoverable binding.
+                sqlx::query("INSERT OR IGNORE INTO acp_runs(session_id, run_id, attempt_key) SELECT p.session_id, p.run_id, p.attempt_key FROM prompt_attempts p JOIN sessions s ON s.id = p.session_id WHERE p.run_id IS NOT NULL")
+                    .execute(&mut **tx).await?;
             }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);
@@ -2925,6 +2937,45 @@ mod tests {
     const GENERATED_SESSION_NAME: &str = "Generated session name";
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn schema_20_upgrade_preserves_sessions_and_adds_native_run_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(directory.path().to_path_buf());
+        let session = manager
+            .create_session(
+                directory.path().to_path_buf(),
+                "legacy".into(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        let pool = manager.storage().pool().await.unwrap();
+        sqlx::query("DROP TABLE acp_runs")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE schema_version SET version = 20")
+            .execute(pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let restored = SessionManager::new(directory.path().to_path_buf());
+        restored
+            .record_acp_run(&session.id, "run_new", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.get_session(&session.id, false).await.unwrap().name,
+            "legacy"
+        );
+        let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(restored.storage().pool().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
     #[tokio::test]
     async fn session_directory_is_owner_private_for_fresh_and_existing_database() {
         use std::os::unix::fs::PermissionsExt;

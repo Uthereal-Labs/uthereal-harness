@@ -20,6 +20,7 @@ activities:
   - Validate ACP thinking-effort discovery, forwarding, and provider switching
   - Validate durable ACP attempt admission, passive recovery, cancellation tombstones, and both agent loops
   - Validate typed asynchronous task outcomes and bounded passive structured receipt evidence
+  - Validate unfenced ACP run identity, immutable child admissions, and pair-scoped passive receipts across later runs
   - Validate opt-in ACP conversation workspace creation, reuse, and rejection of traversal or symlink paths
   - Validate GDK observability hook lifecycle events and payload opt-in
   - Verify ACP returns after delegation, accepts steering of the same live task, and delivers an automatic main-agent completion

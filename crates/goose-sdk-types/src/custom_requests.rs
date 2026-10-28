@@ -429,6 +429,31 @@ pub struct TaskEvidenceResponse {
     pub evidence_complete: bool,
 }
 
+/// Read receipts for an authoritative native run without creating an attempt.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, JsonRpcRequest)]
+#[request(method = "_goose/unstable/session/run-task-evidence", response = RunTaskEvidenceResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct RunTaskEvidenceRequest {
+    pub parent_session_id: String,
+    pub parent_run_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub tool_names: Vec<String>,
+    pub after_task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct RunTaskEvidenceResponse {
+    pub attempt_key: Option<String>,
+    pub parent_session_id: String,
+    pub parent_run_id: String,
+    pub tasks: Vec<TaskEvidence>,
+    pub next_task_id: Option<String>,
+    pub evidence_complete: bool,
+}
+
 /// Outstanding channel dependencies, independent of publication versions or status.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]

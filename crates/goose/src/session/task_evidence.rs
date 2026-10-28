@@ -1,12 +1,23 @@
 use super::SessionManager;
 use anyhow::{bail, Result};
 use goose_sdk_types::custom_requests::{
-    TaskAdmission, TaskEvidence, TaskEvidenceRequest, TaskEvidenceResponse, TaskNoticeRequest,
-    TaskNoticeResponse, TaskNoticeStatus, TaskOutcome, TaskReference, TaskTerminalStatus,
-    TaskToolReceipt, ToolReceiptTransportStatus,
+    RunTaskEvidenceRequest, RunTaskEvidenceResponse, TaskAdmission, TaskEvidence,
+    TaskEvidenceRequest, TaskEvidenceResponse, TaskNoticeRequest, TaskNoticeResponse,
+    TaskNoticeStatus, TaskOutcome, TaskReference, TaskTerminalStatus, TaskToolReceipt,
+    ToolReceiptTransportStatus,
 };
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
+
+pub(crate) const CREATE_RUN_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS acp_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    attempt_key TEXT,
+    UNIQUE(session_id, run_id)
+)
+"#;
 
 pub(crate) const TASK_ADMISSION_VERSION: &str = "task_admission_v1";
 const TASK_PAGE_LIMIT: usize = 32;
@@ -81,19 +92,53 @@ impl SessionManager {
         Ok(references)
     }
 
+    /// Record the actual run after ACP admission, before any tool can delegate.
+    pub async fn record_acp_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        attempt_key: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO acp_runs(session_id, run_id, attempt_key) VALUES (?, ?, ?)")
+            .bind(session_id)
+            .bind(run_id)
+            .bind(attempt_key)
+            .execute(self.storage().pool().await?)
+            .await?;
+        Ok(())
+    }
+
     pub async fn capture_task_admission(
         &self,
         parent_session_id: &str,
         task_id: &str,
         source_name: &str,
     ) -> Result<TaskAdmission> {
-        let binding: Option<(String, String)> =
-            sqlx::query_as("SELECT attempt_key, run_id FROM prompt_attempts WHERE session_id = ?")
-                .bind(parent_session_id)
-                .fetch_optional(self.storage().pool().await?)
-                .await?;
+        let pool = self.storage().pool().await?;
+        let binding: Option<(Option<String>, String)> =
+            match crate::session_context::current_native_run() {
+                Some((session_id, run_id)) => {
+                    if session_id != parent_session_id {
+                        bail!("Task admission does not own its native parent session");
+                    }
+                    let binding = sqlx::query_as("SELECT attempt_key, run_id FROM acp_runs WHERE session_id = ? AND run_id = ?")
+                    .bind(&session_id).bind(&run_id).fetch_optional(pool).await?;
+                    if binding.is_none() {
+                        bail!("Task admission does not own a recorded native run");
+                    }
+                    binding
+                }
+                None => {
+                    sqlx::query_as(
+                        "SELECT attempt_key, run_id FROM prompt_attempts WHERE session_id = ?",
+                    )
+                    .bind(parent_session_id)
+                    .fetch_optional(pool)
+                    .await?
+                }
+            };
         let (attempt_key, parent_run_id) = binding
-            .map(|(key, run)| (Some(key), Some(run)))
+            .map(|(key, run)| (key, Some(run)))
             .unwrap_or_default();
         Ok(TaskAdmission {
             task_id: task_id.to_string(),
@@ -194,12 +239,65 @@ impl SessionManager {
         let Some((parent_session_id, parent_run_id)) = binding else {
             bail!("Attempt does not own a parent session and run");
         };
+        let response = self
+            .project_run_task_evidence(
+                &RunTaskEvidenceRequest {
+                    parent_session_id,
+                    parent_run_id,
+                    task_id: request.task_id.clone(),
+                    tool_names: request.tool_names.clone(),
+                    after_task_id: request.after_task_id.clone(),
+                },
+                Some(request.attempt_key.clone()),
+            )
+            .await?;
+        Ok(TaskEvidenceResponse {
+            attempt_key: request.attempt_key.clone(),
+            parent_session_id: response.parent_session_id,
+            parent_run_id: response.parent_run_id,
+            tasks: response.tasks,
+            next_task_id: response.next_task_id,
+            evidence_complete: response.evidence_complete,
+        })
+    }
+
+    pub async fn run_task_evidence(
+        &self,
+        request: &RunTaskEvidenceRequest,
+    ) -> Result<RunTaskEvidenceResponse> {
+        let binding: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT attempt_key FROM acp_runs WHERE session_id = ? AND run_id = ?")
+                .bind(&request.parent_session_id)
+                .bind(&request.parent_run_id)
+                .fetch_optional(self.storage().pool().await?)
+                .await?;
+        let Some((attempt_key,)) = binding else {
+            bail!("Native run does not own this session");
+        };
+        self.project_run_task_evidence(request, attempt_key).await
+    }
+
+    async fn project_run_task_evidence(
+        &self,
+        request: &RunTaskEvidenceRequest,
+        attempt_key: Option<String>,
+    ) -> Result<RunTaskEvidenceResponse> {
+        if request.tool_names.len() > 8
+            || request.tool_names.iter().any(|name| {
+                name.is_empty() || name.len() > 200 || name.chars().any(char::is_control)
+            })
+        {
+            bail!("Invalid task evidence request");
+        }
+        let pool = self.storage().pool().await?;
+        let parent_session_id = request.parent_session_id.clone();
+        let parent_run_id = request.parent_run_id.clone();
         if let Some(cursor) = &request.after_task_id {
             let admission = self.task_admission(cursor).await?;
             if !admission.is_some_and(|a| {
                 a.parent_session_id == parent_session_id
                     && a.parent_run_id.as_deref() == Some(&parent_run_id)
-                    && a.attempt_key.as_deref() == Some(&request.attempt_key)
+                    && a.attempt_key.as_deref() == attempt_key.as_deref()
             }) {
                 bail!("Task evidence cursor does not belong to this attempt");
             }
@@ -209,7 +307,7 @@ impl SessionManager {
              FROM sessions WHERE parent_session_id = ? AND id > ? AND (? IS NULL OR id = ?)
               AND json_extract(extension_data, '$."summon.task_admission_v1".parentSessionId') = ?
               AND json_extract(extension_data, '$."summon.task_admission_v1".parentRunId') = ?
-              AND json_extract(extension_data, '$."summon.task_admission_v1".attemptKey') = ?
+              AND json_extract(extension_data, '$."summon.task_admission_v1".attemptKey') IS ?
               AND json_extract(extension_data, '$."summon.task_admission_v1".taskId') = id
              ORDER BY id LIMIT ?"#,
         )
@@ -219,13 +317,13 @@ impl SessionManager {
         .bind(&request.task_id)
         .bind(&parent_session_id)
         .bind(&parent_run_id)
-        .bind(&request.attempt_key)
+        .bind(&attempt_key)
         .bind((TASK_PAGE_LIMIT + 1) as i64)
         .fetch_all(pool)
         .await?;
         let more = rows.len() > TASK_PAGE_LIMIT;
-        let mut response = TaskEvidenceResponse {
-            attempt_key: request.attempt_key.clone(),
+        let mut response = RunTaskEvidenceResponse {
+            attempt_key,
             parent_session_id,
             parent_run_id,
             tasks: Vec::new(),

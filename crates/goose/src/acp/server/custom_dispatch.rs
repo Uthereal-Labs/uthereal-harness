@@ -136,6 +136,17 @@ impl GooseAcpAgent {
             .internal_err_ctx("Failed to read task evidence")
     }
 
+    #[custom_method(RunTaskEvidenceRequest)]
+    async fn dispatch_run_task_evidence(
+        &self,
+        req: RunTaskEvidenceRequest,
+    ) -> Result<RunTaskEvidenceResponse, agent_client_protocol::Error> {
+        self.session_manager
+            .run_task_evidence(&req)
+            .await
+            .internal_err_ctx("Failed to read native run task evidence")
+    }
+
     #[custom_method(TaskNoticeRequest)]
     async fn dispatch_task_notice(
         &self,
