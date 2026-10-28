@@ -1,5 +1,6 @@
 //! This module contains tests for the scenario runner and various scenarios.
 //! You can set the GOOSE_TEST_PROVIDER to just run a specific provider.
+//! Missing recordings require explicit GOOSE_RECORD_SCENARIOS=1 outside CI.
 
 #[cfg(test)]
 mod tests {
