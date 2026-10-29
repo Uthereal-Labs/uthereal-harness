@@ -1704,6 +1704,133 @@ fn test_prompt_error_session_not_found() {
 }
 
 #[test]
+fn provider_transport_failure_fails_attempt_and_allows_explicit_retry_in_both_loops() {
+    run_test(async {
+        use goose_sdk_types::custom_requests::PromptAttemptState;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        for use_state_machine in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let responder_calls = calls.clone();
+            let failing = Arc::new(AtomicBool::new(true));
+            let responder_failing = failing.clone();
+            let openai =
+                OpenAiFixture::new(vec![], Arc::new(goose_test_support::IgnoreSessionId)).await;
+            openai
+                .mount_responder(move |_: &wiremock::Request| {
+                    responder_calls.fetch_add(1, Ordering::SeqCst);
+                    let body = if responder_failing.load(Ordering::SeqCst) {
+                        vec![0xff, b'\n']
+                    } else {
+                        include_bytes!("acp_test_data/openai_basic.txt").to_vec()
+                    };
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_bytes(body)
+                })
+                .await;
+            let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+            let SessionData { session, .. } = conn.new_session().await.unwrap();
+            let manager = SessionManager::new(conn.data_root());
+            let attempt = uuid::Uuid::new_v4().to_string();
+            let request = |key: &str, session_id: agent_client_protocol::schema::v1::SessionId| {
+                let meta = serde_json::json!({"goose": {
+                    "attemptKey": key,
+                    "awaitBackgroundTasks": true,
+                    "unrolledAgentLoop": use_state_machine,
+                }});
+                PromptRequest::new(
+                    session_id,
+                    vec![ContentBlock::Text(TextContent::new(
+                        "Complete this request",
+                    ))],
+                )
+                .meta(meta.as_object().unwrap().clone())
+            };
+
+            let error = conn
+                .cx()
+                .send_request(request(&attempt, session.session_id().clone()))
+                .block_task()
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InternalError);
+            assert_eq!(error.data.as_ref().unwrap()["reason"], "agent_error");
+            assert!(
+                error.data.as_ref().unwrap()["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Network error: Stream decode error"),
+                "{error:?}"
+            );
+            let failed_calls = calls.load(Ordering::SeqCst);
+            assert!(failed_calls > 0);
+            let failed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let status = manager.prompt_attempt_status(&attempt).await.unwrap();
+                    if status.stopped {
+                        break status;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(failed.state, Some(PromptAttemptState::Failed));
+            assert!(failed.stopped);
+            assert!(
+                failed.result.is_none(),
+                "failure must not store an EndTurn completion receipt"
+            );
+
+            failing.store(false, Ordering::SeqCst);
+            assert!(conn
+                .cx()
+                .send_request(request(&attempt, session.session_id().clone()))
+                .block_task()
+                .await
+                .is_err());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                failed_calls,
+                "a failed attempt must not be replayed"
+            );
+            let retry = uuid::Uuid::new_v4().to_string();
+            let SessionData {
+                session: retry_session,
+                ..
+            } = conn.new_session().await.unwrap();
+            let response = conn
+                .cx()
+                .send_request(request(&retry, retry_session.session_id().clone()))
+                .block_task()
+                .await
+                .unwrap();
+            assert_eq!(response.stop_reason, StopReason::EndTurn);
+            assert_eq!(calls.load(Ordering::SeqCst), failed_calls + 1);
+            let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let status = manager.prompt_attempt_status(&retry).await.unwrap();
+                    if status.stopped {
+                        break status;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(completed.state, Some(PromptAttemptState::Completed));
+            assert!(completed.stopped);
+            assert_eq!(
+                manager.prompt_attempt_status(&attempt).await.unwrap().state,
+                Some(PromptAttemptState::Failed)
+            );
+        }
+    });
+}
+
+#[test]
 fn test_prompt_image() {
     run_test(async { run_prompt_image::<AcpServerConnection>().await });
 }

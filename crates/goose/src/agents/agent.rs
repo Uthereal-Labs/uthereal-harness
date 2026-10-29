@@ -3519,7 +3519,7 @@ impl Agent {
                             exit_chat = true;
                             break;
                         }
-                        Err(ref provider_err @ ProviderError::Authentication(_)) => {
+                        Err(ref provider_err) => {
                             provider_errored = true;
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
@@ -3532,30 +3532,6 @@ impl Agent {
                             )
                             .await?;
                             yield AgentEvent::Message(message);
-                            break;
-                        }
-                        Err(ref provider_err @ ProviderError::NetworkError(_)) => {
-                            provider_errored = true;
-                            #[cfg(feature = "telemetry")]
-                            crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
-                            error!("Error: {}", provider_err);
-                            yield AgentEvent::Message(
-                                Message::assistant().with_text(
-                                    format!("{provider_err}\n\nPlease resend your message to try again.")
-                                )
-                            );
-                            break;
-                        }
-                        Err(ref provider_err) => {
-                            provider_errored = true;
-                            #[cfg(feature = "telemetry")]
-                            crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
-                            error!("Error: {}", provider_err);
-                            yield AgentEvent::Message(
-                                Message::assistant().with_text(
-                                    format!("Ran into this error: {provider_err}.\n\nPlease retry if you think this is a transient or recoverable error.")
-                                )
-                            );
                             break;
                         }
                     }
