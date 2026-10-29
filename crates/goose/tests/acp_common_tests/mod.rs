@@ -23,6 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SHELL_TEST_CONTENT: &str = "test-shell-content-98765";
+const TOOL_PERMISSION_DENIED: &str = "The user has declined to run this tool.";
+const TOOL_PERMISSION_DENIED_REPLY: &str =
+    "I could not run the tool because permission was declined.";
 pub const TURN_CONTEXT_OPEN: &str = r#"\n<turn-context>"#;
 /// Session name produced by `OPENAI_SESSION_NAME_RESPONSE`.
 pub const GENERATED_SESSION_TITLE: &str = "Generated Test Title";
@@ -393,7 +396,7 @@ pub async fn run_fs_write_text_file_true<C: Connection>() {
                 include_str!("../acp_test_data/openai_fs_write_tool_call.txt"),
             ),
             (
-                r#"Created /tmp/test_acp_write.txt"#.into(),
+                r#"Wrote /tmp/test_acp_write.txt (1 lines)"#.into(),
                 include_str!("../acp_test_data/openai_fs_write_tool_result.txt"),
             ),
         ],
@@ -478,8 +481,8 @@ pub async fn run_load_mode<C: Connection>() {
                 include_str!("../acp_test_data/openai_tool_call.txt"),
             ),
             (
-                format!(r#""content":"{FAKE_CODE}""#),
-                include_str!("../acp_test_data/openai_tool_result.txt"),
+                TOOL_PERMISSION_DENIED.into(),
+                include_str!("../acp_test_data/openai_tool_permission_denied.txt"),
             ),
         ],
         expected_session_id.clone(),
@@ -518,6 +521,7 @@ pub async fn run_load_mode<C: Connection>() {
         .prompt(prompt, PermissionDecision::Cancel)
         .await
         .unwrap();
+    assert_eq!(output.text, TOOL_PERMISSION_DENIED_REPLY);
     assert_eq!(output.tool_status.unwrap(), ToolCallStatus::Failed);
     assert_notifications(
         &loaded.notifications(),
@@ -807,6 +811,14 @@ async fn run_mode_set_impl<C: Connection>(via: SetModeVia) {
                 include_str!("../acp_test_data/openai_tool_call.txt"),
             ),
             (
+                TOOL_PERMISSION_DENIED.into(),
+                include_str!("../acp_test_data/openai_tool_permission_denied.txt"),
+            ),
+            (
+                prompt.to_string(),
+                include_str!("../acp_test_data/openai_tool_call.txt"),
+            ),
+            (
                 format!(r#""content":"{FAKE_CODE}""#),
                 include_str!("../acp_test_data/openai_tool_result.txt"),
             ),
@@ -855,6 +867,7 @@ async fn run_mode_set_impl<C: Connection>(via: SetModeVia) {
         .prompt(prompt, PermissionDecision::Cancel)
         .await
         .unwrap();
+    assert_eq!(output.text, TOOL_PERMISSION_DENIED_REPLY);
     assert_eq!(output.tool_status.unwrap(), ToolCallStatus::Failed);
     assert_notifications(
         &session_b.notifications(),
@@ -867,7 +880,6 @@ async fn run_mode_set_impl<C: Connection>(via: SetModeVia) {
     );
 
     // Auto mode ignores Cancel -- tool succeeds without permission prompt
-    conn.reset_openai();
     expected_session_id.set(&session_a.session_id().0);
     let output = session_a
         .prompt(prompt, PermissionDecision::Cancel)

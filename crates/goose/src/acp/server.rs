@@ -1939,6 +1939,16 @@ fn prompt_error_from_message_content(
                     .data(serde_json::Value::Object(data)),
             )
         }
+        MessageContent::Error(error)
+            if error.kind == crate::conversation::message::MessageErrorKind::Other =>
+        {
+            Some(
+                agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                    "reason": "agent_error",
+                    "message": error.message,
+                })),
+            )
+        }
         _ => None,
     }
 }
