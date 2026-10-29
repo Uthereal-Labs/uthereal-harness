@@ -31,12 +31,19 @@ impl GooseAcpAgent {
             .get_session(&args.session_id.0, false)
             .await
             .internal_err_ctx("Failed to resolve prompt attempt configuration")?;
-        if session.message_count != 0 {
+        let durable = args
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("goose"))
+            .and_then(|goose| goose.get("durable"));
+        if session.message_count != 0
+            && durable.and_then(|durable| durable.get("restore")).is_none()
+        {
             return Err(agent_client_protocol::Error::invalid_params()
                 .data("durable attempts require a new empty session"));
         }
-        // Session IDs and tracing do not affect execution. Credentials remain part of the
-        // digest: a changed tool authority must not silently reuse an accepted request.
+        // Durable identity comes from the logical request, independently of the
+        // fresh authority supplied for this epoch. Legacy attempts bind full config.
         let request = serde_json::json!({
             "prompt": args.prompt,
             "provider": session.provider_name,
@@ -48,10 +55,21 @@ impl GooseAcpAgent {
             "stateMachine": use_state_machine,
             "awaitBackgroundTasks": await_background_tasks,
         });
-        let digest: String = Sha256::digest(request.to_string().as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let digest: String = if let Some(durable) = durable {
+            durable
+                .get("requestDigest")
+                .and_then(|digest| digest.as_str())
+                .ok_or_else(|| {
+                    agent_client_protocol::Error::invalid_params()
+                        .data("durable requestDigest required")
+                })?
+                .to_string()
+        } else {
+            Sha256::digest(request.to_string().as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
         let attempt = self
             .session_manager
             .claim_prompt_attempt(key, &digest, &args.session_id.0)

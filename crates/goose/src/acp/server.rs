@@ -289,6 +289,11 @@ struct AgentStreamOutcome {
     ended_by_wait: bool,
 }
 
+struct PromptExecutionAdmission {
+    attempt: PromptAttemptLease,
+    durable: Option<crate::session::durable::DurableAdmission>,
+}
+
 /// Per-session active-run registry, shared by every `GooseAcpAgent` created
 /// from one `AcpServer`. Roaming spawns a fresh agent per connection, so two
 /// paired clients loading the same session get distinct agents; sharing this
@@ -377,6 +382,7 @@ impl Drop for ActiveRunDropGuard {
                         .is_some_and(|run| run.run_id == run_id)
                     {
                         agent.discard_pending_steers(&session_id).await;
+                        crate::session::durable::release(&session_id);
                         runs.remove(&session_id);
                     }
                 }
@@ -2734,6 +2740,30 @@ impl GooseAcpAgent {
             .claim_acp_prompt_attempt(&args, use_state_machine, await_background_tasks)
             .await?;
         let telemetry_session_id = prompt_telemetry_session_id(args.meta.as_ref());
+        let durable = args
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("goose"))
+            .and_then(|goose| goose.get("durable"))
+            .cloned();
+        let durable = if let Some(durable) = durable {
+            if attempt.is_none() {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data("durable execution requires attemptKey"));
+            }
+            let admission: crate::session::durable::DurableAdmission =
+                serde_json::from_value(durable)
+                    .invalid_params_err_ctx("Invalid durable admission")?;
+            if Some(admission.attempt_id.as_str())
+                != attempt.as_ref().map(|attempt| attempt.key.as_str())
+            {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data("durable attempt identity mismatch"));
+            }
+            Some(admission)
+        } else {
+            None
+        };
         let message = Self::convert_acp_prompt_to_message(&args.prompt);
         let run = self.run_session_message(
             cx,
@@ -2741,7 +2771,7 @@ impl GooseAcpAgent {
             Some(message),
             use_state_machine,
             await_background_tasks,
-            attempt,
+            attempt.map(|attempt| PromptExecutionAdmission { attempt, durable }),
         );
         let run = crate::session_context::with_telemetry_session_id(telemetry_session_id, run);
         #[cfg(feature = "otel")]
@@ -2760,11 +2790,14 @@ impl GooseAcpAgent {
         &self,
         cx: &ConnectionTo<Client>,
         acp_session_id: SessionId,
-        user_message: Option<Message>,
+        mut user_message: Option<Message>,
         use_state_machine: bool,
         await_background_tasks: bool,
-        attempt: Option<PromptAttemptLease>,
+        execution: Option<PromptExecutionAdmission>,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
+        let (attempt, durable) = execution
+            .map(|execution| (Some(execution.attempt), execution.durable))
+            .unwrap_or_default();
         // The ACP session_id IS the thread ID.
         let session_id = acp_session_id.0.to_string();
         if attempt.is_none()
@@ -2807,6 +2840,33 @@ impl GooseAcpAgent {
             true,
         )
         .await?;
+        // Restore only after the session run is exclusively claimed. Otherwise a
+        // competing prompt could replace the live execution's history and authority.
+        if let Some(admission) = durable {
+            let restoring = admission.restore.is_some();
+            let accepted = crate::session::durable::admit(
+                self.session_manager.clone(),
+                &session_id,
+                admission,
+            )
+            .await
+                .map_err(|error| match error.downcast_ref::<crate::session::durable::DurableError>() {
+                    Some(crate::session::durable::DurableError::EffectUncertain(operation_id)) => agent_client_protocol::Error::internal_error().data(serde_json::json!({"code":"durable_effect_uncertain","operationId":operation_id})),
+                    None => agent_client_protocol::Error::internal_error().data(error.to_string()),
+                })?;
+            if let Some(message) = accepted {
+                user_message = Some(message);
+            } else if restoring {
+                user_message = Some(
+                    crate::session::durable::continuation_message(
+                        &self.session_manager,
+                        &session_id,
+                    )
+                    .await
+                    .internal_err_ctx("Missing durable conversation")?,
+                );
+            }
+        }
         self.session_manager
             .record_acp_run(
                 &session_id,
@@ -2818,6 +2878,18 @@ impl GooseAcpAgent {
             )
             .await
             .internal_err_ctx("Failed to record native run ownership")?;
+
+        crate::session::durable::bind_execution(
+            &self.session_manager,
+            &session_id,
+            &run_id,
+            run_guard
+                .attempt
+                .as_ref()
+                .map(|attempt| attempt.key.as_str()),
+        )
+        .await
+        .internal_err_ctx("Failed to bind durable task execution")?;
 
         if user_message.is_some() {
             if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
@@ -2858,6 +2930,14 @@ impl GooseAcpAgent {
         }
 
         let stream = async {
+            if crate::session::durable::completed(&session_id).await {
+                return Ok(AgentStreamOutcome {
+                    was_cancelled: false,
+                    output_token_limit_reached: false,
+                    completed_visible_response: true,
+                    ended_by_wait: false,
+                });
+            }
             let mut outcome = if let Some(user_message) = user_message {
                 self.run_agent_reply(
                     cx,
@@ -2879,7 +2959,9 @@ impl GooseAcpAgent {
             if outcome.was_cancelled || outcome.output_token_limit_reached {
                 return Ok(outcome);
             }
-            if outcome.completed_visible_response || outcome.ended_by_wait {
+            if (outcome.completed_visible_response || outcome.ended_by_wait)
+                && !crate::session::durable::suspended(&session_id).await
+            {
                 let reports = self
                     .session_manager
                     .pending_session_messages(&session_id)
@@ -2903,6 +2985,27 @@ impl GooseAcpAgent {
             loop {
                 if cancel_token.is_cancelled() {
                     outcome.was_cancelled = true;
+                    break;
+                }
+                if crate::session::durable::suspended(&session_id).await {
+                    if agent
+                        .has_active_tasks(&session_id)
+                        .await
+                        .internal_err_ctx("Failed to settle independent durable tasks")?
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    if let Some(run) = self.active_prompt_runs.lock().await.get_mut(&session_id) {
+                        run.accepting_steers = false;
+                    }
+                    if let Some(attempt) = &run_guard.attempt {
+                        self.session_manager
+                            .seal_prompt_attempt_for_park(attempt)
+                            .await
+                            .internal_err_ctx("Failed to seal durable parking admission")?;
+                    }
+                    outcome.ended_by_wait = true;
                     break;
                 }
 
@@ -3128,6 +3231,12 @@ impl GooseAcpAgent {
                 .await
                 .internal_err_ctx("Failed to persist prompt attempt failure")?;
         }
+        if let Some(operation_id) = crate::session::durable::uncertain_operation(&session_id).await
+        {
+            return Err(agent_client_protocol::Error::internal_error().data(
+                serde_json::json!({"code":"durable_effect_uncertain","operationId":operation_id}),
+            ));
+        }
         let outcome = stream_result?;
         let session = self
             .session_manager
@@ -3139,6 +3248,26 @@ impl GooseAcpAgent {
         let mut response = PromptResponse::new(stop_reason);
         if let Some(usage) = build_prompt_usage(&session) {
             response = response.usage(usage);
+        }
+        if !outcome.was_cancelled
+            && !cancel_token.is_cancelled()
+            && !outcome.output_token_limit_reached
+        {
+            if let Some(receipt) = crate::session::durable::parked_receipt(&session_id)
+                .await
+                .internal_err_ctx("Failed to persist durable parking barrier")?
+            {
+                response = response.meta(Some(
+                    serde_json::json!({"goose":{"durable":receipt}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ));
+            } else {
+                crate::session::durable::checkpoint(&session_id, "completed")
+                    .await
+                    .internal_err_ctx("Failed to persist durable completion")?;
+            }
         }
         if let Some(attempt) = &run_guard.attempt {
             let state = if outcome.was_cancelled || cancel_token.is_cancelled() {
@@ -3159,6 +3288,7 @@ impl GooseAcpAgent {
                 .internal_err_ctx("Failed to persist prompt result")?;
         }
         self.clear_active_run(&session_id, &run_id).await;
+        crate::session::durable::release(&session_id);
         Self::send_active_run_update(cx, &acp_session_id, None)?;
         self.send_session_usage_updates(cx, &acp_session_id, &session_id, &agent, &mut None)
             .await?;

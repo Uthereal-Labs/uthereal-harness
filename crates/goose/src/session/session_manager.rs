@@ -461,11 +461,13 @@ impl SessionManager {
                 return Ok(());
             }
         }
-        self.storage.add_message(id, message).await
+        self.storage.add_message(id, message).await?;
+        super::durable::checkpoint(id, "conversation").await
     }
 
     pub async fn replace_conversation(&self, id: &str, conversation: &Conversation) -> Result<()> {
-        self.storage.replace_conversation(id, conversation).await
+        self.storage.replace_conversation(id, conversation).await?;
+        super::durable::checkpoint(id, "conversation").await
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -2041,7 +2043,7 @@ impl SessionStorage {
         Ok(Conversation::new_unvalidated(messages))
     }
 
-    async fn add_message(&self, session_id: &str, message: &Message) -> Result<()> {
+    pub(super) async fn add_message(&self, session_id: &str, message: &Message) -> Result<()> {
         let pool = self.pool().await?;
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
