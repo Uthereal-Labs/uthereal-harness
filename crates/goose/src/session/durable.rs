@@ -1006,9 +1006,13 @@ impl SessionManager {
                 .execute(&mut *tx)
                 .await?;
         }
-        for message in &snapshot.mailbox {
-            sqlx::query("INSERT INTO session_mailbox(id,sender_session_id,recipient_session_id,kind,body,outcome_json,dedupe_key,steering_attempt_key,steering_digest,delivered_at) VALUES(?,?,?,?,?,?,?,?,?,CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END)")
-                .bind(message.id).bind(&message.sender_session_id).bind(&message.recipient_session_id).bind(&message.kind).bind(&message.body).bind(&message.outcome_json).bind(&message.dedupe_key).bind(&message.steering_attempt_key).bind(&message.steering_digest).bind(message.delivered).execute(&mut *tx).await?;
+        let mut mailbox: Vec<_> = snapshot.mailbox.iter().collect();
+        mailbox.sort_unstable_by_key(|message| message.id);
+        // Mailbox IDs and acknowledgement cursors belong to the local database.
+        // Allocate fresh IDs while preserving source delivery order and receipts.
+        for message in mailbox {
+            sqlx::query("INSERT INTO session_mailbox(sender_session_id,recipient_session_id,kind,body,outcome_json,dedupe_key,steering_attempt_key,steering_digest,delivered_at) VALUES(?,?,?,?,?,?,?,?,CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END)")
+                .bind(&message.sender_session_id).bind(&message.recipient_session_id).bind(&message.kind).bind(&message.body).bind(&message.outcome_json).bind(&message.dedupe_key).bind(&message.steering_attempt_key).bind(&message.steering_digest).bind(message.delivered).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         // A legacy loop dispatches before appending its call to conversation. Recover

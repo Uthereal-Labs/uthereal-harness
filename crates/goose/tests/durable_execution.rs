@@ -281,7 +281,17 @@ async fn durable_restore_preserves_specialist_mailbox_and_independent_work() -> 
         children.push(child.id);
     }
     manager
+        .send_to_child(&root, &children[0], "already acknowledged")
+        .await?;
+    let acknowledged = manager.pending_session_messages(&children[0]).await?[0].id;
+    manager
+        .acknowledge_session_messages(&children[0], acknowledged)
+        .await?;
+    manager
         .send_to_child(&root, &children[0], "keep this pending channel message")
+        .await?;
+    manager
+        .send_to_child(&root, &children[0], "keep this later channel message")
         .await?;
     let mut request = CallToolRequestParams::new("ask_user");
     durable::before_tool(&root, "call-1", &mut request).await?;
@@ -293,6 +303,36 @@ async fn durable_restore_preserves_specialist_mailbox_and_independent_work() -> 
 
     let fresh = tempfile::tempdir()?;
     let restored = Arc::new(SessionManager::new(fresh.path().to_path_buf()));
+    let unrelated_parent = restored
+        .prepare_durable_session(
+            &format!("durable_{}", uuid::Uuid::new_v4()),
+            fresh.path(),
+            "unrelated parent",
+            SessionType::Hidden,
+            GooseMode::Auto,
+        )
+        .await?;
+    let unrelated_child = restored
+        .prepare_durable_session(
+            &format!("durable_{}", uuid::Uuid::new_v4()),
+            fresh.path(),
+            "unrelated child",
+            SessionType::SubAgent,
+            GooseMode::Auto,
+        )
+        .await?;
+    restored
+        .update(&unrelated_child.id)
+        .parent_session_id(Some(unrelated_parent.id.clone()))
+        .apply()
+        .await?;
+    let unrelated_message = restored
+        .send_to_child(&unrelated_parent.id, &unrelated_child.id, "unrelated work")
+        .await?;
+    assert!(snapshot
+        .mailbox
+        .iter()
+        .any(|message| message.id == unrelated_message));
     restored
         .prepare_durable_session(
             &root,
@@ -309,8 +349,22 @@ async fn durable_restore_preserves_specialist_mailbox_and_independent_work() -> 
     assert_eq!(runnable.len(), 1);
     assert_eq!(runnable[0].session_id, children[1]);
     let pending = restored.pending_session_messages(&children[0]).await?;
-    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.len(), 2);
     assert_eq!(pending[0].body, "keep this pending channel message");
+    assert_eq!(pending[1].body, "keep this later channel message");
+    assert!(pending[0].id > unrelated_message && pending[1].id > pending[0].id);
+    restored
+        .acknowledge_session_messages(&children[0], pending[0].id)
+        .await?;
+    let remaining = restored.pending_session_messages(&children[0]).await?;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].body, "keep this later channel message");
+    let unrelated = restored
+        .pending_session_messages(&unrelated_child.id)
+        .await?;
+    assert_eq!(unrelated.len(), 1);
+    assert_eq!(unrelated[0].id, unrelated_message);
+    assert_eq!(unrelated[0].body, "unrelated work");
     assert_eq!(
         restored
             .get_session(&children[0], true)
