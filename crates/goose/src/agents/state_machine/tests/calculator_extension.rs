@@ -189,6 +189,15 @@ impl McpClientTrait for CalculatorExtension {
     ) -> Result<CallToolResult, McpError> {
         self.contexts.lock().unwrap().push(ctx.clone());
         if name == "pause" {
+            if ctx
+                .request_meta
+                .as_ref()
+                .is_some_and(|meta| meta.0.contains_key(crate::session::durable::OPERATION_META))
+            {
+                let mut result = CallToolResult::success(vec![]);
+                result.meta = Some(rmcp::model::MetaObject(json!({crate::session::durable::WAIT_META:{"version":1,"waitId":"question-1","dependentTaskIds":[]}}).as_object().unwrap().clone()));
+                return Ok(result);
+            }
             let mut result = CallToolResult::success(vec![ContentBlock::text("paused")]);
             result.meta = Some(rmcp::model::MetaObject(
                 json!({ crate::agents::platform_extensions::summon::END_TURN_META_KEY: true })

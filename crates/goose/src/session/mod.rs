@@ -1,5 +1,6 @@
 mod chat_history_search;
 mod diagnostics;
+pub mod durable;
 mod export_markdown;
 pub mod extension_data;
 pub mod import_formats;

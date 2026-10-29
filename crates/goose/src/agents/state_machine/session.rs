@@ -203,6 +203,10 @@ pub(crate) async fn run(
 
     let mut turn_usage = goose_providers::conversation::token_usage::Usage::default();
     loop {
+        if crate::session::durable::suspended(session_id).await {
+            break;
+        }
+        crate::session::durable::apply_continuation_context(session_id).await?;
         let session = runtime.load(session_id).await?;
         let Some(mut result) = machine.step(&session, emit).await? else {
             break;

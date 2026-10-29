@@ -129,6 +129,184 @@ async fn stream_messages(
 }
 
 #[tokio::test]
+async fn durable_both_loops_restore_wait_into_empty_native_storage() -> Result<()> {
+    use crate::session::durable::{self, AcceptedReply, DurableAdmission, DurableSnapshot};
+    use serde_json::{json, Value};
+    use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
+
+    for state_machine in [false, true] {
+        let callback = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"accepted":true,"generation":body["generation"]}))
+            })
+            .mount(&callback)
+            .await;
+        let (first, api, _initial_root, calculator, first_dir) = agent_with_calculator().await?;
+        let root = format!("durable_{}", uuid::Uuid::new_v4());
+        first
+            .config
+            .session_manager
+            .prepare_durable_session(
+                &root,
+                first_dir.path(),
+                "durable",
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await?;
+        first
+            .update_provider(
+                first.provider().await?,
+                ModelConfig::new(goose_providers::openai::OPEN_AI_DEFAULT_MODEL)
+                    .with_canonical_limits("openai"),
+                &root,
+            )
+            .await?;
+        first.update_goose_mode(GooseMode::Auto, &root).await?;
+        let manager = first.config.session_manager.clone();
+        let admission = DurableAdmission {
+            logical_run_id: "loop-test".into(),
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            epoch: 1,
+            request_digest: "a".repeat(64),
+            expected_generation: 0,
+            callback_url: callback.uri(),
+            callback_token: "old-authority".into(),
+            restore: None,
+            accepted_reply: None,
+            continuation_context: None,
+        };
+        durable::admit(manager.clone(), &root, admission.clone()).await?;
+        api.on("ask the human")
+            .call(super::calculator_extension::PAUSE, json!({}));
+        let config = SessionConfig {
+            id: root.clone(),
+            schedule_id: None,
+            max_turns: Some(4),
+            retry_config: None,
+        };
+        stream_messages(
+            first
+                .reply(
+                    Message::user().with_text("ask the human"),
+                    config.clone(),
+                    state_machine,
+                    Some(CancellationToken::new()),
+                )
+                .await?,
+        )
+        .await?;
+        assert!(durable::suspended(&root).await, "loop={state_machine}");
+        assert_eq!(api.call_count(), 1, "loop={state_machine}");
+        let contexts = calculator.contexts();
+        assert_eq!(contexts.len(), 1);
+        assert!(manager
+            .get_session(&root, true)
+            .await?
+            .conversation
+            .unwrap()
+            .messages()
+            .iter()
+            .all(|message| message.get_tool_response_ids().is_empty()));
+        durable::parked_receipt(&root).await?;
+        let requests = callback.received_requests().await.unwrap();
+        let last: Value = serde_json::from_slice(&requests.last().unwrap().body)?;
+        let snapshot: DurableSnapshot = serde_json::from_value(last["snapshot"].clone())?;
+        let call = snapshot.pending_wait.as_ref().unwrap().tool_call_id.clone();
+        durable::release(&root);
+        drop(first);
+        drop(manager);
+        drop(first_dir);
+
+        let (second, second_api, _unused_session, fresh_calculator, new_dir) =
+            agent_with_calculator().await?;
+        let manager = second.config.session_manager.clone();
+        manager
+            .prepare_durable_session(
+                &root,
+                new_dir.path(),
+                "restored",
+                SessionType::Hidden,
+                GooseMode::Auto,
+            )
+            .await?;
+        second
+            .update_provider(
+                second.provider().await?,
+                ModelConfig::new(goose_providers::openai::OPEN_AI_DEFAULT_MODEL)
+                    .with_canonical_limits("openai"),
+                &root,
+            )
+            .await?;
+        second.update_goose_mode(GooseMode::Auto, &root).await?;
+        let mut next = admission;
+        next.attempt_id = uuid::Uuid::new_v4().to_string();
+        next.epoch = 2;
+        next.callback_token = "fresh-authority".into();
+        next.continuation_context = Some(durable::ContinuationContext { id:"events-through-7".into(), text:"Authenticated intervening conversation: the manuscript now uses the latest terminology.".into() });
+        next.expected_generation = snapshot.generation;
+        next.restore = Some(snapshot);
+        next.accepted_reply = Some(AcceptedReply {
+            wait_id: "question-1".into(),
+            tool_call_id: call.clone(),
+            input_revision: 1,
+            result: rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                "human says add two",
+            )]),
+        });
+        let message = durable::admit(manager.clone(), &root, next).await?.unwrap();
+        second_api.on("human says add two").call(ADD, value(2));
+        second_api
+            .on("result: 2")
+            .reply("completed with accepted answer");
+        let output = stream_messages(
+            second
+                .reply(
+                    message,
+                    config,
+                    state_machine,
+                    Some(CancellationToken::new()),
+                )
+                .await?,
+        )
+        .await?;
+        assert!(
+            output
+                .iter()
+                .map(|message| message.as_concat_text())
+                .collect::<String>()
+                .contains("completed with accepted answer"),
+            "loop={state_machine}: {output:?}"
+        );
+        assert_eq!(fresh_calculator.total(), 2, "loop={state_machine}");
+        assert!(second_api.calls()[0].input_contains("Authenticated intervening conversation"));
+        assert_eq!(
+            fresh_calculator.contexts().len(),
+            1,
+            "suspended ask must not be repeated"
+        );
+        assert_eq!(
+            manager
+                .get_session(&root, true)
+                .await?
+                .conversation
+                .unwrap()
+                .messages()
+                .iter()
+                .flat_map(|message| message.get_tool_response_ids())
+                .filter(|id| *id == call)
+                .count(),
+            1
+        );
+        durable::release(&root);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn state_machine_confirmation_through_agent_resumes_tool_call() -> Result<()> {
     let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", Some("1"))]);
     let (agent, api, session_id, calculator, _temp_dir) = agent_with_calculator().await?;

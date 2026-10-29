@@ -77,6 +77,7 @@ struct DummyApiState {
     rules: Mutex<Vec<ApiRule>>,
     calls: Mutex<Vec<ApiCall>>,
     next_response_id: AtomicUsize,
+    response_namespace: String,
 }
 
 pub(super) struct DummyApi {
@@ -193,6 +194,7 @@ impl DummyApi {
             rules: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             next_response_id: AtomicUsize::new(1),
+            response_namespace: uuid::Uuid::new_v4().to_string(),
         });
         let responder = state.clone();
         Mock::given(method("POST"))
@@ -462,7 +464,8 @@ impl DummyApiState {
         }
 
         let id = format!(
-            "chatcmpl-test-{}",
+            "chatcmpl-test-{}-{}",
+            self.response_namespace,
             self.next_response_id.fetch_add(1, Ordering::Relaxed)
         );
         let meta = |output_tokens: i32| ResponseMeta {

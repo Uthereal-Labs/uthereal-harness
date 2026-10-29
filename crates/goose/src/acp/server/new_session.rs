@@ -60,27 +60,93 @@ impl GooseAcpAgent {
             .or_else(|| meta.client_title.clone())
             .unwrap_or_else(|| "New Chat".to_string());
 
-        let session = self
-            .session_manager
-            .create_session(args.cwd.clone(), session_name, session_type, current_mode)
-            .await
-            .internal_err_ctx("Failed to create session")?;
+        let restore = args
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("goose"))
+            .and_then(|goose| goose.get("durable"))
+            .and_then(|durable| durable.get("restore"));
+        let restoring = restore.is_some();
+        let session = if let Some(restore) = restore {
+            let snapshot: crate::session::durable::DurableSnapshot =
+                serde_json::from_value(restore.clone())
+                    .invalid_params_err_ctx("Invalid durable restore")?;
+            snapshot
+                .validate()
+                .invalid_params_err_ctx("Invalid durable snapshot")?;
+            let runs = self.active_prompt_runs.lock().await;
+            let mut fence = self.session_admission_fence.lock().await;
+            if runs.contains_key(&snapshot.root_session_id)
+                || fence.session_ids.contains(&snapshot.root_session_id)
+                || fence.shutting_down
+            {
+                return Err(agent_client_protocol::Error::invalid_params()
+                    .data("durable session already executing"));
+            }
+            fence.session_ids.insert(snapshot.root_session_id.clone());
+            drop(fence);
+            drop(runs);
+            crate::session::durable::release(&snapshot.root_session_id);
+            let prepared = async {
+                self.sessions.lock().await.remove(&snapshot.root_session_id);
+                self.agent_manager
+                    .remove_session_if_loaded(&snapshot.root_session_id)
+                    .await
+                    .internal_err_ctx("Failed to refresh durable authority")?;
+                self.session_manager
+                    .prepare_durable_session(
+                        &snapshot.root_session_id,
+                        &args.cwd,
+                        &session_name,
+                        session_type,
+                        current_mode,
+                    )
+                    .await
+                    .internal_err_ctx("Failed to prepare durable session")
+            }
+            .await;
+            match prepared {
+                Ok(session) => session,
+                Err(error) => {
+                    self.session_admission_fence
+                        .lock()
+                        .await
+                        .session_ids
+                        .remove(&snapshot.root_session_id);
+                    return Err(error);
+                }
+            }
+        } else {
+            self.session_manager
+                .create_session(args.cwd.clone(), session_name, session_type, current_mode)
+                .await
+                .internal_err_ctx("Failed to create session")?
+        };
         // Session identifiers describe the current persisted lifetime, not a
         // permanent tombstone. A store may legitimately reuse an identifier
         // after deletion.
         self.closed_session_ids.lock().await.remove(&session.id);
+        if !restoring {
+            self.session_admission_fence
+                .lock()
+                .await
+                .session_ids
+                .remove(&session.id);
+        }
+        let result = self
+            .finish_new_session_setup(cx, config, &session, args, recipe, meta)
+            .await;
         self.session_admission_fence
             .lock()
             .await
             .session_ids
             .remove(&session.id);
-        match self
-            .finish_new_session_setup(cx, config, &session, args, recipe, meta)
-            .await
-        {
+        match result {
             Ok(response) => Ok(response),
             Err(error) => {
-                self.cleanup_failed_new_session(&session.id).await;
+                if !restoring {
+                    self.cleanup_failed_new_session(&session.id).await;
+                }
                 Err(error)
             }
         }

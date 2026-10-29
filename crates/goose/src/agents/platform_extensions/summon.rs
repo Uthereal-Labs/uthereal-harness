@@ -1709,6 +1709,17 @@ impl SummonClient {
 
         if !task_config.parent_session_id.is_empty() {
             let mut extension_data = session.extension_data.clone();
+            if crate::session::durable::enabled(&task_config.parent_session_id) {
+                extension_data.set_extension_state(
+                    "summon",
+                    "durable_extensions_v1",
+                    serde_json::json!(task_config
+                        .extensions
+                        .iter()
+                        .map(|extension| extension.name())
+                        .collect::<Vec<_>>()),
+                );
+            }
             if let Some(policy) = policy {
                 extension_data.set_extension_state(
                     "summon",
@@ -1743,6 +1754,7 @@ impl SummonClient {
                 .map_err(|e| format!("Failed to link subagent to parent session: {}", e))?;
         }
 
+        crate::session::durable::inherit(&task_config.parent_session_id, &session.id);
         Ok(session)
     }
 
@@ -4233,6 +4245,9 @@ impl SummonClient {
         let mut completed = self.completed_tasks.lock().await;
         let mut tasks = self.background_tasks.lock().await;
         for (id, _) in finished {
+            if crate::session::durable::suspended(&id).await {
+                continue;
+            }
             let Some(task) = tasks.remove(&id) else {
                 continue;
             };
@@ -4517,6 +4532,13 @@ impl SummonClient {
             .await?;
 
         let task_id = subagent_session.id.clone();
+        self.context
+            .session_manager
+            .update(&task_id)
+            .recipe(Some(recipe.clone()))
+            .apply()
+            .await
+            .map_err(|error| error.to_string())?;
         let completion_session_manager = Arc::clone(&self.context.session_manager);
         let completion_delivery_error = Arc::new(Mutex::new(None));
         let task_completion_delivery_error = Arc::clone(&completion_delivery_error);
@@ -4568,6 +4590,9 @@ impl SummonClient {
                 &completion_cancellation_token,
             )
             .await;
+            if crate::session::durable::suspended(&completion_task_id).await {
+                return result;
+            }
             *task_terminal_status.lock().await = Some(status);
             if let Err(error) = Self::enqueue_task_completion(
                 &completion_session_manager,
@@ -4583,6 +4608,7 @@ impl SummonClient {
                     completion_task_id, error
                 );
             }
+            crate::session::durable::checkpoint(&completion_task_id, "task_completed").await?;
             result
         });
 
@@ -5081,6 +5107,111 @@ impl McpClientTrait for SummonClient {
             .entry(session_id.to_string())
             .or_insert(through_id);
         *entry = (*entry).max(through_id);
+    }
+
+    async fn recover_durable_tasks(&self, session_id: &str) -> anyhow::Result<()> {
+        for task in crate::session::durable::recovered_tasks(session_id).await {
+            if self
+                .background_tasks
+                .lock()
+                .await
+                .contains_key(&task.session_id)
+            {
+                continue;
+            }
+            let recipe = task.recipe.clone().ok_or_else(|| {
+                anyhow::anyhow!("durable task {} has no execution recipe", task.session_id)
+            })?;
+            let parent = self
+                .context
+                .session_manager
+                .get_session(session_id, false)
+                .await?;
+            let params = DelegateParams {
+                extensions: Some(task.extension_names.clone()),
+                working_dir: Some(task.working_dir.clone()),
+                ..Default::default()
+            };
+            let current_extensions = EnabledExtensionsState::extensions_or_default(
+                Some(&parent.extension_data),
+                Config::global(),
+            );
+            anyhow::ensure!(
+                task.extension_names.iter().all(|name| current_extensions
+                    .iter()
+                    .any(|extension| extension.name() == *name)),
+                "durable task extension authority was revoked"
+            );
+            let mut task_config = self.build_task_config(&params, &recipe, &parent).await?;
+            task_config.required_extension_names = task.extension_names.clone();
+            let mut config = AgentConfig::new(
+                self.context.session_manager.clone(),
+                crate::config::permission::PermissionManager::instance(),
+                None,
+                GooseMode::Auto,
+                true,
+                crate::agents::GoosePlatform::GooseCli,
+            )
+            .with_use_login_shell_path(self.context.use_login_shell_path);
+            config.is_subagent = true;
+            let id = task.session_id.clone();
+            let manager = self.context.session_manager.clone();
+            let token = CancellationToken::new();
+            let execution_token = token.clone();
+            let completion_delivery_error = Arc::new(Mutex::new(None));
+            let delivery_error = completion_delivery_error.clone();
+            let terminal_status = Arc::new(Mutex::new(None));
+            let execution_status = terminal_status.clone();
+            let execution_id = id.clone();
+            let telemetry_session_id = crate::session_context::telemetry_session_id(session_id);
+            let parent_span = tracing::Span::current();
+            let (handle, completion_token) = spawn_background_task(async move {
+                let params = SubagentRunParams {
+                    config,
+                    recipe,
+                    task_config,
+                    return_last_only: true,
+                    session_id: execution_id.clone(),
+                    cancellation_token: Some(execution_token.clone()),
+                    on_message: None,
+                    notification_tx: None,
+                    parent_span,
+                    telemetry_session_id,
+                };
+                let (result, status) =
+                    task_execution_outcome(run_subagent_task(params), &execution_token).await;
+                if !crate::session::durable::suspended(&execution_id).await {
+                    *execution_status.lock().await = Some(status);
+                    if let Err(error) =
+                        Self::enqueue_task_completion(&manager, &execution_id, &result, status)
+                            .await
+                    {
+                        *delivery_error.lock().await = Some(error.to_string());
+                    }
+                    crate::session::durable::checkpoint(&execution_id, "task_completed").await?;
+                }
+                result
+            });
+            self.background_tasks.lock().await.insert(
+                id.clone(),
+                BackgroundTask {
+                    id,
+                    parent_session_id: session_id.to_string(),
+                    non_blocking: false,
+                    completion_delivery_error,
+                    terminal_status,
+                    description: task.name,
+                    started_at: Instant::now(),
+                    turns: Arc::new(AtomicU32::new(0)),
+                    last_activity: Arc::new(AtomicU64::new(0)),
+                    handle,
+                    cancellation_token: token,
+                    completion_token,
+                    notification_sink: Self::notification_sink(None),
+                },
+            );
+        }
+        Ok(())
     }
 
     async fn has_active_tasks(&self, session_id: &str) -> anyhow::Result<bool> {

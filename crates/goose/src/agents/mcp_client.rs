@@ -175,6 +175,10 @@ pub trait McpClientTrait: Send + Sync {
         None
     }
 
+    async fn recover_durable_tasks(&self, _session_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn has_active_tasks(&self, _session_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
@@ -960,6 +964,7 @@ impl McpClientTrait for McpClient {
         cancel_token: CancellationToken,
     ) -> Result<CallToolResult, Error> {
         let mut params = CallToolRequestParams::new(name.to_string());
+        params.meta = ctx.request_meta.clone();
         if let Some(args) = arguments {
             params = params.with_arguments(args);
         }

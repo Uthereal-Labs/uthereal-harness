@@ -152,6 +152,9 @@ impl TaskCleanup {
         let handle = tokio::spawn(async move {
             // Sender drop (including cancellation and panic) starts cleanup too.
             let _ = receiver.await;
+            if crate::session::durable::suspended(&session_id).await {
+                return;
+            }
             if tokio::time::timeout(
                 std::time::Duration::from_secs(6),
                 agent.extension_manager.notify_task_ended(&session_id),
@@ -286,8 +289,21 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             build_subagent_prompt(&agent, max_turns, &session_id, system_instructions).await?;
         agent.override_system_prompt(subagent_prompt).await;
 
+        let existing = agent
+            .config
+            .session_manager
+            .get_session(&session_id, true)
+            .await?;
         let user_message =
-            Message::user().with_text(format!("Subagent ID: {session_id}\n\n{user_task}"));
+            if crate::session::durable::enabled(&session_id) && existing.message_count > 0 {
+                crate::session::durable::continuation_message(
+                    &agent.config.session_manager,
+                    &session_id,
+                )
+                .await?
+            } else {
+                Message::user().with_text(format!("Subagent ID: {session_id}\n\n{user_task}"))
+            };
         let mut conversation = Conversation::new_unvalidated(vec![user_message.clone()]);
 
         agent
