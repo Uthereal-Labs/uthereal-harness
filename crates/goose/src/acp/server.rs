@@ -852,6 +852,23 @@ fn build_prompt_usage(session: &Session) -> Option<Usage> {
     Some(Usage::new(total, input, output))
 }
 
+fn durable_acp_error(error: anyhow::Error) -> agent_client_protocol::Error {
+    use crate::session::durable::DurableError;
+    let data = match error.downcast_ref::<DurableError>() {
+        Some(DurableError::EffectUncertain(operation_id)) => {
+            serde_json::json!({"code":"durable_effect_uncertain","operationId":operation_id})
+        }
+        Some(DurableError::SnapshotInvalid(_)) => {
+            serde_json::json!({"code":"durable_snapshot_invalid"})
+        }
+        Some(DurableError::CompletionInvalid(_)) => {
+            serde_json::json!({"code":"durable_completion_invalid"})
+        }
+        None => serde_json::Value::String(error.to_string()),
+    };
+    agent_client_protocol::Error::internal_error().data(data)
+}
+
 fn prompt_stop_reason(was_cancelled: bool, output_token_limit_reached: bool) -> StopReason {
     if was_cancelled {
         StopReason::Cancelled
@@ -2860,10 +2877,7 @@ impl GooseAcpAgent {
                 admission,
             )
             .await
-                .map_err(|error| match error.downcast_ref::<crate::session::durable::DurableError>() {
-                    Some(crate::session::durable::DurableError::EffectUncertain(operation_id)) => agent_client_protocol::Error::internal_error().data(serde_json::json!({"code":"durable_effect_uncertain","operationId":operation_id})),
-                    None => agent_client_protocol::Error::internal_error().data(error.to_string()),
-                })?;
+            .map_err(durable_acp_error)?;
             if let Some(message) = accepted {
                 user_message = Some(message);
             } else if restoring {
@@ -2876,6 +2890,48 @@ impl GooseAcpAgent {
                     .internal_err_ctx("Missing durable conversation")?,
                 );
             }
+        }
+        if let Some(completion) = crate::session::durable::completion(&session_id).await {
+            let cancelled = if let Some(attempt) = &run_guard.attempt {
+                self.session_manager
+                    .prompt_attempt_cancel_requested(&attempt.key)
+                    .await
+                    .internal_err_ctx("Failed to check prompt attempt cancellation")?
+            } else {
+                false
+            };
+            let cancelled = cancelled || cancel_token.is_cancelled();
+            let response = if cancelled {
+                PromptResponse::new(StopReason::Cancelled)
+            } else {
+                PromptResponse::new(StopReason::EndTurn).meta(Some(
+                    serde_json::json!({"goose":{"completion":completion}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ))
+            };
+            if let Some(attempt) = &run_guard.attempt {
+                self.session_manager
+                    .finish_prompt_attempt(
+                        attempt,
+                        if cancelled {
+                            PromptAttemptState::Cancelled
+                        } else {
+                            PromptAttemptState::Completed
+                        },
+                        Some(
+                            serde_json::to_value(&response)
+                                .internal_err_ctx("Failed to serialize prompt result")?,
+                        ),
+                    )
+                    .await
+                    .internal_err_ctx("Failed to persist prompt result")?;
+            }
+            self.clear_active_run(&session_id, &run_id).await;
+            crate::session::durable::release(&session_id);
+            Self::send_active_run_update(cx, &acp_session_id, None)?;
+            return Ok(response);
         }
         self.session_manager
             .record_acp_run(
@@ -2940,14 +2996,6 @@ impl GooseAcpAgent {
         }
 
         let stream = async {
-            if crate::session::durable::completed(&session_id).await {
-                return Ok(AgentStreamOutcome {
-                    was_cancelled: false,
-                    output_token_limit_reached: false,
-                    completed_visible_response: true,
-                    ended_by_wait: false,
-                });
-            }
             let mut outcome = if let Some(user_message) = user_message {
                 self.run_agent_reply(
                     cx,
@@ -3265,7 +3313,7 @@ impl GooseAcpAgent {
         {
             if let Some(receipt) = crate::session::durable::parked_receipt(&session_id)
                 .await
-                .internal_err_ctx("Failed to persist durable parking barrier")?
+                .map_err(durable_acp_error)?
             {
                 response = response.meta(Some(
                     serde_json::json!({"goose":{"durable":receipt}})
@@ -3276,7 +3324,15 @@ impl GooseAcpAgent {
             } else {
                 crate::session::durable::checkpoint(&session_id, "completed")
                     .await
-                    .internal_err_ctx("Failed to persist durable completion")?;
+                    .map_err(durable_acp_error)?;
+                if let Some(completion) = crate::session::durable::completion(&session_id).await {
+                    response = response.meta(Some(
+                        serde_json::json!({"goose":{"completion":completion}})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ));
+                }
             }
         }
         if let Some(attempt) = &run_guard.attempt {
