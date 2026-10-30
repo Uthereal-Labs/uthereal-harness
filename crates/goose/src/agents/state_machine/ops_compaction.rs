@@ -223,6 +223,13 @@ impl Operation<Session, GooseEffect> for CompactionOperation {
         conversation: &Conversation,
         emit: &Emitter,
     ) -> Result<OperationResult<GooseEffect>> {
+        if crate::session::durable::enabled(&session.id)
+            && crate::session::durable::pending_response_receipt(conversation, &session.id)?
+                .is_some_and(|receipt| !receipt.processed)
+        {
+            return not_applicable();
+        }
+
         if self.manages_own_context {
             return not_applicable();
         }

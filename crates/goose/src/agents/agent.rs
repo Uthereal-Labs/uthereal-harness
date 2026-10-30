@@ -2227,6 +2227,19 @@ impl Agent {
             gen_ai.usage.input_tokens = tracing::field::Empty,
             gen_ai.usage.output_tokens = tracing::field::Empty,
         );
+        let initial_output = if crate::session::durable::resuming(&execution_session_id).await {
+            crate::session::durable::pending_response(&execution_session_id)
+                .await?
+                .and_then(|(_, messages)| {
+                    messages
+                        .last()
+                        .filter(|message| crate::session::durable::eligible_completion(message))
+                        .and_then(|message| message.id.clone())
+                })
+        } else {
+            None
+        };
+        let response_cancel = cancel_token.clone();
         let events = self
             .reply_impl(
                 user_message,
@@ -2237,12 +2250,33 @@ impl Agent {
             .instrument(reply_span.clone())
             .await?;
 
-        // This is the single live-event identity boundary. Callers that intentionally stream
-        // multiple events for one logical message must assign their shared ID before this point.
+        if !crate::session::durable::enabled(&execution_session_id) {
+            return Ok(Box::pin(
+                events
+                    .map_ok(ensure_message_event_id)
+                    .instrument(reply_span),
+            ));
+        }
+
+        let session_id = execution_session_id;
         Ok(Box::pin(
-            events
-                .map_ok(ensure_message_event_id)
-                .instrument(reply_span),
+            async_stream::try_stream! {
+                let mut events = events;
+                let mut output_id = initial_output;
+                while let Some(event) = events.next().await {
+                    let event = ensure_message_event_id(event?);
+                    if let AgentEvent::Message(message) = &event {
+                        if message.role == rmcp::model::Role::Assistant && message.is_user_visible() {
+                            output_id = crate::session::durable::eligible_completion(message).then(|| message.id.clone()).flatten();
+                        }
+                    }
+                    yield event;
+                }
+                if crate::session::durable::enabled(&session_id) && !response_cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+                    crate::session::durable::finish_response(&session_id, output_id.as_deref()).await?;
+                }
+            }
+            .instrument(reply_span),
         ))
     }
 
@@ -2303,6 +2337,32 @@ impl Agent {
             }
         }
 
+        if crate::session::durable::resuming(&session_config.id).await {
+            if let Some((receipt, _)) =
+                crate::session::durable::pending_response(&session_config.id).await?
+            {
+                if receipt.processed {
+                    crate::session::durable::take_resume(&session_config.id).await;
+                    self.extension_manager
+                        .recover_durable_tasks(&session_config.id)
+                        .await?;
+                    let session = session_manager
+                        .get_session(&session_config.id, true)
+                        .await?;
+                    let output = session
+                        .conversation
+                        .unwrap()
+                        .messages()
+                        .iter()
+                        .find(|message| message.id == receipt.output_message_id)
+                        .cloned()
+                        .context("processed response output missing")?;
+                    return Ok(Box::pin(futures::stream::once(async move {
+                        Ok(AgentEvent::Message(output))
+                    })));
+                }
+            }
+        }
         if use_state_machine {
             tracing::info!("dispatching reply via experimental state machine");
             return self
@@ -2313,6 +2373,13 @@ impl Agent {
         let message_text = message_text_for_trace;
         let resume_existing = crate::session::durable::take_resume(&session_config.id).await;
 
+        let recovered_response = if resume_existing {
+            crate::session::durable::pending_response(&session_config.id)
+                .await?
+                .map(|(_, messages)| messages)
+        } else {
+            None
+        };
         let session = session_manager
             .get_session(&session_config.id, true)
             .await?;
@@ -2485,11 +2552,20 @@ impl Agent {
         let session = session_manager
             .get_session(&session_config.id, true)
             .await?;
-        let conversation = session
+        let mut conversation = session
             .conversation
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Session {} has no conversation", session_config.id))?;
 
+        if let Some(messages) = &recovered_response {
+            let ids: std::collections::HashSet<_> = messages
+                .iter()
+                .filter_map(|message| message.id.as_deref())
+                .collect();
+            conversation
+                .messages_mut()
+                .retain(|message| !message.id.as_deref().is_some_and(|id| ids.contains(id)));
+        }
         if self.final_output_tool.lock().await.is_some() {
             let provider = self.provider().await?;
             if !provider.supports_builtin_tools() {
@@ -2514,13 +2590,14 @@ impl Agent {
             }
         }
 
-        let needs_auto_compact = check_if_compaction_needed(
-            self.provider().await?.as_ref(),
-            &conversation,
-            None,
-            &session,
-        )
-        .await?;
+        let needs_auto_compact = recovered_response.is_none()
+            && check_if_compaction_needed(
+                self.provider().await?.as_ref(),
+                &conversation,
+                None,
+                &session,
+            )
+            .await?;
 
         let conversation_to_compact = conversation.clone();
         let reply_span = tracing::Span::current();
@@ -2597,11 +2674,125 @@ impl Agent {
             };
 
             let parent_span = tracing::Span::current();
-            let mut reply_stream = self.reply_internal(final_conversation, session_config, session, cancel_token, parent_span.clone()).await?;
+            let mut reply_stream = self.reply_internal(final_conversation, session_config, session, cancel_token, parent_span.clone(), recovered_response).await?;
             while let Some(event) = reply_stream.next().await {
                 yield event?;
             }
         }))
+    }
+
+    // Allocate this stage here so the loop never constructs its large concrete future.
+    fn collect_durable_response<'a>(
+        &'a self,
+        mut stream: crate::providers::base::MessageStream,
+        session_config: &'a SessionConfig,
+        tools: &'a [rmcp::model::Tool],
+        toolshim_tools: &'a [rmcp::model::Tool],
+        inference: Option<&'a InferenceMetadata>,
+        cancel_token: Option<&'a CancellationToken>,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<(crate::providers::base::MessageStream, Option<ProviderUsage>)>,
+    > {
+        Box::pin(async move {
+            let cancelled = || cancel_token.is_some_and(|token| token.is_cancelled());
+            let mut committed_usage = None;
+
+            let mut batch = Conversation::empty();
+            let mut usage = None;
+            let mut failure = None;
+            while let Some(item) = if let Some(token) = cancel_token {
+                tokio::select! { _ = token.cancelled() => None, item = stream.next() => item }
+            } else {
+                stream.next().await
+            } {
+                match item {
+                    Ok((message, next_usage)) => {
+                        if let Some(message) = message {
+                            batch.push(message.with_generated_id_if_missing());
+                        }
+                        if next_usage.is_some() {
+                            usage = next_usage;
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            if failure.is_none() && !cancelled() {
+                let mut seen_requests = std::collections::HashSet::new();
+                for message in batch.messages_mut() {
+                    if let Some(inference) = inference {
+                        message.metadata.inference = Some(inference.clone());
+                    }
+                    let (requests, _) =
+                        self.categorize_tool_requests(message, tools, toolshim_tools, false);
+                    message.content.retain_mut(|content| {
+                        if let MessageContent::ToolRequest(request) = content {
+                            if !seen_requests.insert(request.id.clone()) {
+                                return false;
+                            }
+                            if let Some(canonical) =
+                                requests.iter().find(|candidate| candidate.id == request.id)
+                            {
+                                *request = canonical.clone();
+                            }
+                        }
+                        true
+                    });
+                }
+                batch.messages_mut().retain(|message| {
+                    !message.content.is_empty() || message.metadata.output_token_limit_reached
+                });
+                let recorded_usage = if let Some(usage) = usage.take() {
+                    let enriched = self
+                        .update_session_metrics(
+                            &session_config.id,
+                            session_config.schedule_id.clone(),
+                            &usage,
+                            None,
+                        )
+                        .await?;
+                    Some(enriched)
+                } else {
+                    None
+                };
+                if let (Some(usage), Some(message)) = (
+                    &recorded_usage,
+                    batch
+                        .messages_mut()
+                        .iter_mut()
+                        .rev()
+                        .find(|message| message.is_user_visible()),
+                ) {
+                    message.metadata.usage = Some(Box::new(
+                        crate::conversation::message::MessageUsage::from_provider_usage(
+                            usage, false,
+                        ),
+                    ));
+                }
+                crate::session::durable::record_response(&session_config.id, batch.messages_mut())
+                    .await?;
+                committed_usage = recorded_usage;
+            }
+            let mut items: Vec<_> = if let Some(error) = failure {
+                vec![Err(error)]
+            } else if cancelled() {
+                Vec::new()
+            } else {
+                batch
+                    .into_iter()
+                    .map(|message| Ok((Some(message), None)))
+                    .collect()
+            };
+            if let Some(usage) = usage {
+                items.push(Ok((None, Some(usage))));
+            }
+            let stream: crate::providers::base::MessageStream = Box::pin(stream::iter(items));
+            Ok((stream, committed_usage))
+        })
     }
 
     async fn reply_internal(
@@ -2611,6 +2802,7 @@ impl Agent {
         session: Session,
         cancel_token: Option<CancellationToken>,
         reply_span: tracing::Span,
+        mut recovered_response: Option<Vec<Message>>,
     ) -> Result<BoxStream<'_, Result<AgentEvent>>> {
         let context = self
             .prepare_reply_context(&session.id, conversation, session.working_dir.as_path())
@@ -2763,39 +2955,41 @@ impl Agent {
                 super::moim::compute_compaction_info(&session_config.id, &self.extension_manager)
                     .await;
 
-            if let Some(turn_context) = super::moim::turn_context_message(
-                &session_config.id,
-                &self.extension_manager,
-                turns_taken,
-                max_turns,
-                turn_start,
-                turn_start_compaction_info,
-            )
-            .await
-            {
-                persist_and_push_message_with_id(
-                    &session_manager,
+            if recovered_response.is_none() {
+                if let Some(turn_context) = super::moim::turn_context_message(
                     &session_config.id,
-                    &mut conversation,
-                    turn_context,
+                    &self.extension_manager,
+                    turns_taken,
+                    max_turns,
+                    turn_start,
+                    turn_start_compaction_info,
                 )
-                .await?;
-            }
-            {
-                let drained = drain_child_mailbox(
-                    &session_manager,
-                    &session_config.id,
-                    &mut conversation,
-                    session.session_type == SessionType::SubAgent,
-                )
-                .await?;
-                if drained.refresh_tools {
-                    self.extension_manager.invalidate_tools_cache_and_bump_version().await;
-                    (tools, toolshim_tools, system_prompt, _) =
-                        self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
+                .await
+                {
+                    persist_and_push_message_with_id(
+                        &session_manager,
+                        &session_config.id,
+                        &mut conversation,
+                        turn_context,
+                    )
+                    .await?;
                 }
-                for message in drained.messages {
-                    yield AgentEvent::Message(message);
+                {
+                    let drained = drain_child_mailbox(
+                        &session_manager,
+                        &session_config.id,
+                        &mut conversation,
+                        session.session_type == SessionType::SubAgent,
+                    )
+                    .await?;
+                    if drained.refresh_tools {
+                        self.extension_manager.invalidate_tools_cache_and_bump_version().await;
+                        (tools, toolshim_tools, system_prompt, _) =
+                            self.prepare_tools_and_prompt(&session_config.id, &session.working_dir).await?;
+                    }
+                    for message in drained.messages {
+                        yield AgentEvent::Message(message);
+                    }
                 }
             }
             // Snapshot after the turn-context append so a retry keeps the sent prefix.
@@ -2916,11 +3110,13 @@ impl Agent {
                 if let Some(context) = crate::session::durable::apply_continuation_context(&session_config.id).await? {
                     conversation.push(context);
                 }
+                let response_replay = recovered_response.take();
+                let recovering_response = response_replay.is_some();
                 let recovered_call = if crate::session::durable::enabled(&session_config.id) {
                     crate::session::durable::pending_tool_message(&conversation)
                 } else { None };
                 let recovering_pending = recovered_call.is_some();
-                if recovering_pending {
+                if recovering_pending || recovering_response {
                     // This inference was already committed before interruption.
                 } else if retrying_after_stop_hook_denial {
                     retrying_after_stop_hook_denial = false;
@@ -2935,7 +3131,9 @@ impl Agent {
                     break;
                 }
 
-                let mut stream: crate::providers::base::MessageStream = if let Some(message) = recovered_call {
+                let mut stream: crate::providers::base::MessageStream = if let Some(messages) = response_replay {
+                    Box::pin(stream::iter(messages.into_iter().map(|message| Ok((Some(message), None)))))
+                } else if let Some(message) = recovered_call {
                     Box::pin(stream::once(async move { Ok((Some(message), None)) }))
                 } else { crate::agents::reply_parts::stream_response_from_provider(
                     self.provider().await?,
@@ -2946,6 +3144,12 @@ impl Agent {
                     &tools,
                     &toolshim_tools,
                 ).await? };
+                if crate::session::durable::enabled(&session_config.id) && !recovering_response && !recovering_pending {
+                    // Keep this persistence stage out of the main loop's poll frame.
+                    let (buffered, usage) = self.collect_durable_response(stream, &session_config, &tools, &toolshim_tools, inference.as_ref(), cancel_token.as_ref()).await?;
+                    stream = buffered;
+                    if let Some(usage) = usage { turn_total_usage += usage.usage; yield AgentEvent::Usage(usage); }
+                }
                 last_assistant_text.clear();
 
                 let current_turn_tool_count = conversation.messages().iter()

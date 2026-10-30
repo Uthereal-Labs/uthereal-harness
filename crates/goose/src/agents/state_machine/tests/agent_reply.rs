@@ -180,6 +180,13 @@ async fn durable_both_loops_restore_wait_into_empty_native_storage() -> Result<(
             continuation_context: None,
         };
         durable::admit(manager.clone(), &root, admission.clone()).await?;
+        durable::bind_execution(
+            &manager,
+            &root,
+            "first-native-run",
+            Some(&admission.attempt_id),
+        )
+        .await?;
         api.on("ask the human")
             .call(super::calculator_extension::PAUSE, json!({}));
         let config = SessionConfig {
@@ -188,17 +195,20 @@ async fn durable_both_loops_restore_wait_into_empty_native_storage() -> Result<(
             max_turns: Some(4),
             retry_config: None,
         };
-        stream_messages(
-            first
-                .reply(
-                    Message::user().with_text("ask the human"),
-                    config.clone(),
-                    state_machine,
-                    Some(CancellationToken::new()),
-                )
-                .await?,
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream_messages(
+                first
+                    .reply(
+                        Message::user().with_text("ask the human"),
+                        config.clone(),
+                        state_machine,
+                        Some(CancellationToken::new()),
+                    )
+                    .await?,
+            ),
         )
-        .await?;
+        .await??;
         assert!(durable::suspended(&root).await, "loop={state_machine}");
         assert_eq!(api.call_count(), 1, "loop={state_machine}");
         let contexts = calculator.contexts();
@@ -258,21 +268,25 @@ async fn durable_both_loops_restore_wait_into_empty_native_storage() -> Result<(
             )]),
         });
         let message = durable::admit(manager.clone(), &root, next).await?.unwrap();
+        durable::bind_execution(&manager, &root, "restored-native-run", None).await?;
         second_api.on("human says add two").call(ADD, value(2));
         second_api
             .on("result: 2")
             .reply("completed with accepted answer");
-        let output = stream_messages(
-            second
-                .reply(
-                    message,
-                    config,
-                    state_machine,
-                    Some(CancellationToken::new()),
-                )
-                .await?,
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            stream_messages(
+                second
+                    .reply(
+                        message,
+                        config,
+                        state_machine,
+                        Some(CancellationToken::new()),
+                    )
+                    .await?,
+            ),
         )
-        .await?;
+        .await??;
         assert!(
             output
                 .iter()
