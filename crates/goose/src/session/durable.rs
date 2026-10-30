@@ -18,6 +18,10 @@ pub const OPERATION_META: &str = "uthereal/durableOperation";
 pub enum DurableError {
     #[error("durable_effect_uncertain: {0}")]
     EffectUncertain(String),
+    #[error("durable_snapshot_invalid: {0}")]
+    SnapshotInvalid(String),
+    #[error("durable_completion_invalid: {0}")]
+    CompletionInvalid(String),
 }
 
 #[derive(Clone, Deserialize)]
@@ -90,6 +94,7 @@ pub struct DurableTask {
     pub session_type: SessionType,
     pub conversation: Conversation,
     pub task_admission: Option<serde_json::Value>,
+    pub task_execution: Option<serde_json::Value>,
     pub task_policy: Option<serde_json::Value>,
     pub recipe: Option<crate::recipe::Recipe>,
     pub extension_names: Vec<String>,
@@ -116,7 +121,50 @@ pub struct DurableMailbox {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompletionMarker {
+    pub version: u32,
+    pub message_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DurableCompletion {
+    pub version: u32,
+    pub logical_run_id: String,
+    pub request_digest: String,
+    pub root_session_id: String,
+    pub native_run_id: String,
+    pub producing_attempt_id: String,
+    pub generation: u64,
+    pub consumed_input_revision: u64,
+    pub message_id: String,
+    pub text: String,
+}
+
+fn required_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+fn eligible_completion(message: &Message) -> bool {
+    message.role == rmcp::model::Role::Assistant
+        && message.is_user_visible()
+        && !message.metadata.output_token_limit_reached
+        && !message.is_tool_call()
+        && !message
+            .content
+            .iter()
+            .any(|content| content.as_error().is_some())
+        && !message.as_concat_text().trim().is_empty()
+        && message.as_concat_text() != crate::agents::state_machine::MAX_TURNS_MESSAGE
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DurableSnapshot {
     pub schema_version: u32,
     pub logical_run_id: String,
@@ -125,10 +173,14 @@ pub struct DurableSnapshot {
     pub generation: u64,
     pub consumed_input_revision: u64,
     pub native_run_id: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub producing_attempt_id: Option<String>,
     pub tasks: Vec<DurableTask>,
     pub mailbox: Vec<DurableMailbox>,
     pub effects: Vec<EffectReceipt>,
     pub pending_wait: Option<SuspendedCall>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub completion: Option<CompletionMarker>,
     #[serde(default)]
     pub applied_context_ids: Vec<String>,
 }
@@ -143,9 +195,24 @@ fn valid_session_id(id: &str) -> bool {
 
 impl DurableSnapshot {
     pub fn validate(&self) -> Result<()> {
+        self.validate_snapshot()
+            .map_err(|error| DurableError::SnapshotInvalid(error.to_string()).into())
+    }
+
+    fn validate_snapshot(&self) -> Result<()> {
         ensure!(
-            self.schema_version == 1,
+            self.schema_version == 2,
             "unsupported durable snapshot schema"
+        );
+        ensure!(
+            self.native_run_id.is_some() == self.producing_attempt_id.is_some(),
+            "durable producing authority mismatch"
+        );
+        ensure!(
+            self.producing_attempt_id
+                .as_ref()
+                .is_none_or(|id| !id.is_empty()),
+            "empty durable producing attempt"
         );
         let mut tasks = HashMap::new();
         for task in &self.tasks {
@@ -183,6 +250,45 @@ impl DurableSnapshot {
             !(root.completed && self.pending_wait.is_some()),
             "completed durable execution cannot be suspended"
         );
+        ensure!(
+            root.completed == self.completion.is_some(),
+            "durable completion marker mismatch"
+        );
+        if let Some(marker) = &self.completion {
+            ensure!(marker.version == 1, "unsupported durable completion marker");
+            ensure!(
+                self.native_run_id.as_ref().is_some_and(|id| !id.is_empty()),
+                "completed durable execution has no producing run"
+            );
+            ensure!(
+                self.effects.iter().all(|effect| effect.result.is_some()),
+                "completed durable execution has uncertain effects"
+            );
+            let message = root
+                .conversation
+                .messages()
+                .iter()
+                .rev()
+                .find(|message| {
+                    message.role == rmcp::model::Role::Assistant && message.is_user_visible()
+                })
+                .filter(|message| eligible_completion(message))
+                .context("completed durable execution has no visible answer")?;
+            ensure!(
+                message.id.as_deref() == Some(marker.message_id.as_str())
+                    && !marker.message_id.is_empty(),
+                "durable completion message mismatch"
+            );
+            ensure!(
+                root.conversation
+                    .messages()
+                    .iter()
+                    .filter(|message| message.id.as_deref() == Some(marker.message_id.as_str()))
+                    .count()
+                    == 1,
+                "duplicate durable completion message"
+            );
+        }
         for task in &self.tasks {
             let mut visited = HashSet::new();
             let mut current = task;
@@ -245,6 +351,42 @@ impl DurableSnapshot {
         }
         Ok(())
     }
+
+    pub fn authoritative_completion(&self) -> Result<Option<DurableCompletion>> {
+        self.validate()?;
+        let Some(marker) = &self.completion else {
+            return Ok(None);
+        };
+        let message = self
+            .tasks
+            .iter()
+            .find(|task| task.session_id == self.root_session_id)
+            .and_then(|task| {
+                task.conversation
+                    .messages()
+                    .iter()
+                    .find(|message| message.id.as_deref() == Some(marker.message_id.as_str()))
+            })
+            .context("durable completion message missing")?;
+        Ok(Some(DurableCompletion {
+            version: 1,
+            logical_run_id: self.logical_run_id.clone(),
+            request_digest: self.request_digest.clone(),
+            root_session_id: self.root_session_id.clone(),
+            native_run_id: self
+                .native_run_id
+                .clone()
+                .context("durable producing run missing")?,
+            producing_attempt_id: self
+                .producing_attempt_id
+                .clone()
+                .context("durable producing attempt missing")?,
+            generation: self.generation,
+            consumed_input_revision: self.consumed_input_revision,
+            message_id: marker.message_id.clone(),
+            text: message.as_concat_text(),
+        }))
+    }
 }
 
 struct Execution {
@@ -258,8 +400,10 @@ struct Execution {
     resume_sessions: HashSet<String>,
     fault: Option<String>,
     native_run_id: Option<String>,
+    producing_attempt_id: Option<String>,
     applied_context_ids: HashSet<String>,
     completed: bool,
+    completion: Option<DurableCompletion>,
     parked: bool,
 }
 
@@ -291,7 +435,13 @@ pub async fn bind_execution(
         return Ok(());
     }
     if let Some(runtime) = lookup(root) {
-        runtime.lock().await.native_run_id = Some(run_id.to_string());
+        let mut execution = runtime.lock().await;
+        ensure!(
+            !execution.completed,
+            "completed durable execution cannot be rebound"
+        );
+        execution.native_run_id = Some(run_id.to_string());
+        execution.producing_attempt_id = Some(execution.admission.attempt_id.clone());
     }
     let binding = serde_json::json!({"parentRunId":run_id,"attemptKey":attempt_key});
     sqlx::query(r#"UPDATE sessions SET extension_data=json_set(extension_data, '$."summon.task_execution_v1"', json(?)) WHERE parent_session_id=? AND json_extract(extension_data, '$."summon.task_admission_v1"') IS NOT NULL"#)
@@ -383,6 +533,11 @@ impl Execution {
                     .extension_states
                     .get("summon.task_admission_v1")
                     .cloned(),
+                task_execution: session
+                    .extension_data
+                    .extension_states
+                    .get("summon.task_execution_v1")
+                    .cloned(),
                 task_policy: session
                     .extension_data
                     .extension_states
@@ -398,17 +553,22 @@ impl Execution {
             }
         }
         Ok(DurableSnapshot {
-            schema_version: 1,
+            schema_version: 2,
             logical_run_id: self.admission.logical_run_id.clone(),
             root_session_id: self.root.clone(),
             request_digest: self.admission.request_digest.clone(),
             generation: self.generation + 1,
             consumed_input_revision: self.consumed_input_revision,
             native_run_id: self.native_run_id.clone(),
+            producing_attempt_id: self.producing_attempt_id.clone(),
             tasks,
             mailbox,
             effects: self.effects.clone(),
             pending_wait: self.pending_wait.clone(),
+            completion: self.completion.as_ref().map(|completion| CompletionMarker {
+                version: 1,
+                message_id: completion.message_id.clone(),
+            }),
             applied_context_ids: {
                 let mut ids = self.applied_context_ids.iter().cloned().collect::<Vec<_>>();
                 ids.sort();
@@ -418,7 +578,10 @@ impl Execution {
     }
 
     async fn commit(&mut self, boundary: &str) -> Result<()> {
-        ensure!(!self.parked, "durable execution is already parked");
+        ensure!(
+            !self.parked && !self.completed,
+            "durable execution is sealed"
+        );
         if let Some(fault) = &self.fault {
             anyhow::bail!("durable execution blocked: {fault}");
         }
@@ -431,14 +594,36 @@ impl Execution {
 
     async fn commit_snapshot(&mut self, boundary: &str) -> Result<()> {
         let mut snapshot = self.snapshot().await?;
-        if boundary == "completed" || self.completed {
-            snapshot
-                .tasks
-                .iter_mut()
-                .find(|task| task.session_id == self.root)
-                .context("durable root missing")?
-                .completed = true;
+        if boundary == "completed" {
+            let marker = (|| -> Result<()> {
+                let root = snapshot
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.session_id == self.root)
+                    .context("durable root missing")?;
+                let message = root
+                    .conversation
+                    .messages()
+                    .iter()
+                    .rev()
+                    .find(|message| {
+                        message.role == rmcp::model::Role::Assistant && message.is_user_visible()
+                    })
+                    .filter(|message| eligible_completion(message))
+                    .context("durable completion requires a persisted visible answer")?;
+                snapshot.completion = Some(CompletionMarker {
+                    version: 1,
+                    message_id: message
+                        .id
+                        .clone()
+                        .context("durable completion message has no identity")?,
+                });
+                root.completed = true;
+                Ok(())
+            })();
+            marker.map_err(|error| DurableError::CompletionInvalid(error.to_string()))?;
         }
+        let completion = snapshot.authoritative_completion()?;
         let generation = snapshot.generation;
         let body = serde_json::json!({"schemaVersion":1,"logicalRunId":self.admission.logical_run_id,"attemptId":self.admission.attempt_id,"epoch":self.admission.epoch,"expectedGeneration":self.generation,"generation":generation,"consumedInputRevision":self.consumed_input_revision,"boundary":boundary,"snapshot":snapshot});
         let client = reqwest::Client::builder()
@@ -465,6 +650,7 @@ impl Execution {
         );
         self.generation = generation;
         self.completed |= boundary == "completed";
+        self.completion = completion;
         self.parked |= boundary == "parked";
         Ok(())
     }
@@ -525,12 +711,11 @@ pub async fn admit(
     }
     if let Some(snapshot) = &admission.restore {
         ensure!(
-            snapshot.schema_version == 1
-                && snapshot.logical_run_id == admission.logical_run_id
+            snapshot.logical_run_id == admission.logical_run_id
                 && snapshot.request_digest == admission.request_digest
                 && snapshot.generation == admission.expected_generation
                 && snapshot.root_session_id == session_id,
-            "durable restore identity or generation mismatch"
+            DurableError::SnapshotInvalid("durable restore identity or generation mismatch".into())
         );
         snapshot.validate()?;
         consumed = snapshot.consumed_input_revision;
@@ -625,6 +810,20 @@ pub async fn admit(
             .iter()
             .any(|task| task.session_id == session_id && task.completed)
     });
+    let completion = admission
+        .restore
+        .as_ref()
+        .map(DurableSnapshot::authoritative_completion)
+        .transpose()?
+        .flatten();
+    let native_run_id = admission
+        .restore
+        .as_ref()
+        .and_then(|snapshot| snapshot.native_run_id.clone());
+    let producing_attempt_id = admission
+        .restore
+        .as_ref()
+        .and_then(|snapshot| snapshot.producing_attempt_id.clone());
     let runtime = Arc::new(AsyncMutex::new(Execution {
         generation: admission.expected_generation,
         admission,
@@ -635,9 +834,11 @@ pub async fn admit(
         manager,
         resume_sessions,
         fault: None,
-        native_run_id: None,
+        native_run_id,
+        producing_attempt_id,
         applied_context_ids,
         completed,
+        completion,
         parked: false,
     }));
     let mut registry = executions().lock().unwrap();
@@ -804,6 +1005,15 @@ pub async fn completed(session_id: &str) -> bool {
     };
     let execution = runtime.lock().await;
     execution.root == session_id && execution.completed
+}
+
+pub async fn completion(session_id: &str) -> Option<DurableCompletion> {
+    let runtime = lookup(session_id)?;
+    let execution = runtime.lock().await;
+    if execution.root != session_id {
+        return None;
+    }
+    execution.completion.clone()
 }
 
 pub async fn uncertain_operation(session_id: &str) -> Option<String> {
@@ -975,7 +1185,9 @@ impl SessionManager {
             {
                 ensure!(
                     existing_parent == task.parent_session_id,
-                    "durable task conflicts with an existing session"
+                    DurableError::SnapshotInvalid(
+                        "durable task conflicts with an existing session".into()
+                    )
                 );
             }
         }
@@ -987,6 +1199,9 @@ impl SessionManager {
             );
             if let Some(admission) = &task.task_admission {
                 extension_data.insert("summon.task_admission_v1".to_string(), admission.clone());
+            }
+            if let Some(execution) = &task.task_execution {
+                extension_data.insert("summon.task_execution_v1".to_string(), execution.clone());
             }
             if let Some(policy) = &task.task_policy {
                 extension_data.insert("summon.v1".to_string(), policy.clone());
@@ -1013,6 +1228,25 @@ impl SessionManager {
         for message in mailbox {
             sqlx::query("INSERT INTO session_mailbox(sender_session_id,recipient_session_id,kind,body,outcome_json,dedupe_key,steering_attempt_key,steering_digest,delivered_at) VALUES(?,?,?,?,?,?,?,?,CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END)")
                 .bind(&message.sender_session_id).bind(&message.recipient_session_id).bind(&message.kind).bind(&message.body).bind(&message.outcome_json).bind(&message.dedupe_key).bind(&message.steering_attempt_key).bind(&message.steering_digest).bind(message.delivered).execute(&mut *tx).await?;
+        }
+        if let (Some(run_id), Some(attempt_id)) =
+            (&snapshot.native_run_id, &snapshot.producing_attempt_id)
+        {
+            sqlx::query("INSERT INTO acp_runs(session_id,run_id,attempt_key) VALUES(?,?,?) ON CONFLICT(session_id,run_id) DO NOTHING")
+                .bind(&snapshot.root_session_id).bind(run_id).bind(attempt_id).execute(&mut *tx).await?;
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT attempt_key FROM acp_runs WHERE session_id=? AND run_id=?",
+            )
+            .bind(&snapshot.root_session_id)
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            ensure!(
+                existing.as_ref() == Some(attempt_id),
+                DurableError::SnapshotInvalid(
+                    "durable producing run conflicts with existing authority".into()
+                )
+            );
         }
         tx.commit().await?;
         // A legacy loop dispatches before appending its call to conversation. Recover

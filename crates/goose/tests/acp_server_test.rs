@@ -1831,6 +1831,266 @@ fn provider_transport_failure_fails_attempt_and_allows_explicit_retry_in_both_lo
 }
 
 #[test]
+fn durable_fresh_and_restored_completion_share_authority_in_both_loops() {
+    run_test(async {
+        use goose::session::durable::{DurableCompletion, DurableSnapshot};
+        use serde_json::{json, Value};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
+
+        for use_state_machine in [false, true] {
+            let callback = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(|request: &Request| {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["schemaVersion"], 1);
+                    assert_eq!(body["snapshot"]["schemaVersion"], 2);
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"accepted":true,"generation":body["generation"]}))
+                })
+                .mount(&callback)
+                .await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = || async {
+                let openai =
+                    OpenAiFixture::new(vec![], Arc::new(goose_test_support::IgnoreSessionId)).await;
+                let responder_calls = calls.clone();
+                openai
+                    .mount_responder(move |_: &Request| {
+                        responder_calls.fetch_add(1, Ordering::SeqCst);
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_bytes(
+                                include_bytes!("acp_test_data/openai_basic.txt").to_vec(),
+                            )
+                    })
+                    .await;
+                openai
+            };
+            let mut conn =
+                AcpServerConnection::new(TestConnectionConfig::default(), provider().await).await;
+            let SessionData { session, .. } = conn.new_session().await.unwrap();
+            let admission = |restore: Option<&DurableSnapshot>| {
+                json!({
+                    "logicalRunId":"completion-contract", "attemptId":uuid::Uuid::new_v4().to_string(),
+                    "epoch":if restore.is_some() {2} else {1}, "requestDigest":"a".repeat(64),
+                    "expectedGeneration":restore.map_or(0, |snapshot| snapshot.generation),
+                    "callbackUrl":callback.uri(), "callbackToken":"test-secret", "restore":restore,
+                })
+            };
+            let request = |session_id, durable: Value| {
+                let meta = json!({"goose":{"attemptKey":durable["attemptId"], "unrolledAgentLoop":use_state_machine, "awaitBackgroundTasks":true, "durable":durable}});
+                PromptRequest::new(
+                    session_id,
+                    vec![ContentBlock::Text(TextContent::new(
+                        "Complete this request",
+                    ))],
+                )
+                .meta(meta.as_object().unwrap().clone())
+            };
+            let fresh = conn
+                .cx()
+                .send_request(request(session.session_id().clone(), admission(None)))
+                .block_task()
+                .await
+                .unwrap();
+            assert_eq!(fresh.stop_reason, StopReason::EndTurn);
+            let fresh_wire = serde_json::to_value(&fresh).unwrap();
+            let expected: DurableCompletion =
+                serde_json::from_value(fresh_wire["_meta"]["goose"]["completion"].clone()).unwrap();
+            assert!(!expected.text.trim().is_empty());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let checkpoints = callback.received_requests().await.unwrap();
+            let body: Value = serde_json::from_slice(&checkpoints.last().unwrap().body).unwrap();
+            assert_eq!(body["boundary"], "completed");
+            let mut snapshot: DurableSnapshot =
+                serde_json::from_value(body["snapshot"].clone()).unwrap();
+            assert_eq!(
+                snapshot.authoritative_completion().unwrap(),
+                Some(expected.clone())
+            );
+            let mut child = snapshot.tasks[0].clone();
+            child.session_id = format!("child_{}", uuid::Uuid::new_v4());
+            child.parent_session_id = Some(snapshot.root_session_id.clone());
+            child.completed = false;
+            child.task_admission = Some(json!({
+                "taskId":child.session_id,"parentSessionId":snapshot.root_session_id,
+                "parentRunId":"earlier-run","attemptKey":"earlier-attempt","sourceName":"specialist",
+            }));
+            child.task_execution = Some(
+                json!({"parentRunId":expected.native_run_id,"attemptKey":expected.producing_attempt_id}),
+            );
+            child.conversation = Default::default();
+            snapshot.tasks.push(child.clone());
+
+            // A new server with a separate data root proves recovery needs no native storage.
+            let restored =
+                AcpServerConnection::new(TestConnectionConfig::default(), provider().await).await;
+            let cwd = tempfile::tempdir().unwrap();
+            for invalid in [
+                {
+                    let mut wire = serde_json::to_value(&snapshot).unwrap();
+                    wire["schemaVersion"] = json!(1);
+                    wire
+                },
+                {
+                    let mut wire = serde_json::to_value(&snapshot).unwrap();
+                    wire.as_object_mut().unwrap().remove("completion");
+                    wire
+                },
+            ] {
+                let error = restored
+                    .cx()
+                    .send_request(
+                        NewSessionRequest::new(cwd.path()).meta(
+                            json!({"goose":{"durable":{"restore":invalid}}})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        ),
+                    )
+                    .block_task()
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.data.as_ref().unwrap()["code"],
+                    "durable_snapshot_invalid"
+                );
+            }
+
+            let session = restored
+                .cx()
+                .send_request(
+                    NewSessionRequest::new(cwd.path()).meta(
+                        json!({"goose":{"durable":{"restore":snapshot}}})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .block_task()
+                .await
+                .unwrap();
+            let response = restored
+                .cx()
+                .send_request(request(session.session_id, admission(Some(&snapshot))))
+                .block_task()
+                .await
+                .unwrap();
+            assert_eq!(response.stop_reason, StopReason::EndTurn);
+            let wire = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                wire["_meta"]["goose"]["completion"],
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "completed restore must not invoke the provider"
+            );
+            assert_eq!(
+                callback.received_requests().await.unwrap().len(),
+                checkpoints.len(),
+                "completed restore must not checkpoint"
+            );
+            let manager = SessionManager::new(restored.data_root());
+            let child = manager.get_session(&child.session_id, false).await.unwrap();
+            assert_eq!(
+                child
+                    .extension_data
+                    .extension_states
+                    .get("summon.task_execution_v1"),
+                snapshot.tasks.last().unwrap().task_execution.as_ref(),
+                "completed restore must preserve the original child execution binding"
+            );
+            let evidence = manager
+                .run_task_evidence(&goose_sdk_types::custom_requests::RunTaskEvidenceRequest {
+                    parent_session_id: expected.root_session_id.clone(),
+                    parent_run_id: expected.native_run_id.clone(),
+                    task_id: None,
+                    tool_names: vec![],
+                    after_task_id: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                evidence.attempt_key.as_deref(),
+                Some(expected.producing_attempt_id.as_str())
+            );
+            assert_eq!(evidence.tasks.len(), 1);
+            assert_eq!(
+                evidence.tasks[0].admission.parent_run_id.as_deref(),
+                Some(expected.native_run_id.as_str())
+            );
+        }
+    });
+}
+
+#[test]
+fn durable_invalid_completion_is_typed_in_both_loops() {
+    run_test(async {
+        use serde_json::{json, Value};
+        use std::sync::Arc;
+        use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
+        for use_state_machine in [false, true] {
+            let callback = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(|request: &Request| {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"accepted":true,"generation":body["generation"]}))
+                })
+                .mount(&callback)
+                .await;
+            let openai =
+                OpenAiFixture::new(vec![], Arc::new(goose_test_support::IgnoreSessionId)).await;
+            let chunk = json!({"id":"invalid-completion","model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":goose::agents::state_machine::MAX_TURNS_MESSAGE},"finish_reason":null}]});
+            let done = json!({"id":"invalid-completion","model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+            openai
+                .mount_responder(move |_: &Request| {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(body.clone())
+                })
+                .await;
+            let mut conn = AcpServerConnection::new(TestConnectionConfig::default(), openai).await;
+            let SessionData { session, .. } = conn.new_session().await.unwrap();
+            let attempt_id = uuid::Uuid::new_v4().to_string();
+            let error = conn.cx().send_request(PromptRequest::new(session.session_id().clone(), vec![ContentBlock::Text(TextContent::new("Complete the request"))]).meta(
+                json!({"goose":{"attemptKey":attempt_id,"awaitBackgroundTasks":true,"unrolledAgentLoop":use_state_machine,"durable":{
+                    "logicalRunId":"invalid-completion","attemptId":attempt_id,"epoch":1,"requestDigest":"a".repeat(64),"expectedGeneration":0,"callbackUrl":callback.uri(),"callbackToken":"test-secret",
+                }}}).as_object().unwrap().clone(),
+            )).block_task().await.unwrap_err();
+            assert_eq!(
+                error.data.as_ref().unwrap()["code"],
+                "durable_completion_invalid"
+            );
+            for request in callback.received_requests().await.unwrap() {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_ne!(body["boundary"], "completed");
+            }
+            let manager = SessionManager::new(conn.data_root());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !manager
+                    .prompt_attempt_status(&attempt_id)
+                    .await
+                    .unwrap()
+                    .stopped
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    });
+}
+
+#[test]
 fn test_prompt_image() {
     run_test(async { run_prompt_image::<AcpServerConnection>().await });
 }

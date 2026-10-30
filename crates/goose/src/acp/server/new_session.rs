@@ -69,11 +69,13 @@ impl GooseAcpAgent {
         let restoring = restore.is_some();
         let session = if let Some(restore) = restore {
             let snapshot: crate::session::durable::DurableSnapshot =
-                serde_json::from_value(restore.clone())
-                    .invalid_params_err_ctx("Invalid durable restore")?;
-            snapshot
-                .validate()
-                .invalid_params_err_ctx("Invalid durable snapshot")?;
+                serde_json::from_value(restore.clone()).map_err(|error| {
+                    super::durable_acp_error(
+                        crate::session::durable::DurableError::SnapshotInvalid(error.to_string())
+                            .into(),
+                    )
+                })?;
+            snapshot.validate().map_err(super::durable_acp_error)?;
             let runs = self.active_prompt_runs.lock().await;
             let mut fence = self.session_admission_fence.lock().await;
             if runs.contains_key(&snapshot.root_session_id)
