@@ -2030,6 +2030,539 @@ fn durable_fresh_and_restored_completion_share_authority_in_both_loops() {
 }
 
 #[test]
+fn durable_response_checkpoint_resumes_processing_without_another_inference() {
+    run_test(async {
+        use goose::session::durable::DurableSnapshot;
+        use serde_json::{json, Value};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
+        for use_state_machine in [false, true] {
+            for fail_boundary in ["response_processed", "completed"] {
+                let callback = MockServer::start().await;
+                let rejecting = Arc::new(AtomicBool::new(true));
+                let rejected = rejecting.clone();
+                Mock::given(method("POST"))
+                    .respond_with(move |request: &Request| {
+                        let body: Value = serde_json::from_slice(&request.body).unwrap();
+                        if rejected.load(Ordering::SeqCst) && body["boundary"] == fail_boundary {
+                            ResponseTemplate::new(503)
+                        } else {
+                            ResponseTemplate::new(200).set_body_json(
+                                json!({"accepted":true,"generation":body["generation"]}),
+                            )
+                        }
+                    })
+                    .mount(&callback)
+                    .await;
+                let calls = Arc::new(AtomicUsize::new(0));
+                let provider = || async {
+                    let openai =
+                        OpenAiFixture::new(vec![], Arc::new(goose_test_support::IgnoreSessionId))
+                            .await;
+                    let calls = calls.clone();
+                    openai.mount_responder(move |_: &Request| {
+                        let text = if calls.fetch_add(1, Ordering::SeqCst) == 0 { "There are 12 pens in the box." } else { "How can I help?" };
+                        let chunk = json!({"id":"response-recovery","model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":null}]});
+                        let done = json!({"id":"response-recovery","model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":7,"total_tokens":27}});
+                        ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n"))
+                    }).await;
+                    openai
+                };
+                let mut first =
+                    AcpServerConnection::new(TestConnectionConfig::default(), provider().await)
+                        .await;
+                let SessionData { session, .. } = first.new_session().await.unwrap();
+                let admission = |snapshot: Option<&DurableSnapshot>| {
+                    json!({
+                        "logicalRunId":"response-recovery","attemptId":uuid::Uuid::new_v4().to_string(),"epoch":if snapshot.is_some(){2}else{1},
+                        "requestDigest":"a".repeat(64),"expectedGeneration":snapshot.map_or(0,|snapshot|snapshot.generation),
+                        "callbackUrl":callback.uri(),"callbackToken":"test-secret","restore":snapshot,
+                        "continuationContext":snapshot.map(|_|json!({"id":"later-context","text":"Ordinary conversation context; this is not a new request."})),
+                    })
+                };
+                let prompt = |session_id, durable: Value| {
+                    PromptRequest::new(session_id, vec![ContentBlock::Text(TextContent::new("A box has 7 blue pens and 5 red pens. How many pens?"))]).meta(
+                    json!({"goose":{"attemptKey":durable["attemptId"],"awaitBackgroundTasks":true,"unrolledAgentLoop":use_state_machine,"durable":durable}}).as_object().unwrap().clone(),
+                )
+                };
+                let initial = admission(None);
+                let attempt = initial["attemptId"].as_str().unwrap().to_string();
+                first
+                    .cx()
+                    .send_request(prompt(session.session_id().clone(), initial))
+                    .block_task()
+                    .await
+                    .unwrap_err();
+                let manager = SessionManager::new(first.data_root());
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !manager
+                        .prompt_attempt_status(&attempt)
+                        .await
+                        .unwrap()
+                        .stopped
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let requests = callback.received_requests().await.unwrap();
+                let bodies: Vec<Value> = requests
+                    .iter()
+                    .map(|request| serde_json::from_slice(&request.body).unwrap())
+                    .collect();
+                let committed = bodies
+                    .iter()
+                    .rev()
+                    .find(|body| body["boundary"] != fail_boundary)
+                    .unwrap();
+                let snapshot: DurableSnapshot =
+                    serde_json::from_value(committed["snapshot"].clone()).unwrap();
+                assert!(snapshot.completion.is_none());
+                for _ in 0..2 {
+                    manager.import_durable_snapshot(&snapshot).await.unwrap();
+                    let saved = manager
+                        .get_session(&snapshot.root_session_id, false)
+                        .await
+                        .unwrap();
+                    assert_eq!(saved.usage.total_tokens, Some(27));
+                    assert_eq!(saved.accumulated_usage.total_tokens, Some(27));
+                    assert_eq!(
+                        manager
+                            .get_session_usage_totals(&snapshot.root_session_id)
+                            .await
+                            .unwrap()
+                            .accumulated_usage
+                            .total_tokens,
+                        Some(27)
+                    );
+                }
+
+                let root = snapshot
+                    .tasks
+                    .iter()
+                    .find(|task| task.session_id == snapshot.root_session_id)
+                    .unwrap();
+                let answer = root
+                    .conversation
+                    .messages()
+                    .iter()
+                    .find(|message| message.as_concat_text() == "There are 12 pens in the box.")
+                    .unwrap();
+                let answer_id = answer.id.clone();
+                let contexts = root
+                    .conversation
+                    .messages()
+                    .iter()
+                    .filter(|message| message.is_turn_context())
+                    .count();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                rejecting.store(false, Ordering::SeqCst);
+                let restored =
+                    AcpServerConnection::new(TestConnectionConfig::default(), provider().await)
+                        .await;
+                let cwd = tempfile::tempdir().unwrap();
+                let session = restored
+                    .cx()
+                    .send_request(
+                        NewSessionRequest::new(cwd.path()).meta(
+                            json!({"goose":{"durable":{"restore":snapshot}}})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        ),
+                    )
+                    .block_task()
+                    .await
+                    .unwrap();
+                let response = restored
+                    .cx()
+                    .send_request(prompt(session.session_id, admission(Some(&snapshot))))
+                    .block_task()
+                    .await
+                    .unwrap();
+                let wire = serde_json::to_value(response).unwrap();
+                assert_eq!(
+                    wire["_meta"]["goose"]["completion"]["text"],
+                    "There are 12 pens in the box."
+                );
+                assert_eq!(
+                    wire["_meta"]["goose"]["completion"]["messageId"],
+                    json!(answer_id)
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "recovery must process the saved response instead of making a new inference"
+                );
+                let manager = SessionManager::new(restored.data_root());
+                let usage = manager
+                    .get_session(&snapshot.root_session_id, false)
+                    .await
+                    .unwrap();
+                assert_eq!(usage.usage.total_tokens, Some(27));
+                assert_eq!(usage.accumulated_usage.total_tokens, Some(27));
+                assert_eq!(
+                    manager
+                        .get_session_usage_totals(&snapshot.root_session_id)
+                        .await
+                        .unwrap()
+                        .accumulated_usage
+                        .total_tokens,
+                    Some(27)
+                );
+                let conversation = manager
+                    .get_session(&snapshot.root_session_id, true)
+                    .await
+                    .unwrap()
+                    .conversation
+                    .unwrap();
+                assert_eq!(
+                    conversation
+                        .messages()
+                        .iter()
+                        .filter(|message| message.id == answer_id)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    conversation
+                        .messages()
+                        .iter()
+                        .filter(|message| message.is_turn_context())
+                        .count(),
+                    contexts
+                );
+                assert!(!conversation.messages().iter().any(|message| message
+                    .as_concat_text()
+                    .contains("Ordinary conversation context;")));
+            }
+        }
+    });
+}
+
+#[test]
+fn durable_real_root_steering_settles_before_completion_in_both_loops() {
+    run_test(async {
+        use goose::session::durable::DurableSnapshot;
+        use serde_json::{json, Value};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
+
+        const GUIDANCE: &str = "One additional pen has been added. Recalculate the total.";
+        for use_state_machine in [false, true] {
+            for restore_after_inference in [false, true] {
+                let callback = MockServer::start().await;
+                let rejecting = Arc::new(AtomicBool::new(restore_after_inference));
+                let reject = rejecting.clone();
+                Mock::given(method("POST"))
+                    .respond_with(move |request: &Request| {
+                        let body: Value = serde_json::from_slice(&request.body).unwrap();
+                        if body["boundary"] == "completed" {
+                            assert!(
+                                body["snapshot"]["mailbox"].as_array().unwrap().iter().all(
+                                    |message| {
+                                        message["kind"] != "steering"
+                                            || message["delivered"] == true
+                                    }
+                                ),
+                                "completed checkpoint must not leave accepted guidance pending"
+                            );
+                        }
+                        if reject.load(Ordering::SeqCst) && body["boundary"] == "inference" {
+                            // The body is retained as committed, but its acknowledgement is lost.
+                            ResponseTemplate::new(503)
+                        } else {
+                            ResponseTemplate::new(200).set_body_json(
+                                json!({"accepted": true, "generation": body["generation"]}),
+                            )
+                        }
+                    })
+                    .mount(&callback)
+                    .await;
+                let calls = Arc::new(AtomicUsize::new(0));
+                let started = Arc::new(tokio::sync::Notify::new());
+                let provider = || async {
+                    let openai =
+                        OpenAiFixture::new(vec![], Arc::new(goose_test_support::IgnoreSessionId))
+                            .await;
+                    let calls = calls.clone();
+                    let started = started.clone();
+                    openai.mount_responder(move |request: &Request| {
+                        let index = calls.fetch_add(1, Ordering::SeqCst);
+                        if index == 0 { started.notify_one(); }
+                        let text = if String::from_utf8_lossy(&request.body).contains(GUIDANCE) {
+                            "There are 13 pens in the box."
+                        } else {
+                            "There are 12 pens in the box."
+                        };
+                        let chunk = json!({"id": format!("steered-{index}"), "model": "gpt-4.1", "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": null}]});
+                        let done = json!({"id": format!("steered-{index}"), "model": "gpt-4.1", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27}});
+                        let response = ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string(format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n"));
+                        if index == 0 { response.set_delay(std::time::Duration::from_secs(2)) } else { response }
+                    }).await;
+                    openai
+                };
+                let admission = |snapshot: Option<&DurableSnapshot>| {
+                    json!({
+                        "logicalRunId": "root-steering", "attemptId": uuid::Uuid::new_v4().to_string(),
+                        "epoch": if snapshot.is_some() { 2 } else { 1 }, "requestDigest": "a".repeat(64),
+                        "expectedGeneration": snapshot.map_or(0, |snapshot| snapshot.generation),
+                        "callbackUrl": callback.uri(), "callbackToken": "test-secret", "restore": snapshot,
+                    })
+                };
+                let prompt = |session_id, durable: Value| {
+                    PromptRequest::new(
+                    session_id,
+                    vec![ContentBlock::Text(TextContent::new("A box has 7 blue pens and 5 red pens. How many pens?"))],
+                ).meta(json!({"goose": {"attemptKey": durable["attemptId"], "awaitBackgroundTasks": true, "unrolledAgentLoop": use_state_machine, "durable": durable}}).as_object().unwrap().clone())
+                };
+                let mut first =
+                    AcpServerConnection::new(TestConnectionConfig::default(), provider().await)
+                        .await;
+                let SessionData { session, .. } = first.new_session().await.unwrap();
+                let manager = SessionManager::new(first.data_root());
+                let initial = admission(None);
+                let attempt = initial["attemptId"].as_str().unwrap().to_string();
+                let request = first
+                    .cx()
+                    .send_request(prompt(session.session_id().clone(), initial))
+                    .block_task();
+                let queue_guidance = async {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+                        .await
+                        .unwrap();
+                    let status = manager.prompt_attempt_status(&attempt).await.unwrap();
+                    let receipt = manager
+                        .admit_steering_delivery(
+                            &attempt,
+                            session.session_id().0.as_ref(),
+                            status.run_id.as_deref().unwrap(),
+                            "accepted-guidance",
+                            &"b".repeat(64),
+                            &Message::user()
+                                .with_text(GUIDANCE)
+                                .with_steer()
+                                .with_id(format!("steer_{}", uuid::Uuid::new_v4())),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(receipt).unwrap()["deliveryState"],
+                        "queued"
+                    );
+                };
+                let (initial_result, ()) =
+                    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                        tokio::join!(request, queue_guidance)
+                    })
+                    .await
+                    .unwrap();
+                let (response, completed_manager, completed_session, _restored_connection) =
+                    if restore_after_inference {
+                        initial_result.unwrap_err();
+                        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            while !manager
+                                .prompt_attempt_status(&attempt)
+                                .await
+                                .unwrap()
+                                .stopped
+                            {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        let bodies = callback.received_requests().await.unwrap();
+                        let inference: Value = bodies
+                            .iter()
+                            .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+                            .find(|body| body["boundary"] == "inference")
+                            .unwrap();
+                        let snapshot: DurableSnapshot =
+                            serde_json::from_value(inference["snapshot"].clone()).unwrap();
+                        assert!(snapshot.completion.is_none());
+                        assert!(snapshot
+                            .mailbox
+                            .iter()
+                            .any(|message| message.kind == "steering"
+                                && !message.delivered
+                                && message.body.contains(GUIDANCE)));
+                        assert_eq!(calls.load(Ordering::SeqCst), 1);
+                        rejecting.store(false, Ordering::SeqCst);
+                        let restored = AcpServerConnection::new(
+                            TestConnectionConfig::default(),
+                            provider().await,
+                        )
+                        .await;
+                        let cwd = tempfile::tempdir().unwrap();
+                        let loaded = restored
+                            .cx()
+                            .send_request(
+                                NewSessionRequest::new(cwd.path()).meta(
+                                    json!({"goose": {"durable": {"restore": snapshot}}})
+                                        .as_object()
+                                        .unwrap()
+                                        .clone(),
+                                ),
+                            )
+                            .block_task()
+                            .await
+                            .unwrap();
+                        let restored_session = loaded.session_id.0.to_string();
+                        let response = restored
+                            .cx()
+                            .send_request(prompt(loaded.session_id, admission(Some(&snapshot))))
+                            .block_task()
+                            .await
+                            .unwrap();
+                        (
+                            response,
+                            SessionManager::new(restored.data_root()),
+                            restored_session,
+                            Some(restored),
+                        )
+                    } else {
+                        (
+                            initial_result.unwrap(),
+                            manager,
+                            session.session_id().0.to_string(),
+                            None,
+                        )
+                    };
+                assert_eq!(response.stop_reason, StopReason::EndTurn);
+                assert_eq!(
+                    serde_json::to_value(response).unwrap()["_meta"]["goose"]["completion"]["text"],
+                    "There are 13 pens in the box."
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    2,
+                    "process the first response, then infer once for real accepted guidance"
+                );
+                assert!(completed_manager
+                    .pending_session_messages(&completed_session)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                let bodies = callback.received_requests().await.unwrap();
+                let completed: Value =
+                    serde_json::from_slice(&bodies.last().unwrap().body).unwrap();
+                assert_eq!(completed["boundary"], "completed");
+            }
+        }
+    });
+}
+
+#[test]
+fn durable_provider_prefix_failure_and_duplicate_tools_are_safe_in_both_loops() {
+    run_test(async {
+        use goose::session::durable::DurableSnapshot;
+        use serde_json::{json, Value};
+        use std::sync::Arc;
+        use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
+        for use_state_machine in [false, true] {
+            for failed_prefix in [true, false] {
+                let callback = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(|request: &Request| {
+                        let body: Value = serde_json::from_slice(&request.body).unwrap();
+                        ResponseTemplate::new(200)
+                            .set_body_json(json!({"accepted":true,"generation":body["generation"]}))
+                    })
+                    .mount(&callback)
+                    .await;
+                let mcp = McpFixture::new().await;
+                let openai =
+                    OpenAiFixture::new(vec![], Arc::new(goose_test_support::IgnoreSessionId)).await;
+                openai.mount_responder(move |request:&Request| {
+                    let body=String::from_utf8_lossy(&request.body);
+                    let stream=if failed_prefix {
+                        include_str!("acp_test_data/openai_tool_call.txt").replace("data: [DONE]","data: not-json")
+                    } else if body.contains(FAKE_CODE) {
+                        include_str!("acp_test_data/openai_basic.txt").to_string()
+                    } else {
+                        let request=|index|json!({"index":index,"id":"duplicate-call","type":"function","function":{"name":"mcp-fixture__get_code","arguments":"{}"}});
+                        let chunk=json!({"id":"duplicates","model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[request(0),request(1)]},"finish_reason":null}]});
+                        let done=json!({"id":"duplicates","model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]});
+                        format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n")
+                    };
+                    ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(stream)
+                }).await;
+                let mut conn = AcpServerConnection::new(
+                    TestConnectionConfig {
+                        mcp_servers: vec![McpServer::Http(McpServerHttp::new(
+                            "mcp-fixture",
+                            &mcp.url,
+                        ))],
+                        goose_mode: GooseMode::Auto,
+                        ..Default::default()
+                    },
+                    openai,
+                )
+                .await;
+                let SessionData { session, .. } = conn.new_session().await.unwrap();
+                let attempt = uuid::Uuid::new_v4().to_string();
+                let response=conn.cx().send_request(PromptRequest::new(session.session_id().clone(),vec![ContentBlock::Text(TextContent::new("Use get_code once."))]).meta(json!({"goose":{
+                    "attemptKey":attempt,"awaitBackgroundTasks":true,"unrolledAgentLoop":use_state_machine,"durable":{
+                        "logicalRunId":"prefix-safety","attemptId":attempt,"epoch":1,"requestDigest":"a".repeat(64),"expectedGeneration":0,"callbackUrl":callback.uri(),"callbackToken":"test-secret",
+                    }
+                }}).as_object().unwrap().clone())).block_task().await;
+                assert_eq!(response.is_err(), failed_prefix);
+                let manager = SessionManager::new(conn.data_root());
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !manager
+                        .prompt_attempt_status(&attempt)
+                        .await
+                        .unwrap()
+                        .stopped
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                for request in callback.received_requests().await.unwrap() {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    let snapshot: DurableSnapshot =
+                        serde_json::from_value(body["snapshot"].clone()).unwrap();
+                    if failed_prefix {
+                        assert!(
+                            snapshot.effects.is_empty(),
+                            "an incomplete provider response cannot dispatch a prefix tool"
+                        );
+                        assert_ne!(body["boundary"], "inference");
+                        assert!(snapshot.completion.is_none());
+                    } else {
+                        let root = snapshot
+                            .tasks
+                            .iter()
+                            .find(|task| task.session_id == snapshot.root_session_id)
+                            .unwrap();
+                        assert!(
+                            root.conversation
+                                .messages()
+                                .iter()
+                                .flat_map(|message| message.get_tool_request_ids())
+                                .filter(|id| *id == "duplicate-call")
+                                .count()
+                                <= 1
+                        );
+                        assert!(snapshot.effects.len() <= 1);
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn durable_invalid_completion_is_typed_in_both_loops() {
     run_test(async {
         use serde_json::{json, Value};

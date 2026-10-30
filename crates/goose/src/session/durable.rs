@@ -150,7 +150,83 @@ where
     Option::deserialize(deserializer)
 }
 
-fn eligible_completion(message: &Message) -> bool {
+pub use super::durable_usage::DurableUsageReceipt;
+
+pub const RESPONSE_OPERATION: &str = "durable";
+pub const RESPONSE_NOTE: &str = "inference";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InferenceReceipt {
+    pub version: u32,
+    pub task_id: String,
+    pub native_run_id: String,
+    pub producing_attempt_id: String,
+    #[serde(rename = "responseMessageIds")]
+    pub message_ids: Vec<String>,
+    pub processed: bool,
+    pub usage: DurableUsageReceipt,
+    #[serde(deserialize_with = "required_nullable")]
+    pub output_message_id: Option<String>,
+}
+
+fn response_receipts(conversation: &Conversation, task_id: &str) -> Result<Vec<InferenceReceipt>> {
+    let mut identities: HashMap<&str, (&Message, usize)> = HashMap::new();
+    for message in conversation.messages() {
+        if let Some(id) = &message.id {
+            let entry = identities.entry(id).or_insert((message, 0));
+            entry.1 += 1;
+        }
+    }
+    let mut receipts = Vec::new();
+    for (end, message) in conversation.messages().iter().enumerate() {
+        let Some(value) = message
+            .metadata
+            .operation_note(RESPONSE_OPERATION, RESPONSE_NOTE)
+        else {
+            continue;
+        };
+        let receipt: InferenceReceipt = serde_json::from_value(value.clone())?;
+        receipt.usage.validate()?;
+        ensure!(
+            receipt.version == 1
+                && receipt.task_id == task_id
+                && !receipt.native_run_id.is_empty()
+                && !receipt.producing_attempt_id.is_empty()
+                && !receipt.message_ids.is_empty()
+                && receipt.message_ids.iter().all(|id| !id.is_empty())
+                && receipt.message_ids.len() <= end + 1,
+            "invalid inference receipt authority"
+        );
+        let start = end + 1 - receipt.message_ids.len();
+        ensure!(
+            conversation.messages()[start..=end]
+                .iter()
+                .zip(&receipt.message_ids)
+                .all(|(message, id)| message.id.as_ref() == Some(id))
+                && receipt.message_ids.iter().collect::<HashSet<_>>().len()
+                    == receipt.message_ids.len(),
+            "inference response batch is incomplete"
+        );
+        ensure!(
+            receipt.message_ids.iter().all(|id| identities
+                .get(id.as_str())
+                .is_some_and(|(_, count)| *count == 1)),
+            "ambiguous inference response identity"
+        );
+        ensure!(
+            receipt.processed == receipt.output_message_id.is_some(),
+            "invalid inference processing state"
+        );
+        if let Some(id) = &receipt.output_message_id {
+            ensure!(!id.is_empty() && identities.get(id.as_str()).is_some_and(|(message, count)| *count == 1 && eligible_completion(message)), "processed inference has no unique valid output");
+        }
+        receipts.push(receipt);
+    }
+    Ok(receipts)
+}
+
+pub(crate) fn eligible_completion(message: &Message) -> bool {
     message.role == rmcp::model::Role::Assistant
         && message.is_user_visible()
         && !message.metadata.output_token_limit_reached
@@ -405,6 +481,7 @@ struct Execution {
     completed: bool,
     completion: Option<DurableCompletion>,
     parked: bool,
+    recorded_response_ids: HashSet<(String, String)>,
 }
 
 type SharedExecution = Arc<AsyncMutex<Execution>>;
@@ -516,6 +593,25 @@ impl Execution {
                             .and_then(|names| serde_json::from_value(names.clone()).ok())
                             .unwrap_or_default()
                     });
+            let mut conversation = session.conversation.clone().unwrap_or_default();
+            {
+                let mut receipts = response_receipts(&conversation, &id)
+                    .map_err(|error| DurableError::SnapshotInvalid(error.to_string()))?;
+                if let Some(mut receipt) = receipts.pop() {
+                    receipt.usage = DurableUsageReceipt::from_session(&session)?;
+                    if let Some(holder) = conversation
+                        .messages_mut()
+                        .iter_mut()
+                        .find(|message| message.id.as_ref() == receipt.message_ids.last())
+                    {
+                        holder.metadata.set_operation_note(
+                            RESPONSE_OPERATION,
+                            RESPONSE_NOTE,
+                            serde_json::to_value(receipt)?,
+                        );
+                    }
+                }
+            }
             tasks.push(DurableTask {
                 session_id: id.clone(),
                 parent_session_id: session.parent_session_id,
@@ -527,7 +623,7 @@ impl Execution {
                     .to_string_lossy()
                     .to_string(),
                 session_type: session.session_type,
-                conversation: session.conversation.unwrap_or_default(),
+                conversation,
                 task_admission: session
                     .extension_data
                     .extension_states
@@ -611,6 +707,20 @@ impl Execution {
                     })
                     .filter(|message| eligible_completion(message))
                     .context("durable completion requires a persisted visible answer")?;
+                if root
+                    .conversation
+                    .messages()
+                    .iter()
+                    .any(|message| message.metadata.inference.is_some())
+                {
+                    let receipt = response_receipts(&root.conversation, &self.root)?
+                        .pop()
+                        .context("completion has no processed inference boundary")?;
+                    ensure!(
+                        receipt.processed && receipt.output_message_id == message.id,
+                        "completion response processing is unfinished"
+                    );
+                }
                 snapshot.completion = Some(CompletionMarker {
                     version: 1,
                     message_id: message
@@ -768,6 +878,71 @@ pub async fn admit(
             return Err(DurableError::EffectUncertain(effect.operation_id.clone()).into());
         }
     }
+    let mut recorded_response_ids = HashSet::new();
+    if let Some(snapshot) = &admission.restore {
+        if !snapshot
+            .tasks
+            .iter()
+            .any(|task| task.session_id == session_id && task.completed)
+        {
+            for task in &snapshot.tasks {
+                if task.completed {
+                    continue;
+                }
+                let receipts = response_receipts(&task.conversation, &task.session_id)
+                    .map_err(|error| DurableError::SnapshotInvalid(error.to_string()))?;
+                if let Some(receipt) = receipts.last().filter(|receipt| !receipt.processed) {
+                    if let Some(tail) = task
+                        .conversation
+                        .messages()
+                        .iter()
+                        .rev()
+                        .find(|message| !message.content.is_empty())
+                    {
+                        ensure!(
+                            tail.role != rmcp::model::Role::Assistant
+                                || tail
+                                    .id
+                                    .as_ref()
+                                    .is_some_and(|id| receipt.message_ids.contains(id)),
+                            DurableError::SnapshotInvalid(
+                                "unrecorded derived response processing phase".into()
+                            )
+                        );
+                    }
+                }
+                let covered: HashSet<&str> = receipts
+                    .iter()
+                    .flat_map(|receipt| {
+                        receipt
+                            .message_ids
+                            .iter()
+                            .chain(receipt.output_message_id.iter())
+                    })
+                    .map(String::as_str)
+                    .collect();
+                ensure!(
+                    task.conversation
+                        .messages()
+                        .iter()
+                        .filter(|message| message.metadata.inference.is_some())
+                        .all(|message| message
+                            .id
+                            .as_deref()
+                            .is_some_and(|id| covered.contains(id))),
+                    DurableError::SnapshotInvalid(
+                        "unfinished inference has no durable response boundary".into()
+                    )
+                );
+                recorded_response_ids.extend(
+                    receipts
+                        .into_iter()
+                        .flat_map(|receipt| receipt.message_ids)
+                        .map(|id| (task.session_id.clone(), id)),
+                );
+            }
+        }
+    }
     ensure!(!enabled(session_id), "durable session already admitted");
     if let Some(snapshot) = &admission.restore {
         manager.import_durable_snapshot(snapshot).await?;
@@ -840,6 +1015,7 @@ pub async fn admit(
         completed,
         completion,
         parked: false,
+        recorded_response_ids,
     }));
     let mut registry = executions().lock().unwrap();
     if let Some(snapshot) = &runtime.try_lock().unwrap().admission.restore {
@@ -991,6 +1167,183 @@ pub fn is_wait(result: &std::result::Result<CallToolResult, ErrorData>) -> bool 
     })
 }
 
+pub async fn recorded_response_message(session_id: &str, message_id: &str) -> bool {
+    let Some(runtime) = lookup(session_id) else {
+        return false;
+    };
+    let execution = runtime.lock().await;
+    execution
+        .recorded_response_ids
+        .contains(&(session_id.to_string(), message_id.to_string()))
+}
+
+pub async fn record_response(session_id: &str, messages: &mut [Message]) -> Result<()> {
+    let Some(runtime) = lookup(session_id) else {
+        return Ok(());
+    };
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let mut execution = runtime.lock().await;
+    let ids = messages
+        .iter()
+        .map(|message| {
+            message
+                .id
+                .clone()
+                .context("inference response message has no identity")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let receipt = InferenceReceipt {
+        version: 1,
+        task_id: session_id.into(),
+        native_run_id: execution
+            .native_run_id
+            .clone()
+            .context("inference has no native run")?,
+        producing_attempt_id: execution
+            .producing_attempt_id
+            .clone()
+            .context("inference has no attempt")?,
+        message_ids: ids.clone(),
+        processed: false,
+        usage: super::durable_usage::capture(execution.manager.as_ref(), session_id).await?,
+        output_message_id: None,
+    };
+    messages.last_mut().unwrap().metadata.set_operation_note(
+        RESPONSE_OPERATION,
+        RESPONSE_NOTE,
+        serde_json::to_value(receipt)?,
+    );
+    if let Err(error) = execution
+        .manager
+        .storage()
+        .add_messages(session_id, messages)
+        .await
+    {
+        execution.fault = Some("inference response persistence failed".into());
+        return Err(error);
+    }
+    execution
+        .recorded_response_ids
+        .extend(ids.into_iter().map(|id| (session_id.to_string(), id)));
+    execution.commit("inference").await
+}
+
+pub(crate) fn pending_response_receipt(
+    conversation: &Conversation,
+    session_id: &str,
+) -> Result<Option<InferenceReceipt>> {
+    let Some(receipt) = response_receipts(conversation, session_id)?.pop() else {
+        return Ok(None);
+    };
+    let tail = conversation
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| !message.content.is_empty());
+    let Some(tail_id) = tail.and_then(|message| message.id.as_ref()) else {
+        return Ok(None);
+    };
+    if receipt.processed {
+        if receipt.output_message_id.as_ref() != Some(tail_id) {
+            return Ok(None);
+        }
+    } else if !receipt.message_ids.contains(tail_id) {
+        return Ok(None);
+    }
+    Ok(Some(receipt))
+}
+
+pub async fn pending_response(
+    session_id: &str,
+) -> Result<Option<(InferenceReceipt, Vec<Message>)>> {
+    let Some(runtime) = lookup(session_id) else {
+        return Ok(None);
+    };
+    let execution = runtime.lock().await;
+    let conversation = execution
+        .manager
+        .get_session(session_id, true)
+        .await?
+        .conversation
+        .unwrap_or_default();
+    let Some(receipt) = pending_response_receipt(&conversation, session_id)? else {
+        return Ok(None);
+    };
+    let end = conversation
+        .messages()
+        .iter()
+        .position(|message| message.id.as_ref() == receipt.message_ids.last())
+        .unwrap();
+    let start = end + 1 - receipt.message_ids.len();
+    let messages = conversation.messages()[start..=end].to_vec();
+    Ok(Some((receipt, messages)))
+}
+
+pub async fn finish_response(session_id: &str, output_message_id: Option<&str>) -> Result<()> {
+    let Some(output_message_id) = output_message_id else {
+        return Ok(());
+    };
+    let Some(runtime) = lookup(session_id) else {
+        return Ok(());
+    };
+    let mut execution = runtime.lock().await;
+    if execution.pending_wait.is_some()
+        || execution
+            .effects
+            .iter()
+            .any(|effect| effect.result.is_none())
+    {
+        return Ok(());
+    }
+    let session = execution.manager.get_session(session_id, true).await?;
+    let usage = DurableUsageReceipt::from_session(&session)?;
+    let conversation = session.conversation.unwrap_or_default();
+    let Some(last) = conversation.messages().last().filter(|message| {
+        eligible_completion(message) && message.id.as_deref() == Some(output_message_id)
+    }) else {
+        return Ok(());
+    };
+    let Some(mut receipt) = response_receipts(&conversation, session_id)?.pop() else {
+        return Ok(());
+    };
+    if receipt.processed {
+        return Ok(());
+    }
+    receipt.usage = usage;
+    receipt.processed = true;
+    receipt.output_message_id = last.id.clone();
+    let holder = receipt.message_ids.last().unwrap();
+    let mut metadata = conversation
+        .messages()
+        .iter()
+        .find(|message| message.id.as_ref() == Some(holder))
+        .unwrap()
+        .metadata
+        .clone();
+    metadata.set_operation_note(
+        RESPONSE_OPERATION,
+        RESPONSE_NOTE,
+        serde_json::to_value(&receipt)?,
+    );
+    sqlx::query("UPDATE messages SET metadata_json=? WHERE session_id=? AND message_id=?")
+        .bind(serde_json::to_string(&metadata)?)
+        .bind(session_id)
+        .bind(holder)
+        .execute(execution.manager.storage().pool().await?)
+        .await?;
+    execution.commit("response_processed").await
+}
+
+pub async fn resuming(session_id: &str) -> bool {
+    let Some(runtime) = lookup(session_id) else {
+        return false;
+    };
+    let execution = runtime.lock().await;
+    execution.resume_sessions.contains(session_id)
+}
+
 pub async fn take_resume(session_id: &str) -> bool {
     let Some(runtime) = lookup(session_id) else {
         return false;
@@ -1078,12 +1431,12 @@ pub async fn apply_continuation_context(session_id: &str) -> Result<Option<Messa
         return Ok(None);
     }
     let session = execution.manager.get_session(session_id, true).await?;
-    if session
-        .conversation
-        .as_ref()
-        .is_some_and(|conversation| pending_tool_message(conversation).is_some())
-    {
-        return Ok(None);
+    if let Some(conversation) = session.conversation.as_ref() {
+        if pending_response_receipt(conversation, session_id)?.is_some()
+            || pending_tool_message(conversation).is_some()
+        {
+            return Ok(None);
+        }
     }
     let message = Message::user()
         .with_text(context.text)
@@ -1213,8 +1566,19 @@ impl SessionManager {
                 .execute(&mut *tx)
                 .await?;
             for message in task.conversation.messages() {
-                sqlx::query("INSERT INTO messages(message_id,session_id,role,content_json,created_timestamp,metadata_json) VALUES(?,?,?,?,?,?)")
-                    .bind(&message.id).bind(&task.session_id).bind(match message.role { rmcp::model::Role::User => "user", rmcp::model::Role::Assistant => "assistant" }).bind(serde_json::to_string(&message.content)?).bind(message.created).bind(serde_json::to_string(&message.metadata)?).execute(&mut *tx).await?;
+                super::session_manager::SessionStorage::message_insert(
+                    &task.session_id,
+                    message,
+                    message.id.clone(),
+                    message.created,
+                )?
+                .execute(&mut *tx)
+                .await?;
+            }
+            let receipts = response_receipts(&task.conversation, &task.session_id)
+                .map_err(|error| DurableError::SnapshotInvalid(error.to_string()))?;
+            if let Some(receipt) = receipts.last() {
+                super::durable_usage::restore(&mut tx, &task.session_id, &receipt.usage).await?;
             }
             sqlx::query("DELETE FROM session_mailbox WHERE recipient_session_id=?")
                 .bind(&task.session_id)

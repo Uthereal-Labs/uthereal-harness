@@ -914,3 +914,235 @@ async fn durable_completion_cannot_skip_invalid_terminal_assistant_messages() ->
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn durable_response_boundary_rejects_partial_and_unmarked_inferences_before_import(
+) -> Result<()> {
+    use goose::conversation::message::InferenceMetadata;
+    let server = callback().await;
+    let (manager, root, directory) = manager().await?;
+    durable::admit(manager.clone(), &root, admission(&server, None)).await?;
+    durable::bind_execution(&manager, &root, "response-run", None).await?;
+    manager
+        .add_message(
+            &root,
+            &Message::user().with_text("original accepted request"),
+        )
+        .await?;
+    let before = server.received_requests().await.unwrap().len();
+    let mut messages: Vec<_> = ["first response message", "second response message"]
+        .into_iter()
+        .map(|text| {
+            Message::assistant()
+                .with_text(text)
+                .with_generated_id()
+                .with_inference(InferenceMetadata {
+                    provider: "test".into(),
+                    requested_model: "test-model".into(),
+                    resolved_model: None,
+                    provider_session_id: None,
+                })
+        })
+        .collect();
+    durable::record_response(&root, &mut messages).await?;
+    let snapshot = last_snapshot(&server).await?;
+    assert_eq!(server.received_requests().await.unwrap().len(), before + 1);
+    assert_eq!(snapshot.tasks[0].conversation.messages().len(), 3);
+    let child = manager
+        .prepare_durable_session(
+            &format!("child_{}", uuid::Uuid::new_v4()),
+            directory.path(),
+            "child",
+            SessionType::SubAgent,
+            GooseMode::Auto,
+        )
+        .await?;
+    manager
+        .update(&child.id)
+        .parent_session_id(Some(root.clone()))
+        .apply()
+        .await?;
+    durable::inherit(&root, &child.id);
+    manager
+        .add_message(
+            &child.id,
+            &Message::assistant()
+                .with_text("another task may reuse an id")
+                .with_id(messages[0].id.clone().unwrap()),
+        )
+        .await?;
+    assert_eq!(
+        manager
+            .get_session(&child.id, true)
+            .await?
+            .conversation
+            .unwrap()
+            .messages()
+            .len(),
+        1
+    );
+    durable::release(&root);
+    let fresh = tempfile::tempdir()?;
+    let restored = Arc::new(SessionManager::new(fresh.path().to_path_buf()));
+    restored
+        .prepare_durable_session(
+            &root,
+            fresh.path(),
+            "restored",
+            SessionType::Hidden,
+            GooseMode::Auto,
+        )
+        .await?;
+    for mutation in [
+        "prefix",
+        "no_receipt",
+        "later_unmarked",
+        "duplicate_reference",
+        "derived_output",
+        "malformed_processed",
+    ] {
+        let mut invalid = snapshot.clone();
+        match mutation {
+            "prefix" => {
+                invalid.tasks[0].conversation.messages_mut().remove(1);
+            }
+            "no_receipt" => {
+                invalid.tasks[0]
+                    .conversation
+                    .messages_mut()
+                    .last_mut()
+                    .unwrap()
+                    .metadata
+                    .operations = None;
+            }
+            "derived_output" => {
+                invalid.tasks[0].conversation.push(
+                    Message::assistant()
+                        .with_text("derived recipe output without a recorded processing phase")
+                        .with_generated_id(),
+                );
+            }
+            "duplicate_reference" => {
+                invalid.tasks[0]
+                    .conversation
+                    .messages_mut()
+                    .insert(0, messages[0].clone());
+            }
+            "later_unmarked" => {
+                invalid.tasks[0].conversation.push(
+                    Message::assistant()
+                        .with_text("uncommitted later inference")
+                        .with_generated_id()
+                        .with_inference(InferenceMetadata {
+                            provider: "test".into(),
+                            requested_model: "test-model".into(),
+                            resolved_model: None,
+                            provider_session_id: None,
+                        }),
+                );
+            }
+            _ => {
+                let value = invalid.tasks[0]
+                    .conversation
+                    .messages_mut()
+                    .last_mut()
+                    .unwrap()
+                    .metadata
+                    .operations
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(durable::RESPONSE_OPERATION)
+                    .unwrap()
+                    .get_mut(durable::RESPONSE_NOTE)
+                    .unwrap();
+                value["outputMessageId"] = json!(messages[1].id);
+            }
+        }
+        let error = durable::admit(restored.clone(), &root, admission(&server, Some(invalid)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<durable::DurableError>(),
+                Some(durable::DurableError::SnapshotInvalid(_))
+            ),
+            "{mutation}: {error}"
+        );
+        assert_eq!(
+            restored
+                .get_session(&root, true)
+                .await?
+                .conversation
+                .unwrap_or_default()
+                .len(),
+            0
+        );
+    }
+    durable::admit(restored.clone(), &root, admission(&server, Some(snapshot))).await?;
+    let replay = durable::pending_response(&root).await?.unwrap();
+    assert_eq!(replay.1.len(), 2);
+    assert!(!replay.0.processed);
+    durable::release(&root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_completed_children_do_not_require_new_inference_boundaries() -> Result<()> {
+    use goose::conversation::message::InferenceMetadata;
+    let server = callback().await;
+    let (manager, root, directory) = manager().await?;
+    durable::admit(manager.clone(), &root, admission(&server, None)).await?;
+    durable::bind_execution(&manager, &root, "run", None).await?;
+    manager
+        .add_message(&root, &Message::user().with_text("accepted request"))
+        .await?;
+    let child = manager
+        .prepare_durable_session(
+            &format!("child_{}", uuid::Uuid::new_v4()),
+            directory.path(),
+            "finished child",
+            SessionType::SubAgent,
+            GooseMode::Auto,
+        )
+        .await?;
+    manager
+        .update(&child.id)
+        .parent_session_id(Some(root.clone()))
+        .apply()
+        .await?;
+    manager
+        .add_message(
+            &child.id,
+            &Message::assistant()
+                .with_text("already completed historical child")
+                .with_inference(InferenceMetadata {
+                    provider: "test".into(),
+                    requested_model: "test-model".into(),
+                    resolved_model: None,
+                    provider_session_id: None,
+                }),
+        )
+        .await?;
+    durable::checkpoint(&root, "observation").await?;
+    let mut snapshot = last_snapshot(&server).await?;
+    snapshot
+        .tasks
+        .iter_mut()
+        .find(|task| task.session_id == child.id)
+        .unwrap()
+        .completed = true;
+    durable::release(&root);
+    durable::admit(manager.clone(), &root, admission(&server, Some(snapshot))).await?;
+    assert_eq!(
+        manager
+            .get_session(&child.id, true)
+            .await?
+            .conversation
+            .unwrap()
+            .messages()
+            .len(),
+        1
+    );
+    durable::release(&root);
+    Ok(())
+}

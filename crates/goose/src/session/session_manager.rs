@@ -454,6 +454,9 @@ impl SessionManager {
     }
 
     pub async fn add_message(&self, id: &str, message: &Message) -> Result<()> {
+        if super::durable::enabled(id) && self.enrich_recorded_response(id, message).await? {
+            return Ok(());
+        }
         if let Some(message_id) = message.id.as_deref().filter(|id| id.starts_with("steer_")) {
             let consumed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM session_mailbox WHERE recipient_session_id = ? AND kind = 'steering' AND delivered_at IS NOT NULL AND json_extract(body, '$.id') = ? AND EXISTS(SELECT 1 FROM messages WHERE session_id = ? AND message_id = ?))")
                 .bind(id).bind(message_id).bind(id).bind(message_id).fetch_one(self.storage.pool().await?).await?;
@@ -463,6 +466,33 @@ impl SessionManager {
         }
         self.storage.add_message(id, message).await?;
         super::durable::checkpoint(id, "conversation").await
+    }
+
+    // Allocate the durable replay SQL stage here to bound ordinary append frames.
+    fn enrich_recorded_response<'a>(
+        &'a self,
+        id: &'a str,
+        message: &'a Message,
+    ) -> futures::future::BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            let Some(message_id) = &message.id else {
+                return Ok(false);
+            };
+            if !super::durable::recorded_response_message(id, message_id).await {
+                return Ok(false);
+            }
+            let usage = message.metadata.usage.as_deref();
+            let usage = usage.map(serde_json::to_string).transpose()?;
+            let updated = sqlx::query("UPDATE messages SET metadata_json=CASE WHEN ? IS NULL THEN metadata_json ELSE json_set(metadata_json, '$.usage', json(?)) END WHERE session_id=? AND message_id=?")
+            .bind(&usage).bind(&usage).bind(id).bind(message_id).execute(self.storage.pool().await?).await?;
+            anyhow::ensure!(
+                updated.rows_affected() == 1,
+                super::durable::DurableError::SnapshotInvalid(
+                    "recorded response message is missing or ambiguous".into()
+                )
+            );
+            Ok(true)
+        })
     }
 
     pub async fn replace_conversation(&self, id: &str, conversation: &Conversation) -> Result<()> {
@@ -2043,49 +2073,59 @@ impl SessionStorage {
         Ok(Conversation::new_unvalidated(messages))
     }
 
-    pub(super) async fn add_message(&self, session_id: &str, message: &Message) -> Result<()> {
+    pub(super) fn add_message<'a>(
+        &'a self,
+        session_id: &'a str,
+        message: &'a Message,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.add_messages(session_id, std::slice::from_ref(message))
+    }
+
+    pub(super) async fn add_messages(&self, session_id: &str, messages: &[Message]) -> Result<()> {
         let pool = self.pool().await?;
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-
-        let metadata_json = serde_json::to_string(&message.metadata)?;
-        // Messages are read back ordered by (created_timestamp, id), so one built
-        // before the messages it is appended after would sort ahead of them —
-        // operations do that whenever they prepare a reply and fill it in while a
-        // tool runs. Never move a message ahead of what is already stored.
-        let latest: Option<i64> =
+        let mut latest: Option<i64> =
             sqlx::query_scalar("SELECT MAX(created_timestamp) FROM messages WHERE session_id = ?")
                 .bind(session_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let created = message.created.max(latest.unwrap_or(message.created));
+        for message in messages {
+            // Operations can construct a reply before earlier messages are persisted.
+            // Clamp timestamps so retrieval preserves insertion order.
+            let created = message.created.max(latest.unwrap_or(message.created));
+            let message_id = message
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("msg_{}_{}", session_id, uuid::Uuid::new_v4()));
+            Self::message_insert(session_id, message, Some(message_id), created)?
+                .execute(&mut *tx)
+                .await?;
 
-        let message_id = message
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("msg_{}_{}", session_id, uuid::Uuid::new_v4()));
-
-        sqlx::query(
-            r#"
-            INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-        "#,
-        )
-        .bind(message_id)
-        .bind(session_id)
-        .bind(role_to_string(&message.role))
-        .bind(serde_json::to_string(&message.content)?)
-        .bind(created)
-        .bind(metadata_json)
-        .execute(&mut *tx)
-        .await?;
-
+            latest = Some(created);
+        }
         sqlx::query("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?")
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
-
         tx.commit().await?;
         Ok(())
+    }
+
+    pub(super) fn message_insert(
+        session_id: &str,
+        message: &Message,
+        message_id: Option<String>,
+        created: i64,
+    ) -> Result<sqlx::query::Query<'static, Sqlite, sqlx::sqlite::SqliteArguments>> {
+        Ok(sqlx::query(
+            "INSERT INTO messages(message_id,session_id,role,content_json,created_timestamp,metadata_json) VALUES(?,?,?,?,?,?)",
+        )
+        .bind(message_id)
+        .bind(session_id.to_string())
+        .bind(role_to_string(&message.role))
+        .bind(serde_json::to_string(&message.content)?)
+        .bind(created)
+        .bind(serde_json::to_string(&message.metadata)?))
     }
 
     async fn replace_conversation_inner(
@@ -2101,27 +2141,13 @@ impl SessionStorage {
             .await?;
 
         for message in conversation.messages() {
-            let metadata_json = serde_json::to_string(&message.metadata)?;
-
             let message_id = message
                 .id
                 .clone()
                 .unwrap_or_else(|| format!("msg_{}_{}", session_id, uuid::Uuid::new_v4()));
-
-            sqlx::query(
-                r#"
-            INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-        "#,
-            )
-            .bind(message_id)
-            .bind(session_id)
-            .bind(role_to_string(&message.role))
-            .bind(serde_json::to_string(&message.content)?)
-            .bind(message.created)
-            .bind(metadata_json)
-            .execute(&mut *tx)
-            .await?;
+            Self::message_insert(session_id, message, Some(message_id), message.created)?
+                .execute(&mut *tx)
+                .await?;
         }
 
         tx.commit().await?;
@@ -2937,6 +2963,43 @@ mod tests {
 
     const NUM_CONCURRENT_SESSIONS: i32 = 10;
     const GENERATED_SESSION_NAME: &str = "Generated session name";
+
+    #[tokio::test]
+    async fn response_batch_insert_failure_rolls_back_the_entire_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(directory.path().to_path_buf());
+        let session = manager
+            .create_session(
+                directory.path().to_path_buf(),
+                "batch".into(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER reject_second_message BEFORE INSERT ON messages WHEN NEW.message_id='reject-batch' BEGIN SELECT RAISE(FAIL, 'synthetic failure'); END")
+            .execute(manager.storage().pool().await.unwrap()).await.unwrap();
+        let batch = [
+            Message::assistant()
+                .with_text("prefix")
+                .with_id("first-batch"),
+            Message::assistant()
+                .with_text("tail")
+                .with_id("reject-batch"),
+        ];
+        assert!(manager
+            .storage()
+            .add_messages(&session.id, &batch)
+            .await
+            .is_err());
+        assert!(manager
+            .get_session(&session.id, true)
+            .await
+            .unwrap()
+            .conversation
+            .unwrap_or_default()
+            .is_empty());
+    }
 
     #[cfg(unix)]
     #[tokio::test]

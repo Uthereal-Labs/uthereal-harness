@@ -173,6 +173,56 @@ impl EffectUsage<GooseEffect> for SessionManager {
     }
 }
 
+fn persist_inference_result<'a>(
+    runtime: &'a SessionManager,
+    session: &'a Session,
+    effects: &'a mut Vec<GooseEffect>,
+    emit: &'a Emitter,
+) -> futures::future::BoxFuture<'a, Result<()>> {
+    Box::pin(async move {
+        let full_response = effects.iter().any(|effect| matches!(effect,
+        GooseEffect::Conversation(ConversationEffect::AppendMessage(message))
+        if message.metadata.operation_note("llm", "response_completed").and_then(serde_json::Value::as_bool) == Some(true)));
+        if !full_response {
+            effects.retain(|effect| !matches!(effect,
+            GooseEffect::Conversation(ConversationEffect::AppendMessage(message)) if message.metadata.inference.is_some()));
+            return Ok(());
+        }
+        usage::enrich(session, effects);
+        let provider_usage: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                GooseEffect::RecordUsage(usage) => Some(usage.clone()),
+                _ => None,
+            })
+            .collect();
+        for usage in &provider_usage {
+            usage::record(runtime, session, usage, false).await?;
+        }
+        let mut messages: Vec<Message> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                GooseEffect::Conversation(ConversationEffect::AppendMessage(message)) => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        crate::session::durable::record_response(&session.id, &mut messages).await?;
+        effects.retain(|effect| !matches!(effect, GooseEffect::RecordUsage(_)));
+        for usage in provider_usage {
+            emit.emit(AgentEvent::Usage(usage)).await;
+        }
+        let mut messages = messages.into_iter();
+        for effect in effects {
+            if let GooseEffect::Conversation(ConversationEffect::AppendMessage(message)) = effect {
+                *message = messages.next().unwrap();
+            }
+        }
+        Ok(())
+    })
+}
+
 pub(crate) async fn run(
     machine: &crate::agents::state_machine::StateMachine<'_, Session, GooseEffect>,
     runtime: &SessionManager,
@@ -216,6 +266,9 @@ pub(crate) async fn run(
             if let Some(usage) = runtime.usage(effect) {
                 turn_usage += usage;
             }
+        }
+        if result.applied_step == Some("llm") && crate::session::durable::enabled(session_id) {
+            persist_inference_result(runtime, &session, &mut result.effects, emit).await?;
         }
         machine.apply(runtime, &session, &mut result, emit).await?;
         if result.yield_to_client {
