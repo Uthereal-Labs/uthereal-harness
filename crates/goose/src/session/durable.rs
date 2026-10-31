@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, OnceLock},
 };
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 pub const WAIT_META: &str = "uthereal/durableWait";
 pub const OPERATION_META: &str = "uthereal/durableOperation";
@@ -773,11 +773,35 @@ pub async fn checkpoint(session_id: &str, boundary: &str) -> Result<()> {
     Ok(())
 }
 
+pub(super) struct TaskNoticeCheckpoint(OwnedMutexGuard<Execution>);
+
+impl TaskNoticeCheckpoint {
+    pub(super) async fn commit(&mut self) -> Result<()> {
+        self.0.commit("task_notice").await
+    }
+}
+
+pub(super) async fn task_notice_checkpoint(
+    session_id: &str,
+) -> Result<Option<TaskNoticeCheckpoint>> {
+    let Some(runtime) = lookup(session_id) else {
+        return Ok(None);
+    };
+    let execution = runtime.lock_owned().await;
+    if execution.parked || execution.completed {
+        return Ok(None);
+    }
+    if let Some(fault) = &execution.fault {
+        anyhow::bail!("durable execution blocked: {fault}");
+    }
+    Ok(Some(TaskNoticeCheckpoint(execution)))
+}
+
 pub async fn checkpoint_notice(session_id: &str) -> Result<()> {
-    let runtime =
-        lookup(session_id).context("durable task notice target is parked or interrupted")?;
-    let result = runtime.lock().await.commit("task_notice").await;
-    result
+    let mut checkpoint = task_notice_checkpoint(session_id)
+        .await?
+        .context("durable task notice target is parked or interrupted")?;
+    checkpoint.commit().await
 }
 
 pub async fn admit(

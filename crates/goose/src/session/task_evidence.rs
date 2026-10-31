@@ -430,6 +430,8 @@ impl SessionManager {
     /// until its finish checkpoint seals notice admission. Fresh notices after
     /// that checkpoint are `not_running`; retries of accepted dedupe keys remain
     /// `queued`, including after delivery, so callers can acknowledge lost replies.
+    /// Parked or interrupted durable executions return `not_running` without local
+    /// writes; accepted notices remain in their checkpoint for the next resume.
     pub async fn queue_task_notice(
         &self,
         request: &TaskNoticeRequest,
@@ -462,23 +464,34 @@ impl SessionManager {
             bail!("Invalid task notice request");
         }
         let pool = self.storage().pool().await?;
-        // Acquire the SQLite writer before checking terminal state; completion
-        // insertion uses the same writer lock and cannot interleave admission.
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let binding: Option<(String, String)> = sqlx::query_as(
             "SELECT session_id, run_id FROM prompt_attempts
              WHERE attempt_key = ? AND session_id IS NOT NULL AND run_id IS NOT NULL",
         )
         .bind(&request.attempt_key)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(pool)
         .await?;
         let Some((parent_session_id, parent_run_id)) = binding else {
             bail!("Attempt does not own a parent session and run");
         };
-        let durable: bool = sqlx::query_scalar(r#"SELECT json_extract(extension_data, '$."durable.execution_v1"') IS NOT NULL FROM sessions WHERE id=?"#).bind(&parent_session_id).fetch_one(&mut *tx).await?;
-        if durable && !super::durable::enabled(&parent_session_id) {
-            bail!("Durable task notice target is parked or interrupted");
-        }
+        let durable: bool = sqlx::query_scalar(r#"SELECT json_extract(extension_data, '$."durable.execution_v1"') IS NOT NULL FROM sessions WHERE id=?"#).bind(&parent_session_id).fetch_one(pool).await?;
+        // Durable checkpoints also acquire SQLite while holding the runtime lock.
+        // Keep that order and hold the runtime through admission and checkpointing.
+        let mut checkpoint = if durable {
+            let Some(checkpoint) =
+                super::durable::task_notice_checkpoint(&parent_session_id).await?
+            else {
+                return Ok(TaskNoticeResponse {
+                    status: TaskNoticeStatus::NotRunning,
+                    task_id: None,
+                });
+            };
+            Some(checkpoint)
+        } else {
+            None
+        };
+        // Completion insertion shares this writer lock and cannot interleave admission.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(dedupe_key) = &request.dedupe_key {
             let accepted: Option<String> = sqlx::query_scalar(
                 r#"SELECT s.id FROM sessions s JOIN session_mailbox m ON m.recipient_session_id = s.id
@@ -496,8 +509,8 @@ impl SessionManager {
              .fetch_optional(&mut *tx).await?;
             if let Some(task_id) = accepted {
                 tx.commit().await?;
-                if durable {
-                    super::durable::checkpoint_notice(&parent_session_id).await?;
+                if let Some(checkpoint) = &mut checkpoint {
+                    checkpoint.commit().await?;
                 }
                 return Ok(TaskNoticeResponse {
                     status: TaskNoticeStatus::Queued,
@@ -562,8 +575,8 @@ impl SessionManager {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        if durable {
-            super::durable::checkpoint_notice(&parent_session_id).await?;
+        if let Some(checkpoint) = &mut checkpoint {
+            checkpoint.commit().await?;
         }
         Ok(TaskNoticeResponse {
             status: TaskNoticeStatus::Queued,
