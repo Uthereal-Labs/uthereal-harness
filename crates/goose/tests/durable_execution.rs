@@ -614,7 +614,7 @@ async fn durable_completion_is_restored_for_publication_without_execution() -> R
 }
 
 #[tokio::test]
-async fn durable_parked_task_notice_cannot_acknowledge_local_only_delivery() -> Result<()> {
+async fn durable_parking_seals_notice_admission_without_losing_checkpointed_mailbox() -> Result<()> {
     use goose_sdk_types::custom_requests::{TaskNoticeRequest, TaskNoticeStatus};
     let server = callback().await;
     let (manager, root, directory) = manager().await?;
@@ -647,7 +647,7 @@ async fn durable_parked_task_notice_cannot_acknowledge_local_only_delivery() -> 
     durable::inherit(&root, &child.id);
     let mut notice = TaskNoticeRequest {
         attempt_key: lease.key.clone(),
-        task_id: Some(child.id),
+        task_id: Some(child.id.clone()),
         text: "durable channel notice".into(),
         dedupe_key: Some("notice-1".into()),
         ..Default::default()
@@ -656,14 +656,42 @@ async fn durable_parked_task_notice_cannot_acknowledge_local_only_delivery() -> 
         manager.queue_task_notice(&notice).await?.status,
         TaskNoticeStatus::Queued
     );
+    assert_eq!(
+        manager.queue_task_notice(&notice).await?.status,
+        TaskNoticeStatus::Queued
+    );
+    assert_eq!(manager.pending_session_messages(&child.id).await?.len(), 1);
     let mut request = CallToolRequestParams::new("ask_user");
     durable::before_tool(&root, "wait", &mut request).await?;
     durable::after_tool(&root, "wait", &Ok(waiting())).await?;
-    durable::parked_receipt(&root).await?;
-    notice.dedupe_key = Some("late-notice".into());
-    assert!(manager.queue_task_notice(&notice).await.is_err());
+    notice.dedupe_key = Some("racing-notice".into());
+    let (queued, parked) = tokio::join!(
+        manager.queue_task_notice(&notice),
+        durable::parked_receipt(&root)
+    );
+    let queued = queued?;
+    assert!(parked?.is_some());
+    let expected_notices = 1 + usize::from(queued.status == TaskNoticeStatus::Queued);
+    let snapshot = last_snapshot(&server).await?;
+    assert_eq!(
+        snapshot.mailbox.iter().filter(|row| row.recipient_session_id == child.id).count(),
+        expected_notices
+    );
+    let callback_count = server.received_requests().await.unwrap().len();
+    for dedupe in ["late-notice", "notice-1"] {
+        notice.dedupe_key = Some(dedupe.into());
+        let response = manager.queue_task_notice(&notice).await?;
+        assert_eq!(response.status, TaskNoticeStatus::NotRunning);
+        assert!(response.task_id.is_none());
+    }
     durable::release(&root);
-    assert!(manager.queue_task_notice(&notice).await.is_err());
+    assert_eq!(manager.queue_task_notice(&notice).await?.status, TaskNoticeStatus::NotRunning);
+    assert_eq!(manager.pending_session_messages(&child.id).await?.len(), expected_notices);
+    assert_eq!(server.received_requests().await.unwrap().len(), callback_count);
+    durable::admit(manager.clone(), &root, admission(&server, Some(snapshot))).await?;
+    assert_eq!(manager.queue_task_notice(&notice).await?.status, TaskNoticeStatus::Queued);
+    assert_eq!(manager.pending_session_messages(&child.id).await?.len(), expected_notices);
+    durable::release(&root);
     Ok(())
 }
 
