@@ -614,16 +614,21 @@ async fn durable_completion_is_restored_for_publication_without_execution() -> R
 }
 
 #[tokio::test]
-async fn durable_parking_seals_notice_admission_without_losing_checkpointed_mailbox() -> Result<()> {
+async fn durable_parking_seals_notice_admission_without_losing_checkpointed_mailbox() -> Result<()>
+{
     use goose_sdk_types::custom_requests::{TaskNoticeRequest, TaskNoticeStatus};
     let server = callback().await;
     let (manager, root, directory) = manager().await?;
-    let admission = admission(&server, None);
+    let initial_admission = admission(&server, None);
     let lease = manager
-        .claim_prompt_attempt(&admission.attempt_id, &admission.request_digest, &root)
+        .claim_prompt_attempt(
+            &initial_admission.attempt_id,
+            &initial_admission.request_digest,
+            &root,
+        )
         .await?
         .unwrap();
-    durable::admit(manager.clone(), &root, admission).await?;
+    durable::admit(manager.clone(), &root, initial_admission).await?;
     let child = manager
         .prepare_durable_session(
             &format!("durable_{}", uuid::Uuid::new_v4()),
@@ -674,7 +679,11 @@ async fn durable_parking_seals_notice_admission_without_losing_checkpointed_mail
     let expected_notices = 1 + usize::from(queued.status == TaskNoticeStatus::Queued);
     let snapshot = last_snapshot(&server).await?;
     assert_eq!(
-        snapshot.mailbox.iter().filter(|row| row.recipient_session_id == child.id).count(),
+        snapshot
+            .mailbox
+            .iter()
+            .filter(|row| row.recipient_session_id == child.id)
+            .count(),
         expected_notices
     );
     let callback_count = server.received_requests().await.unwrap().len();
@@ -685,12 +694,27 @@ async fn durable_parking_seals_notice_admission_without_losing_checkpointed_mail
         assert!(response.task_id.is_none());
     }
     durable::release(&root);
-    assert_eq!(manager.queue_task_notice(&notice).await?.status, TaskNoticeStatus::NotRunning);
-    assert_eq!(manager.pending_session_messages(&child.id).await?.len(), expected_notices);
-    assert_eq!(server.received_requests().await.unwrap().len(), callback_count);
+    assert_eq!(
+        manager.queue_task_notice(&notice).await?.status,
+        TaskNoticeStatus::NotRunning
+    );
+    assert_eq!(
+        manager.pending_session_messages(&child.id).await?.len(),
+        expected_notices
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        callback_count
+    );
     durable::admit(manager.clone(), &root, admission(&server, Some(snapshot))).await?;
-    assert_eq!(manager.queue_task_notice(&notice).await?.status, TaskNoticeStatus::Queued);
-    assert_eq!(manager.pending_session_messages(&child.id).await?.len(), expected_notices);
+    assert_eq!(
+        manager.queue_task_notice(&notice).await?.status,
+        TaskNoticeStatus::Queued
+    );
+    assert_eq!(
+        manager.pending_session_messages(&child.id).await?.len(),
+        expected_notices
+    );
     durable::release(&root);
     Ok(())
 }
