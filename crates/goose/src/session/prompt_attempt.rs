@@ -131,6 +131,15 @@ impl SessionManager {
         Ok(true)
     }
 
+    pub async fn seal_prompt_attempt_for_park(&self, lease: &PromptAttemptLease) -> Result<()> {
+        let changed = sqlx::query("UPDATE prompt_attempts SET steering_sealed=1 WHERE attempt_key=? AND run_id=? AND state='running'")
+            .bind(&lease.key).bind(&lease.run_id).execute(self.storage().pool().await?).await?.rows_affected();
+        if changed != 1 {
+            bail!("durable parking admission lost execution ownership");
+        }
+        Ok(())
+    }
+
     pub async fn prompt_attempt_transcript(
         &self,
         request: &PromptAttemptTranscriptRequest,
@@ -224,12 +233,17 @@ impl SessionManager {
         let run_id = format!("run_{}", Uuid::new_v4());
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO prompt_attempts
-             (attempt_key, request_digest, session_id, run_id, state) VALUES (?, ?, ?, ?, 'running')",
+             (attempt_key, request_digest, session_id, run_id, state)
+             SELECT ?, ?, ?, ?, 'running'
+             WHERE NOT EXISTS(SELECT 1 FROM prompt_attempts WHERE session_id=?)
+                OR EXISTS(SELECT 1 FROM sessions WHERE id=? AND json_extract(extension_data, '$.\"durable.execution_v1\"') IS NOT NULL)",
         )
         .bind(key)
         .bind(digest)
         .bind(session_id)
         .bind(&run_id)
+        .bind(session_id)
+        .bind(session_id)
         .execute(pool)
         .await?
         .rows_affected();
@@ -238,8 +252,9 @@ impl SessionManager {
                 "SELECT request_digest FROM prompt_attempts WHERE attempt_key = ?",
             )
             .bind(key)
-            .fetch_one(pool)
-            .await?;
+            .fetch_optional(pool)
+            .await?
+            .flatten();
             if original.is_some_and(|original| original != digest) {
                 bail!("attempt key is already bound to a different request");
             }
@@ -282,7 +297,13 @@ impl SessionManager {
             .await?
             .begin_with("BEGIN IMMEDIATE")
             .await?;
-        if state == "completed" {
+        if state == "completed"
+            && result
+                .as_ref()
+                .and_then(|result| result.pointer("/_meta/goose/durable/state"))
+                .and_then(|state| state.as_str())
+                != Some("parked")
+        {
             let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM session_mailbox m JOIN prompt_attempts p ON p.attempt_key = m.steering_attempt_key WHERE p.attempt_key = ? AND p.run_id = ? AND p.state = 'running' AND m.delivered_at IS NULL)")
                 .bind(&lease.key).bind(&lease.run_id).fetch_one(&mut *tx).await?;
             if pending {

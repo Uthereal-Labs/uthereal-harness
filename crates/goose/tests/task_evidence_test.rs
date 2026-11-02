@@ -9,6 +9,117 @@ use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn restored_task_evidence_projects_fresh_execution_without_rewriting_admission() {
+    let f = Fixture::new().await;
+    let original = f.child().await;
+    f.manager
+        .enqueue_task_outcome(
+            &original.task_id,
+            "completed specialist result",
+            TaskTerminalStatus::Completed,
+        )
+        .await
+        .unwrap();
+    f.manager
+        .prepare_durable_session(
+            &f.parent,
+            f.directory.path(),
+            "restored",
+            SessionType::User,
+            GooseMode::Auto,
+        )
+        .await
+        .unwrap();
+    let mut parent_data = f
+        .manager
+        .get_session(&f.parent, false)
+        .await
+        .unwrap()
+        .extension_data;
+    parent_data.set_extension_state(
+        "durable",
+        "execution_v1",
+        json!({"logicalRunId":"same-logical-request"}),
+    );
+    f.manager
+        .update(&f.parent)
+        .extension_data(parent_data)
+        .apply()
+        .await
+        .unwrap();
+    let next = f
+        .manager
+        .claim_prompt_attempt(
+            &uuid::Uuid::new_v4().to_string(),
+            &"a".repeat(64),
+            &f.parent,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut data = f
+        .manager
+        .get_session(&original.task_id, false)
+        .await
+        .unwrap()
+        .extension_data;
+    data.set_extension_state(
+        "summon",
+        "task_execution_v1",
+        json!({"parentRunId":next.run_id,"attemptKey":next.key}),
+    );
+    f.manager
+        .update(&original.task_id)
+        .extension_data(data)
+        .apply()
+        .await
+        .unwrap();
+    let admission = f
+        .manager
+        .task_admission(&original.task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admission.attempt_key.as_deref(), Some(next.key.as_str()));
+    assert_eq!(
+        admission.parent_run_id.as_deref(),
+        Some(next.run_id.as_str())
+    );
+    let response = f
+        .manager
+        .task_evidence(&TaskEvidenceRequest {
+            attempt_key: next.key.clone(),
+            task_id: Some(original.task_id.clone()),
+            tool_names: vec![],
+            after_task_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.tasks.len(), 1);
+    assert_eq!(response.tasks[0].admission, admission);
+    assert_eq!(
+        response.tasks[0].outcome.as_ref().unwrap().admission,
+        admission
+    );
+    let stored = f
+        .manager
+        .get_session(&original.task_id, false)
+        .await
+        .unwrap()
+        .extension_data;
+    assert_eq!(
+        serde_json::from_value::<TaskAdmission>(
+            stored
+                .get_extension_state("summon", "task_admission_v1")
+                .unwrap()
+                .clone()
+        )
+        .unwrap(),
+        original
+    );
+}
+
 struct Fixture {
     directory: TempDir,
     manager: SessionManager,

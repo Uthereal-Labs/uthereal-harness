@@ -282,6 +282,7 @@ impl SessionManager {
         if result.rows_affected() == 0 {
             bail!("Session '{child_session_id}' is not a child of '{parent_session_id}'");
         }
+        super::durable::checkpoint(parent_session_id, "mailbox_queued").await?;
         Ok(result.last_insert_rowid())
     }
 
@@ -306,6 +307,7 @@ impl SessionManager {
         if result.rows_affected() == 0 {
             bail!("Session '{child_session_id}' has no parent session");
         }
+        super::durable::checkpoint(child_session_id, "mailbox_queued").await?;
         Ok(result.last_insert_rowid())
     }
 
@@ -346,6 +348,7 @@ impl SessionManager {
                 bail!("Session '{child_session_id}' has no parent session");
             }
         }
+        super::durable::checkpoint(child_session_id, "task_completed").await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -396,7 +399,7 @@ impl SessionManager {
         through_id: i64,
     ) -> Result<u64> {
         let pool = self.storage().pool().await?;
-        Ok(sqlx::query(
+        let changed = sqlx::query(
             r#"
             UPDATE session_mailbox
             SET delivered_at = CURRENT_TIMESTAMP
@@ -407,7 +410,9 @@ impl SessionManager {
         .bind(through_id)
         .execute(pool)
         .await?
-        .rows_affected())
+        .rows_affected();
+        super::durable::checkpoint(recipient_session_id, "mailbox_acknowledged").await?;
+        Ok(changed)
     }
 
     pub async fn deliver_session_message(
@@ -469,6 +474,7 @@ impl SessionManager {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        super::durable::checkpoint(recipient_session_id, "mailbox_delivered").await?;
         Ok(true)
     }
 }

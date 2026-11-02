@@ -38,6 +38,7 @@ pub struct ToolCallContext {
     pub session_id: String,
     pub working_dir: Option<PathBuf>,
     pub tool_call_request_id: Option<String>,
+    pub request_meta: Option<rmcp::model::RequestMetaObject>,
     notification_emitter: Option<ToolCallNotificationEmitter>,
 }
 
@@ -51,6 +52,7 @@ impl ToolCallContext {
             session_id,
             working_dir,
             tool_call_request_id,
+            request_meta: None,
             notification_emitter: None,
         }
     }

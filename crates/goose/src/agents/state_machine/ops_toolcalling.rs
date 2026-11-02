@@ -259,6 +259,9 @@ pub(super) fn with_post_tool_hooks(
     let future = async move {
         let result =
             crate::agents::large_response_handler::process_tool_response(result.result.await);
+        crate::session::durable::after_tool(&session_id, &tool_call_id, &result)
+            .await
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
         crate::agents::gen_ai_telemetry::record_tool_result(&tracing::Span::current(), &result);
         match &result {
             _ if crate::agents::gen_ai_telemetry::is_rule_rejection(&result) => {}
@@ -338,11 +341,16 @@ impl<'a> ToolExecutionOperation<'a> {
 
     async fn dispatch_tool_call(
         &self,
-        tool_call: CallToolRequestParams,
+        mut tool_call: CallToolRequestParams,
         request_id: String,
         cancellation_token: CancellationToken,
         session: &Session,
     ) -> std::result::Result<ToolCallResult, ErrorData> {
+        match crate::session::durable::before_tool(&session.id, &request_id, &mut tool_call).await {
+            Ok(Some(result)) => return Ok(ToolCallResult::from(result)),
+            Ok(None) => {}
+            Err(error) => return Err(ErrorData::internal_error(error.to_string(), None)),
+        }
         let span = tool_span(&tool_call.name, &request_id, &session.id);
         crate::agents::gen_ai_telemetry::record_tool_arguments(&span, &tool_call);
         let result_span = span.clone();
@@ -967,6 +975,9 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
                     let Some((request_id, item)) = item else { break };
                     match item {
                         ToolStreamItem::Result(output) => {
+                            if crate::session::durable::is_wait(&output) {
+                                continue;
+                            }
                             if manage_extensions_ids.contains(request_id.as_str())
                                 && output.is_err()
                             {
@@ -1007,7 +1018,9 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
             .map(str::to_string)
             .collect();
         for request in &requests {
-            if !answered.contains(request.id.as_str()) {
+            if !answered.contains(request.id.as_str())
+                && !crate::session::durable::suspended(&session.id).await
+            {
                 response.add_tool_response_with_metadata(
                     request.id.clone(),
                     Ok(CallToolResult::error(vec![ContentBlock::text(
@@ -1022,11 +1035,18 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
             effects.push(self.extension_state_effect(session).await?);
         }
 
+        if response.content.is_empty() && crate::session::durable::suspended(&session.id).await {
+            return yielded_with(effects);
+        }
         let response = response.with_generated_id_if_missing();
         emit.emit(AgentEvent::Message(response.user_visible_content()))
             .await;
         effects.push(response.into());
-        applied(effects)
+        if crate::session::durable::suspended(&session.id).await {
+            yielded_with(effects)
+        } else {
+            applied(effects)
+        }
     }
 }
 

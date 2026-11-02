@@ -2502,11 +2502,12 @@ impl ExtensionManager {
         let resolved_tool = resolved;
         let should_hydrate_mcp_app = self.host_supports_mcp_apps();
         let read_cancellation_token = cancellation_token.clone();
-        let owned_ctx = ToolCallContext::new(
+        let mut owned_ctx = ToolCallContext::new(
             ctx.session_id.clone(),
             ctx.working_dir.clone(),
             ctx.tool_call_request_id.clone(),
         );
+        owned_ctx.request_meta = tool_call.meta.clone().or_else(|| ctx.request_meta.clone());
         let (owned_ctx, tool_call_notifications_receiver) =
             if let Some(notification_emitter) = ctx.notification_emitter().cloned() {
                 (
@@ -2809,6 +2810,20 @@ impl ExtensionManager {
             }
         }
         parts
+    }
+
+    pub async fn recover_durable_tasks(&self, session_id: &str) -> anyhow::Result<()> {
+        let clients: Vec<_> = self
+            .extensions
+            .lock()
+            .await
+            .values()
+            .map(|extension| extension.get_client())
+            .collect();
+        for client in clients {
+            client.recover_durable_tasks(session_id).await?;
+        }
+        Ok(())
     }
 
     pub async fn has_active_tasks(&self, session_id: &str) -> anyhow::Result<bool> {

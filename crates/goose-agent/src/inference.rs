@@ -537,6 +537,15 @@ impl<S: Sync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> 
                 return yielded_with(usage_effects);
             }
 
+            if !cancelled && !emit.cancel_token().is_cancelled() {
+                if let Some(message) = accumulator.messages_mut().last_mut() {
+                    message.metadata.set_operation_note(
+                        "llm",
+                        "response_completed",
+                        serde_json::json!(true),
+                    );
+                }
+            }
             usage_effects.extend(accumulator.into_iter().map(|message| E::from(message)));
             applied(usage_effects)
         }
@@ -548,6 +557,101 @@ impl<S: Sync, E: InferenceEffect> Inference<S, E> for InferenceRunner<'_, S, E> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    enum BoundaryEffect {
+        Message(Box<Message>),
+        Usage,
+    }
+    impl From<Message> for BoundaryEffect {
+        fn from(message: Message) -> Self {
+            Self::Message(Box::new(message))
+        }
+    }
+    impl InferenceEffect for BoundaryEffect {
+        fn record_usage(_: ProviderUsage) -> Self {
+            Self::Usage
+        }
+    }
+    struct BoundaryProvider {
+        fail_after_prefix: bool,
+    }
+    #[async_trait]
+    impl Provider for BoundaryProvider {
+        fn get_name(&self) -> &str {
+            "boundary-test"
+        }
+        async fn stream(
+            &self,
+            _: &ModelConfig,
+            _: &str,
+            _: &[Message],
+            _: &[rmcp::model::Tool],
+        ) -> std::result::Result<goose_provider_types::base::MessageStream, ProviderError> {
+            let first = Ok((
+                Some(
+                    Message::assistant()
+                        .with_text("first complete message")
+                        .with_id("first"),
+                ),
+                None,
+            ));
+            let second = if self.fail_after_prefix {
+                Err(ProviderError::NetworkError("failed after prefix".into()))
+            } else {
+                Ok((
+                    Some(
+                        Message::assistant()
+                            .with_text("second complete message")
+                            .with_id("second"),
+                    ),
+                    None,
+                ))
+            };
+            Ok(Box::pin(futures::stream::iter([first, second])))
+        }
+    }
+    #[tokio::test]
+    async fn inference_completion_note_requires_successful_stream_exhaustion() -> Result<()> {
+        for fail_after_prefix in [false, true] {
+            let provider = Arc::new(BoundaryProvider { fail_after_prefix });
+            let runner: InferenceRunner<'_, (), BoundaryEffect> =
+                InferenceRunner::new(provider, ModelConfig::new("test-model"));
+            let conversation =
+                Conversation::new_unvalidated([Message::user().with_text("accepted request")]);
+            let (sender, _receiver) = tokio::sync::mpsc::channel(32);
+            let emit = Emitter::new(sender, tokio_util::sync::CancellationToken::new());
+            let OperationResult::Applied(result) = runner
+                .infer(&(), &conversation, InferenceInput::default(), &emit)
+                .await?
+            else {
+                panic!("inference should apply")
+            };
+            let messages: Vec<_> = result
+                .effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    BoundaryEffect::Message(message) => Some(message),
+                    _ => None,
+                })
+                .collect();
+            let completed: Vec<_> = messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .metadata
+                        .operation_note("llm", "response_completed")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                })
+                .collect();
+            assert_eq!(completed.len(), usize::from(!fail_after_prefix));
+            if !fail_after_prefix {
+                assert_eq!(messages.len(), 2);
+                assert_eq!(completed[0].id.as_deref(), Some("second"));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn provider_session_id_comes_only_from_latest_inference() {

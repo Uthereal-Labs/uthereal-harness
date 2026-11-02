@@ -41,6 +41,14 @@ impl Operation<Session, GooseEffect> for MailboxOperation<'_> {
         conversation: &Conversation,
         _emit: &Emitter,
     ) -> Result<OperationResult<GooseEffect>> {
+        if session.session_type != crate::session::SessionType::SubAgent
+            && crate::session::durable::enabled(&session.id)
+            && crate::session::durable::pending_response_receipt(conversation, &session.id)?
+                .is_some_and(|receipt| !receipt.processed)
+        {
+            return not_applicable();
+        }
+
         let messages = messages_since_kickoff(conversation)?;
         let between_turns = ends_turn(messages)
             || matches!(

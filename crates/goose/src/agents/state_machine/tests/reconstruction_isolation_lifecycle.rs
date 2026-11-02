@@ -152,9 +152,9 @@ async fn reconstruction_and_session_isolation() -> Result<()> {
         .apply()
         .await?;
     let pipeline = pipeline.reconstruct().await?;
-    api.on("try the restored calculator").call(ADD, value(1));
-    let next_tool_call_id = format!("dummy-tool-call-{}", api.call_count() + 1);
-    api.on(next_tool_call_id)
+    api.on("try the restored calculator")
+        .calls([("restored-calculator-call", ADD, value(1))]);
+    api.on("restored-calculator-call")
         .reply("chat mode kept the tool idle");
     let chat = pipeline.run(["try the restored calculator"]).await?;
     chat.assert_message(-2, ToolResponse, CHAT_MODE_TOOL_SKIPPED_RESPONSE);

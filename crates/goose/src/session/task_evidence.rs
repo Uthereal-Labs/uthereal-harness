@@ -25,6 +25,24 @@ const TOOL_BLOCK_LIMIT: i64 = 1024;
 const RECEIPT_LIMIT: usize = 128;
 const STRUCTURED_RESULT_LIMIT: usize = 32768;
 const RESPONSE_LIMIT: usize = 262144;
+
+fn project_task_execution(
+    mut admission: TaskAdmission,
+    execution: Option<&serde_json::Value>,
+) -> Result<TaskAdmission> {
+    if let Some(execution) = execution {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Binding {
+            parent_run_id: String,
+            attempt_key: Option<String>,
+        }
+        let binding: Binding = serde_json::from_value(execution.clone())?;
+        admission.parent_run_id = Some(binding.parent_run_id);
+        admission.attempt_key = binding.attempt_key;
+    }
+    Ok(admission)
+}
 const NOTICE_TEXT_LIMIT: usize = 65536;
 const EDITOR_RESULT_LIMIT: usize = 16384;
 
@@ -165,7 +183,16 @@ impl SessionManager {
                 bail!("Task admission ownership does not match the child session");
             }
         }
-        Ok(admission)
+        admission
+            .map(|admission| {
+                project_task_execution(
+                    admission,
+                    child
+                        .extension_data
+                        .get_extension_state("summon", "task_execution_v1"),
+                )
+            })
+            .transpose()
     }
 
     /// Seal admission only after every accepted channel notice is durable in
@@ -294,11 +321,14 @@ impl SessionManager {
         let parent_run_id = request.parent_run_id.clone();
         if let Some(cursor) = &request.after_task_id {
             let admission = self.task_admission(cursor).await?;
-            if !admission.is_some_and(|a| {
-                a.parent_session_id == parent_session_id
-                    && a.parent_run_id.as_deref() == Some(&parent_run_id)
-                    && a.attempt_key.as_deref() == attempt_key.as_deref()
-            }) {
+            let execution: bool = sqlx::query_scalar(r#"SELECT EXISTS(SELECT 1 FROM sessions WHERE id=? AND parent_session_id=? AND json_extract(extension_data, '$."summon.task_execution_v1".parentRunId')=? AND json_extract(extension_data, '$."summon.task_execution_v1".attemptKey') IS ?)"#).bind(cursor).bind(&parent_session_id).bind(&parent_run_id).bind(&attempt_key).fetch_one(pool).await?;
+            if !execution
+                && !admission.is_some_and(|a| {
+                    a.parent_session_id == parent_session_id
+                        && a.parent_run_id.as_deref() == Some(&parent_run_id)
+                        && a.attempt_key.as_deref() == attempt_key.as_deref()
+                })
+            {
                 bail!("Task evidence cursor does not belong to this attempt");
             }
         }
@@ -306,8 +336,8 @@ impl SessionManager {
             r#"SELECT id, extension_data, json_extract(extension_data, '$."summon.task_admission_v1"') AS admission
              FROM sessions WHERE parent_session_id = ? AND id > ? AND (? IS NULL OR id = ?)
               AND json_extract(extension_data, '$."summon.task_admission_v1".parentSessionId') = ?
-              AND json_extract(extension_data, '$."summon.task_admission_v1".parentRunId') = ?
-              AND json_extract(extension_data, '$."summon.task_admission_v1".attemptKey') IS ?
+              AND COALESCE(json_extract(extension_data, '$."summon.task_execution_v1".parentRunId'), json_extract(extension_data, '$."summon.task_admission_v1".parentRunId')) = ?
+              AND COALESCE(json_extract(extension_data, '$."summon.task_execution_v1".attemptKey'), json_extract(extension_data, '$."summon.task_admission_v1".attemptKey')) IS ?
               AND json_extract(extension_data, '$."summon.task_admission_v1".taskId') = id
              ORDER BY id LIMIT ?"#,
         )
@@ -336,6 +366,10 @@ impl SessionManager {
             let task_id: String = row.try_get("id")?;
             let admission: TaskAdmission =
                 serde_json::from_str(&row.try_get::<String, _>("admission")?)?;
+            let extension_data: serde_json::Value =
+                serde_json::from_str(&row.try_get::<String, _>("extension_data")?)?;
+            let execution = extension_data.get("summon.task_execution_v1");
+            let admission = project_task_execution(admission, execution)?;
             let outcome_json: Option<String> = sqlx::query_scalar(
                 "SELECT outcome_json FROM session_mailbox
                  WHERE sender_session_id = ? AND recipient_session_id = ? AND kind = 'completion'
@@ -346,15 +380,16 @@ impl SessionManager {
             .fetch_optional(pool)
             .await?
             .flatten();
-            let outcome: Option<TaskOutcome> = outcome_json
+            let mut outcome: Option<TaskOutcome> = outcome_json
                 .as_deref()
                 .map(serde_json::from_str)
                 .transpose()?;
+            if let Some(outcome) = &mut outcome {
+                outcome.admission = project_task_execution(outcome.admission.clone(), execution)?;
+            }
             if outcome.as_ref().is_some_and(|o| o.admission != admission) {
                 bail!("Task outcome does not match its immutable admission");
             }
-            let extension_data: serde_json::Value =
-                serde_json::from_str(&row.try_get::<String, _>("extension_data")?)?;
             let policy = &extension_data["summon.v1"];
             let reference_artifacts = self
                 .task_references(&response.parent_session_id, &task_id, policy)
@@ -395,6 +430,8 @@ impl SessionManager {
     /// until its finish checkpoint seals notice admission. Fresh notices after
     /// that checkpoint are `not_running`; retries of accepted dedupe keys remain
     /// `queued`, including after delivery, so callers can acknowledge lost replies.
+    /// Parked or interrupted durable executions return `not_running` without local
+    /// writes; accepted notices remain in their checkpoint for the next resume.
     pub async fn queue_task_notice(
         &self,
         request: &TaskNoticeRequest,
@@ -427,27 +464,42 @@ impl SessionManager {
             bail!("Invalid task notice request");
         }
         let pool = self.storage().pool().await?;
-        // Acquire the SQLite writer before checking terminal state; completion
-        // insertion uses the same writer lock and cannot interleave admission.
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let binding: Option<(String, String)> = sqlx::query_as(
             "SELECT session_id, run_id FROM prompt_attempts
              WHERE attempt_key = ? AND session_id IS NOT NULL AND run_id IS NOT NULL",
         )
         .bind(&request.attempt_key)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(pool)
         .await?;
         let Some((parent_session_id, parent_run_id)) = binding else {
             bail!("Attempt does not own a parent session and run");
         };
+        let durable: bool = sqlx::query_scalar(r#"SELECT json_extract(extension_data, '$."durable.execution_v1"') IS NOT NULL FROM sessions WHERE id=?"#).bind(&parent_session_id).fetch_one(pool).await?;
+        // Durable checkpoints also acquire SQLite while holding the runtime lock.
+        // Keep that order and hold the runtime through admission and checkpointing.
+        let mut checkpoint = if durable {
+            let Some(checkpoint) =
+                super::durable::task_notice_checkpoint(&parent_session_id).await?
+            else {
+                return Ok(TaskNoticeResponse {
+                    status: TaskNoticeStatus::NotRunning,
+                    task_id: None,
+                });
+            };
+            Some(checkpoint)
+        } else {
+            None
+        };
+        // Completion insertion shares this writer lock and cannot interleave admission.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(dedupe_key) = &request.dedupe_key {
             let accepted: Option<String> = sqlx::query_scalar(
                 r#"SELECT s.id FROM sessions s JOIN session_mailbox m ON m.recipient_session_id = s.id
                    WHERE m.sender_session_id = ? AND m.kind = 'channel' AND m.dedupe_key = ?
                    AND s.parent_session_id = ?
                    AND json_extract(s.extension_data, '$."summon.task_admission_v1".parentSessionId') = ?
-                   AND json_extract(s.extension_data, '$."summon.task_admission_v1".parentRunId') = ?
-                   AND json_extract(s.extension_data, '$."summon.task_admission_v1".attemptKey') = ?
+                   AND COALESCE(json_extract(s.extension_data, '$."summon.task_execution_v1".parentRunId'), json_extract(s.extension_data, '$."summon.task_admission_v1".parentRunId')) = ?
+                   AND COALESCE(json_extract(s.extension_data, '$."summon.task_execution_v1".attemptKey'), json_extract(s.extension_data, '$."summon.task_admission_v1".attemptKey')) = ?
                    AND json_extract(s.extension_data, '$."summon.task_admission_v1".taskId') = s.id
                    AND (s.id = ? OR json_extract(s.extension_data, '$."summon.v1".artifact_key') IN (SELECT value FROM json_each(?)))
                    LIMIT 1"#,
@@ -457,6 +509,9 @@ impl SessionManager {
              .fetch_optional(&mut *tx).await?;
             if let Some(task_id) = accepted {
                 tx.commit().await?;
+                if let Some(checkpoint) = &mut checkpoint {
+                    checkpoint.commit().await?;
+                }
                 return Ok(TaskNoticeResponse {
                     status: TaskNoticeStatus::Queued,
                     task_id: Some(task_id),
@@ -468,8 +523,8 @@ impl SessionManager {
              WHERE parent_session_id = ?
               AND COALESCE(json_extract(extension_data, '$."summon.notice_closed_v1"'), 0) = 0
               AND json_extract(extension_data, '$."summon.task_admission_v1".parentSessionId') = ?
-              AND json_extract(extension_data, '$."summon.task_admission_v1".parentRunId') = ?
-              AND json_extract(extension_data, '$."summon.task_admission_v1".attemptKey') = ?
+              AND COALESCE(json_extract(extension_data, '$."summon.task_execution_v1".parentRunId'), json_extract(extension_data, '$."summon.task_admission_v1".parentRunId')) = ?
+              AND COALESCE(json_extract(extension_data, '$."summon.task_execution_v1".attemptKey'), json_extract(extension_data, '$."summon.task_admission_v1".attemptKey')) = ?
               AND json_extract(extension_data, '$."summon.task_admission_v1".taskId') = id
               AND (id = ? OR json_extract(extension_data, '$."summon.v1".artifact_key') IN (SELECT value FROM json_each(?)))
               AND NOT EXISTS (
@@ -520,6 +575,9 @@ impl SessionManager {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        if let Some(checkpoint) = &mut checkpoint {
+            checkpoint.commit().await?;
+        }
         Ok(TaskNoticeResponse {
             status: TaskNoticeStatus::Queued,
             task_id: Some(task_id),
