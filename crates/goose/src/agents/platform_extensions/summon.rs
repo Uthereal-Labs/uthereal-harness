@@ -48,6 +48,66 @@ pub fn tool_result_ends_turn(result: &CallToolResult) -> bool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
 }
+
+/// Park only a complete delegation batch whose reports will wake its parent.
+/// Result metadata describes actual admission, including forced async tasks.
+pub fn delegation_batch_ends_turn(messages: &[Message]) -> bool {
+    let mut results = HashMap::new();
+    let mut previous = messages.iter().rev();
+    let request_message = loop {
+        let Some(message) = previous.next() else {
+            return false;
+        };
+        if !message.is_tool_response() {
+            break message;
+        }
+        for content in &message.content {
+            if let MessageContent::ToolResponse(response) = content {
+                let Ok(result) = &response.tool_result else {
+                    return false;
+                };
+                let admitted = result.structured_content.as_ref().is_some_and(|value| {
+                    value.get("task_status").and_then(serde_json::Value::as_str) == Some("running")
+                        && value
+                            .get("taskAdmission")
+                            .is_some_and(serde_json::Value::is_object)
+                        && value
+                            .get("automatic_report_delivery")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                });
+                if result.is_error == Some(true)
+                    || !admitted
+                    || results.insert(response.id.as_str(), ()).is_some()
+                {
+                    return false;
+                }
+            }
+        }
+    };
+    let mut count = 0;
+    let mut ready_to_wait = false;
+    for content in &request_message.content {
+        if let MessageContent::ToolRequest(request) = content {
+            let Ok(call) = &request.tool_call else {
+                return false;
+            };
+            if !matches!(call.name.as_ref(), "delegate" | "summon__delegate")
+                || !results.contains_key(request.id.as_str())
+            {
+                return false;
+            }
+            count += 1;
+            ready_to_wait |= call
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("yield_after_delegation"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+        }
+    }
+    ready_to_wait && count > 0 && count == results.len()
+}
 use tokio::sync::Mutex;
 
 use tokio::task::JoinHandle;
@@ -2339,6 +2399,11 @@ impl SummonClient {
                     "type": "boolean",
                     "default": false,
                     "description": "Run in background (default: false)."
+                },
+                "yield_after_delegation": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Set true on the final delegation only when all intended tasks are launched in this batch and independent work, channel setup, and user announcements are complete. After the whole batch succeeds asynchronously, the runtime parks the parent until an automatic report or new input arrives, without another model call to wait. Leave false when more work or delegation remains."
                 }
             }
         });
@@ -3438,6 +3503,7 @@ impl SummonClient {
                 "subagent_session_id": task_id,
                 "task_status": "running",
                 "taskAdmission": admission,
+                "automatic_report_delivery": self.event_driven_parents.lock().await.contains(session_id),
             }));
             return Ok(result);
         }
@@ -4630,7 +4696,7 @@ impl SummonClient {
             let mut content = vec![ContentBlock::text(format!(
                 "Task {task_id} started in background: \"{description}\"\n\
                  It already has its complete task and reports back automatically: you are resumed for its terminal report or for a question it asks. \
-                 Once you have delegated everything and finished any independent work, tell the user once, in their terms, what you are working on, then call wait. \
+                 A successful delegation-only batch with yield_after_delegation parks you automatically. Otherwise finish any remaining delegation and independent work, then call wait. \
                  Use send(task_id: \"{task_id}\", message: \"...\") only to steer it with new guidance or answer its question."
             ))];
             if let Some(key) = artifact.as_deref() {

@@ -3723,6 +3723,8 @@ impl Agent {
                 }
                 conversation.extend(messages_to_add);
 
+                exit_chat |= super::platform_extensions::summon::delegation_batch_ends_turn(conversation.messages());
+
                 if exit_chat && (self.has_pending_steers(&session_config.id).await || session_manager.pending_session_messages(&session_config.id).await?.iter().any(|message| session.session_type == SessionType::SubAgent || message.kind == crate::session::MailboxMessageKind::Steering)) {
                     exit_chat = false;
                 }
