@@ -660,13 +660,17 @@ impl SessionManager {
                     json_extract(c.value, '$.toolResult.value.isError') AS is_error,
                     CASE WHEN json_type(c.value, '$.toolResult.value.structuredContent') IS NOT NULL
                          AND length(CAST(json_quote(json_extract(c.value, '$.toolResult.value.structuredContent')) AS BLOB)) <= ?
-                         THEN json_quote(json_extract(c.value, '$.toolResult.value.structuredContent')) END AS structured_result,
+                         THEN json_quote(json_extract(c.value, '$.toolResult.value.structuredContent'))
+                         WHEN json_type(c.value, '$.toolResult.value.structuredContent.execution_usage_facts') = 'object'
+                         AND length(CAST(json_object('execution_usage_facts', json_extract(c.value, '$.toolResult.value.structuredContent.execution_usage_facts')) AS BLOB)) <= ?
+                         THEN json_object('execution_usage_facts', json_extract(c.value, '$.toolResult.value.structuredContent.execution_usage_facts')) END AS structured_result,
                     CASE WHEN length(CAST(json_quote(json_extract(c.value, '$.toolResult.value.structuredContent')) AS BLOB)) > ? THEN 1 ELSE 0 END AS oversized
              FROM messages m, json_each(m.content_json) c WHERE m.session_id = ?
               AND json_extract(c.value, '$.type') = 'toolResponse'
               AND json_extract(c.value, '$.id') IN (SELECT value FROM json_each(?))
              ORDER BY m.id, CAST(c.key AS INTEGER) LIMIT ?",
         )
+        .bind(STRUCTURED_RESULT_LIMIT as i64)
         .bind(STRUCTURED_RESULT_LIMIT as i64)
         .bind(STRUCTURED_RESULT_LIMIT as i64)
         .bind(task_id)
