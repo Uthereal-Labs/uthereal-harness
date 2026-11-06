@@ -1088,3 +1088,46 @@ async fn unfenced_native_runs_keep_scoped_child_receipts_after_reconstruction() 
     reconstructed.delete_session(&parent).await.unwrap();
     assert!(reconstructed.run_task_evidence(&query).await.is_err());
 }
+
+#[tokio::test]
+async fn oversized_research_retains_bounded_source_facts_with_partial_coverage() {
+    let f = Fixture::new().await;
+    let child = f.child().await;
+    let facts = json!({"version":2,"observations":{"version":1,"coverage":"complete","web_operations":[{"operation":"search","outcome":"success","reason_code":"completed","count":2}]}});
+    f.call(
+        &child.task_id,
+        "research",
+        "selected",
+        json!({"answer":"private".repeat(6000),"execution_usage_facts":facts}),
+    )
+    .await;
+    f.call(
+        &child.task_id,
+        "oversized-facts",
+        "selected",
+        json!({"execution_usage_facts":{"value":"x".repeat(33000)}}),
+    )
+    .await;
+    let evidence = f
+        .manager
+        .task_evidence(&f.request(&["selected"]))
+        .await
+        .unwrap();
+    let task = &evidence.tasks[0];
+    assert!(!task.evidence_complete);
+    let receipt = task
+        .receipts
+        .iter()
+        .find(|row| row.call_id == "research")
+        .unwrap();
+    assert_eq!(
+        receipt.structured_result,
+        Some(json!({"execution_usage_facts":facts}))
+    );
+    let overflow = task
+        .receipts
+        .iter()
+        .find(|row| row.call_id == "oversized-facts")
+        .unwrap();
+    assert!(overflow.structured_result.is_none());
+}
