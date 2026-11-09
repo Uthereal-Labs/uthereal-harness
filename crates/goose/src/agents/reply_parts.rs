@@ -456,7 +456,7 @@ pub(crate) async fn stream_response_from_provider_in_span(
         // The stream is consumed after this function returned, outside the
         // span; stamp the span's end when the stream is finished or dropped.
         let _end_span = gen_ai_telemetry::EndSpanOnDrop::new(span.clone());
-        if !provider.manages_own_context() {
+        if !provider.manages_own_context() && !provider.owns_stream_recovery() {
             let retry_config = provider.retry_config().transient_only();
             let mut attempts = 0;
 
@@ -2004,6 +2004,7 @@ mod tests {
         responses: Mutex<std::collections::VecDeque<Result<Vec<TestStreamItem>, ProviderError>>>,
         calls: Arc<std::sync::atomic::AtomicUsize>,
         manages_context: bool,
+        owns_recovery: bool,
     }
 
     impl SequencedProvider {
@@ -2012,6 +2013,7 @@ mod tests {
                 responses: Mutex::new(responses.into()),
                 calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 manages_context: false,
+                owns_recovery: false,
             }
         }
 
@@ -2033,6 +2035,10 @@ mod tests {
 
         fn manages_own_context(&self) -> bool {
             self.manages_context
+        }
+
+        fn owns_stream_recovery(&self) -> bool {
+            self.owns_recovery
         }
 
         async fn stream(
@@ -2133,6 +2139,19 @@ mod tests {
         let calls = provider.calls.clone();
         let mut stream = stream_for_test(provider).await;
 
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ProviderError::NetworkError(_))
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_owned_recovery_does_not_acquire_another_allowance() {
+        let mut provider = SequencedProvider::new(vec![Ok(vec![Err(transient_error())])]);
+        provider.owns_recovery = true;
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(Arc::new(provider)).await;
         assert!(matches!(
             stream.next().await.unwrap(),
             Err(ProviderError::NetworkError(_))

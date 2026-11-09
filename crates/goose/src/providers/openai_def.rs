@@ -4,7 +4,7 @@ use goose_providers::base::ProviderDescriptor;
 use std::collections::HashMap;
 
 use crate::config::declarative_providers::DeclarativeProviderConfig;
-use crate::config::Config;
+use crate::config::{Config, ConfigError};
 use crate::providers::base::{ProviderDef, DEFAULT_PROVIDER_TIMEOUT_SECS};
 use crate::providers::command_auth::CommandAuthProvider;
 use crate::providers::custom_provider_config::ConfigKeyResolver;
@@ -93,6 +93,19 @@ pub async fn from_env(
             .unwrap_or_else(|_| default_bp())
     };
 
+    let prepared_request_max_attempts =
+        match config.get_param::<usize>("OPENAI_PREPARED_REQUEST_MAX_ATTEMPTS") {
+            Ok(attempts) => Some(attempts),
+            Err(ConfigError::NotFound(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
+    if let Some(attempts) = prepared_request_max_attempts {
+        anyhow::ensure!(
+            (1..=2).contains(&attempts),
+            "OPENAI_PREPARED_REQUEST_MAX_ATTEMPTS must be 1 or 2"
+        );
+    }
+
     let is_openai = is_direct_openai_host(&parsed.host);
     let secrets = config
         .get_secrets("OPENAI_API_KEY", &["OPENAI_CUSTOM_HEADERS"])
@@ -168,6 +181,7 @@ pub async fn from_env(
     }
 
     let provider = OpenAiProviderBuilder::new(api_client)
+        .prepared_request_max_attempts(prepared_request_max_attempts)
         .base_path(base_path)
         .organization(organization)
         .project(project)
@@ -334,6 +348,121 @@ fn is_direct_openai_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn numeric_env_policy_controls_actual_provider_recovery_and_wire_reasoning() -> Result<()>
+    {
+        use goose_providers::base::collect_stream;
+        use goose_providers::conversation::message::Message;
+        use goose_providers::thinking::ThinkingEffort;
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let base_url = format!("{}/openai/v1", server.uri());
+        let _env = env_lock::lock_env([
+            ("OPENAI_PREPARED_REQUEST_MAX_ATTEMPTS", Some("2")),
+            ("OPENAI_BASE_URL", Some(base_url.as_str())),
+            ("OPENAI_HOST", None),
+            ("OPENAI_BASE_PATH", Some("v1/responses")),
+            ("OPENAI_AUTH_MODE", Some("api_key")),
+            ("OPENAI_API_KEY", Some("local-test-key")),
+            ("OPENAI_CUSTOM_HEADERS", Some("")),
+            ("GOOSE_THINKING_EFFORT", Some("low")),
+            ("GOOSE_MAX_TOKENS", Some("16384")),
+            ("GOOSE_CONTEXT_LIMIT", Some("128000")),
+            ("GOOSE_SUPPORTS_VISION", Some("true")),
+        ]);
+        let registry = crate::providers::provider_registry::ProviderRegistry::new(None)
+            .with_providers(|registry| registry.register::<OpenAiProviderDef>(true));
+        let provider = registry
+            .entries
+            .get("openai")
+            .unwrap()
+            .create(Vec::new())
+            .await?;
+        assert!(
+            provider.owns_stream_recovery(),
+            "numeric environment policy must not silently disappear"
+        );
+        let model =
+            crate::model_config::model_config_from_user_config("openai", "gpt-6-luna-prod")?;
+        assert_eq!(model.thinking_effort(), Some(ThinkingEffort::Low));
+        let completed = format!(
+            "data: {}\n\n",
+            json!({"type":"response.completed", "sequence_number":1,
+            "response":{"id":"resp_env", "object":"response", "created_at":1, "status":"completed",
+            "model":"gpt-6-luna-prod", "output":[], "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}})
+        );
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(completed, "text/event-stream"))
+            .mount(&server)
+            .await;
+        for model in [
+            model.clone(),
+            model.with_thinking_effort(ThinkingEffort::Off),
+        ] {
+            collect_stream(
+                provider
+                    .stream(&model, "", &[Message::user().with_text("hello")], &[])
+                    .await?,
+            )
+            .await?;
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for (request, effort) in requests.iter().zip(["low", "none"]) {
+            let payload: serde_json::Value = request.body_json()?;
+            assert_eq!(payload["model"], "gpt-6-luna-prod");
+            assert_eq!(payload["reasoning"]["effort"], effort);
+            assert_eq!(payload["max_output_tokens"], 16384);
+        }
+
+        server.reset().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/openai/v1/responses"))
+            .respond_with(move |_: &Request| {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_raw("", "text/event-stream")
+                }
+            })
+            .mount(&server)
+            .await;
+        let model =
+            crate::model_config::model_config_from_user_config("openai", "gpt-6-luna-prod")?;
+        assert!(provider.stream(&model, "", &[], &[]).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_prepared_request_policy_never_silently_uses_generic_retries() {
+        for value in ["invalid", "0", "3", "-1"] {
+            let _env = env_lock::lock_env([
+                ("OPENAI_PREPARED_REQUEST_MAX_ATTEMPTS", Some(value)),
+                ("OPENAI_BASE_URL", Some("https://example.invalid/openai/v1")),
+                ("OPENAI_HOST", None),
+                ("OPENAI_BASE_PATH", Some("v1/responses")),
+                ("OPENAI_AUTH_MODE", Some("api_key")),
+                ("OPENAI_API_KEY", Some("local-test-key")),
+                ("OPENAI_CUSTOM_HEADERS", Some("")),
+            ]);
+            let error = from_env(None).await.unwrap_err().to_string();
+            assert!(
+                error.contains("OPENAI_PREPARED_REQUEST_MAX_ATTEMPTS")
+                    || error.contains("expected usize"),
+                "invalid policy {value} failed for an unrelated reason: {error}"
+            );
+        }
+    }
 
     #[test]
     fn parse_base_url_strips_v1_from_standard_openai_url() {

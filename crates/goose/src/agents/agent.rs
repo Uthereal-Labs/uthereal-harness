@@ -5949,6 +5949,160 @@ echo start >> "$PLUGIN_ROOT/hook.log"
     }
 
     #[tokio::test]
+    async fn prepared_responses_attempt_traces_distinguish_progress_and_cancellation() -> Result<()>
+    {
+        use goose_providers::api_client::{ApiClient, AuthMethod};
+        use goose_providers::openai::OpenAiProviderBuilder;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for cancel in [false, true] {
+            let capture = SpanFieldCapture::new("azure.responses.attempt");
+            let _subscriber = capture.clone().set_default();
+            let server = MockServer::start().await;
+            let body = [
+                ": network-heartbeat\n\n",
+                "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"private-reasoning-secret\"}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_test\",\"output_index\":0,\"content_index\":0,\"delta\":\"answer\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_test\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"model\":\"gpt-6-luna-prod\",\"output\":[]}}\n\n",
+            ].concat();
+            Mock::given(method("POST"))
+                .and(path("/openai/v1/responses"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+                .mount(&server)
+                .await;
+            let provider = OpenAiProviderBuilder::new(ApiClient::with_timeout_and_tls(
+                format!("{}/openai", server.uri()),
+                AuthMethod::BearerToken("private-api-key-secret".into()),
+                std::time::Duration::from_secs(60),
+                None,
+            )?)
+            .base_path("v1/responses")
+            .prepared_request_max_attempts(Some(2))
+            .build();
+            let model = goose_providers::model::ModelConfig::new("gpt-6-luna-prod");
+            let mut stream = provider.stream(&model, "", &[], &[]).await?;
+            assert!(stream.next().await.transpose()?.is_some());
+            if cancel {
+                drop(stream);
+            } else {
+                while stream.next().await.transpose()?.is_some() {}
+            }
+            let fields = capture.fields();
+            assert_eq!(fields["physical_attempt"], serde_json::json!(1));
+            assert_eq!(fields["deployment"], serde_json::json!("gpt-6-luna-prod"));
+            assert_eq!(
+                fields["outcome"],
+                serde_json::json!(if cancel { "cancelled" } else { "completed" })
+            );
+            for key in [
+                "headers_received_ms",
+                "first_network_activity_ms",
+                "last_network_activity_ms",
+                "first_provider_progress_ms",
+                "first_downstream_output_ms",
+                "completion_ms",
+            ] {
+                assert!(
+                    fields[key].is_number(),
+                    "missing measurement {key}: {fields:?}"
+                );
+            }
+            assert!(
+                fields["first_provider_progress_ms"].as_f64().unwrap()
+                    <= fields["first_downstream_output_ms"].as_f64().unwrap()
+            );
+            let serialized = serde_json::to_string(&fields)?;
+            assert!(!serialized.contains("private-reasoning-secret"));
+            assert!(!serialized.contains("private-api-key-secret"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_agent_loops_preserve_prepared_responses_attempt_budget() -> Result<()> {
+        use goose_providers::api_client::{ApiClient, AuthMethod};
+        use goose_providers::openai::OpenAiProviderBuilder;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        for use_state_machine in [false, true] {
+            let server = MockServer::start().await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            Mock::given(method("POST"))
+                .and(path("/openai/v1/responses"))
+                .respond_with(move |_: &Request| {
+                    if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                        ResponseTemplate::new(503)
+                    } else {
+                        ResponseTemplate::new(200).set_body_raw("", "text/event-stream")
+                    }
+                })
+                .mount(&server)
+                .await;
+            let provider = Arc::new(
+                OpenAiProviderBuilder::new(ApiClient::with_timeout_and_tls(
+                    format!("{}/openai", server.uri()),
+                    AuthMethod::BearerToken("local-test".into()),
+                    std::time::Duration::from_secs(60),
+                    None,
+                )?)
+                .base_path("v1/responses")
+                .prepared_request_max_attempts(Some(2))
+                .build(),
+            );
+            let directory = tempfile::tempdir()?;
+            let manager = Arc::new(SessionManager::new(directory.path().to_path_buf()));
+            let agent = Agent::with_config(AgentConfig::new(
+                manager.clone(),
+                Arc::new(PermissionManager::new(directory.path().to_path_buf())),
+                None,
+                GooseMode::Auto,
+                true,
+                GoosePlatform::GooseCli,
+            ));
+            let session = manager
+                .create_session(
+                    directory.path().to_path_buf(),
+                    "bounded-responses".into(),
+                    SessionType::Hidden,
+                    GooseMode::Auto,
+                )
+                .await?;
+            agent
+                .update_provider(
+                    provider,
+                    goose_providers::model::ModelConfig::new("gpt-6-luna-prod")
+                        .with_context_limit(Some(128000)),
+                    &session.id,
+                )
+                .await?;
+            let stream = agent
+                .reply(
+                    Message::user().with_text("hello"),
+                    SessionConfig {
+                        id: session.id,
+                        schedule_id: None,
+                        max_turns: Some(1),
+                        retry_config: None,
+                    },
+                    use_state_machine,
+                    None,
+                )
+                .await?;
+            tokio::pin!(stream);
+            while stream.next().await.is_some() {}
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "loop state_machine={use_state_machine} acquired another physical allowance"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn both_agent_loops_deliver_mailbox_guidance_at_safe_checkpoints() -> Result<()> {
         for use_state_machine in [false, true] {
             let temp_dir = tempfile::tempdir()?;

@@ -35,6 +35,9 @@ pub enum ProviderError {
     #[error("Invalid value: {0}")]
     InvalidValue(String),
 
+    #[error("Provider protocol error: {0}")]
+    ProtocolError(String),
+
     #[error("Execution error: {0}")]
     ExecutionError(String),
 
@@ -76,6 +79,7 @@ impl ProviderError {
             ProviderError::RequestFailed(_) => "request",
             ProviderError::InvalidValue(_) => "invalid_value",
             ProviderError::ExecutionError(_) => "execution",
+            ProviderError::ProtocolError(_) => "protocol",
             ProviderError::UsageError(_) => "usage",
             ProviderError::NotImplemented(_) => "not_implemented",
             ProviderError::EndpointNotFound(_) => "endpoint_not_found",
