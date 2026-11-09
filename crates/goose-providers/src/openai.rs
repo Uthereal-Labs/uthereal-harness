@@ -18,7 +18,8 @@ use crate::formats::openai_responses::{
 use crate::http_status::read_json_response;
 use crate::images::ImageFormat;
 use crate::openai_compatible::{
-    handle_response_openai_compat, handle_status, stream_openai_compat, stream_responses_compat,
+    handle_response_openai_compat, handle_status, stream_openai_compat, stream_prepared_responses,
+    stream_responses_compat,
 };
 use crate::request_log::{start_log, LoggerHandleExt};
 use crate::thinking::ThinkingEffort;
@@ -29,6 +30,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 use crate::base::{MessageStream, ProviderDescriptor};
 use crate::model::ModelConfig;
@@ -167,6 +169,8 @@ pub struct OpenAiProvider {
     dynamic_models: Option<bool>,
     skip_canonical_filtering: bool,
     preserve_thinking_context: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prepared_request_max_attempts: Option<usize>,
     #[serde(skip)]
     n_ctx_cache: Arc<Mutex<HashMap<String, CachedContextLimit>>>,
 }
@@ -188,6 +192,7 @@ pub struct OpenAiProviderBuilder {
     dynamic_models: Option<bool>,
     skip_canonical_filtering: bool,
     preserve_thinking_context: bool,
+    prepared_request_max_attempts: Option<usize>,
 }
 
 impl OpenAiProviderBuilder {
@@ -204,6 +209,7 @@ impl OpenAiProviderBuilder {
             dynamic_models: None,
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            prepared_request_max_attempts: None,
         }
     }
 
@@ -275,6 +281,11 @@ impl OpenAiProviderBuilder {
         self
     }
 
+    pub fn prepared_request_max_attempts(mut self, attempts: Option<usize>) -> Self {
+        self.prepared_request_max_attempts = attempts;
+        self
+    }
+
     pub fn build(self) -> OpenAiProvider {
         OpenAiProvider {
             api_client: self.api_client,
@@ -288,7 +299,60 @@ impl OpenAiProviderBuilder {
             dynamic_models: self.dynamic_models,
             skip_canonical_filtering: self.skip_canonical_filtering,
             preserve_thinking_context: self.preserve_thinking_context,
+            prepared_request_max_attempts: self.prepared_request_max_attempts,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+struct PreparedResponseAttempt {
+    span: tracing::Span,
+    started: Instant,
+    finished: bool,
+}
+
+impl PreparedResponseAttempt {
+    fn new(endpoint: &str, model: &ModelConfig, physical_attempt: usize) -> Self {
+        Self {
+            span: tracing::info_span!(
+                "azure.responses.attempt",
+                physical_attempt,
+                endpoint = crate::http_status::sanitize_url(endpoint),
+                deployment = model.model_name,
+                headers_received_ms = tracing::field::Empty,
+                first_network_activity_ms = tracing::field::Empty,
+                last_network_activity_ms = tracing::field::Empty,
+                first_provider_progress_ms = tracing::field::Empty,
+                first_downstream_output_ms = tracing::field::Empty,
+                completion_ms = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+                error_type = tracing::field::Empty,
+                retry_decision = tracing::field::Empty,
+                http.response.status_code = tracing::field::Empty,
+            ),
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.0
+    }
+
+    fn finish(&mut self, outcome: &str, error: Option<&ProviderError>) {
+        self.span.record("outcome", outcome);
+        self.span.record("completion_ms", self.elapsed_ms());
+        if let Some(error) = error {
+            self.span.record("error_type", error.telemetry_type());
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for PreparedResponseAttempt {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish("cancelled", None);
         }
     }
 }
@@ -320,6 +384,11 @@ impl OpenAiProvider {
         model_config: &ModelConfig,
         payload: serde_json::Value,
     ) -> Result<MessageStream, ProviderError> {
+        if let Some(max_attempts) = self.prepared_request_max_attempts {
+            return self
+                .stream_prepared_request(model_config, &payload, max_attempts)
+                .await;
+        }
         let mut log = start_log(model_config, &payload)?;
         let response = self
             .with_retry(|| async {
@@ -387,6 +456,7 @@ impl OpenAiProvider {
             dynamic_models: None,
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            prepared_request_max_attempts: None,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -607,6 +677,105 @@ impl OpenAiProvider {
         })?;
         Ok(parse_n_ctx_from_models(&json, model_name))
     }
+
+    async fn stream_prepared_request(
+        &self,
+        model_config: &ModelConfig,
+        payload: &serde_json::Value,
+        max_attempts: usize,
+    ) -> Result<MessageStream, ProviderError> {
+        use futures::StreamExt;
+        if !self.supports_streaming || !(1..=2).contains(&max_attempts) {
+            return Err(ProviderError::InvalidValue(
+                "Prepared Responses recovery requires streaming and one or two attempts".into(),
+            ));
+        }
+        let retry = crate::retry::RetryConfig::default().transient_only();
+        for physical_attempt in 1..=max_attempts {
+            let mut attempt = PreparedResponseAttempt::new(
+                self.api_client.host(),
+                model_config,
+                physical_attempt,
+            );
+            let log = start_log(model_config, payload)?;
+            let result = async {
+                let response = self
+                    .api_client
+                    .request(&Self::map_base_path(
+                        &self.base_path,
+                        "responses",
+                        OPEN_AI_DEFAULT_RESPONSES_PATH,
+                    ))
+                    .model_headers(model_config)?
+                    .streaming(true)
+                    .response_post(payload)
+                    .await?;
+                attempt
+                    .span
+                    .record("headers_received_ms", attempt.elapsed_ms());
+                attempt
+                    .span
+                    .record("http.response.status_code", response.status().as_u16());
+                if matches!(response.status().as_u16(), 408 | 499) {
+                    return Err(ProviderError::NetworkError(
+                        "Azure request timed out".into(),
+                    ));
+                }
+                let response = handle_status(response).await?;
+                let mut stream = stream_prepared_responses(
+                    response,
+                    log,
+                    attempt.span.clone(),
+                    attempt.started,
+                )?;
+                let first = stream.next().await.transpose()?;
+                Ok::<_, ProviderError>((first, stream))
+            }
+            .instrument(attempt.span.clone())
+            .await;
+            match result {
+                Ok((first, mut stream)) => {
+                    return Ok(Box::pin(async_stream::try_stream! {
+                        if let Some(item) = first {
+                            attempt.span.record("first_downstream_output_ms", attempt.elapsed_ms());
+                            yield item;
+                        }
+                        while let Some(item) = stream.next().instrument(attempt.span.clone()).await {
+                            match item {
+                                Ok(item) => yield item,
+                                Err(error) => {
+                                    attempt.finish("error", Some(&error));
+                                    Err(error)?;
+                                }
+                            }
+                        }
+                        attempt.finish("completed", None);
+                    }));
+                }
+                Err(error) => {
+                    let eligible = crate::retry::should_retry(&error, &retry)
+                        && physical_attempt < max_attempts;
+                    attempt.span.record(
+                        "retry_decision",
+                        if eligible { "retry" } else { "terminal" },
+                    );
+                    attempt.finish("error", Some(&error));
+                    if !eligible {
+                        return Err(error);
+                    }
+                    let delay = match error {
+                        ProviderError::RateLimitExceeded {
+                            retry_delay: Some(delay),
+                            ..
+                        } => delay,
+                        _ => retry.delay_for_attempt(physical_attempt),
+                    };
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+        unreachable!("validated nonempty physical attempt allowance")
+    }
 }
 
 fn parse_model_ids(json: &serde_json::Value) -> Result<Vec<String>, ProviderError> {
@@ -670,6 +839,13 @@ impl ProviderDescriptor for OpenAiProvider {
                 ConfigKey::new("OPENAI_API_KEY", false, true, None, true),
                 ConfigKey::new("OPENAI_BASE_URL", false, false, None, false),
                 ConfigKey::new(
+                    "OPENAI_PREPARED_REQUEST_MAX_ATTEMPTS",
+                    false,
+                    false,
+                    None,
+                    false,
+                ),
+                ConfigKey::new(
                     "OPENAI_HOST",
                     true,
                     false,
@@ -702,6 +878,10 @@ impl ProviderDescriptor for OpenAiProvider {
 impl Provider for OpenAiProvider {
     fn get_name(&self) -> &str {
         &self.name
+    }
+
+    fn owns_stream_recovery(&self) -> bool {
+        self.prepared_request_max_attempts.is_some()
     }
 
     async fn refresh_credentials(&self) -> Result<(), ProviderError> {
@@ -792,13 +972,26 @@ impl Provider for OpenAiProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
+        if self.prepared_request_max_attempts.is_some()
+            && !self.should_use_responses_api_for_provider(&model_config.model_name)
+        {
+            return Err(ProviderError::InvalidValue(
+                "Prepared recovery requires the Responses API".into(),
+            ));
+        }
         if self.should_use_responses_api_for_provider(&model_config.model_name) {
             let (wire_model, _) =
                 crate::formats::openai::extract_reasoning_effort(&model_config.model_name);
+            // Deployment's production suffix is not the canonical model's pro variant.
+            let capability_model = if self.prepared_request_max_attempts.is_some() {
+                wire_model.strip_suffix("-prod").unwrap_or(&wire_model)
+            } else {
+                &model_config.model_name
+            };
             self.stream_for_model(
                 model_config,
                 &wire_model,
-                &model_config.model_name,
+                capability_model,
                 system,
                 messages,
                 tools,
@@ -1035,6 +1228,7 @@ mod tests {
             dynamic_models: None,
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            prepared_request_max_attempts: None,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1502,6 +1696,7 @@ mod tests {
             dynamic_models: Some(true),
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            prepared_request_max_attempts: None,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }

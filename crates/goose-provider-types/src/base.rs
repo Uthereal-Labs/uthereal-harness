@@ -504,6 +504,11 @@ pub trait Provider: Send + Sync {
             .await
     }
 
+    /// Whether this provider bounds HTTP and pre-output stream recovery together.
+    fn owns_stream_recovery(&self) -> bool {
+        false
+    }
+
     fn retry_config(&self) -> RetryConfig {
         RetryConfig::default()
     }

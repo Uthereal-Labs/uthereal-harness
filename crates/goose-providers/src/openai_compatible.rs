@@ -10,7 +10,7 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use tokio::pin;
 use tokio_stream::StreamExt;
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 use tokio_util::io::StreamReader;
 
 use super::api_client::ApiClient;
@@ -23,7 +23,9 @@ use crate::formats::openai::{
     record_response_metadata, response_to_message, response_to_streaming_message,
     OpenAiFormatOptions,
 };
-use crate::formats::openai_responses::responses_api_to_streaming_message;
+use crate::formats::openai_responses::{
+    responses_api_to_streaming_message, responses_api_to_streaming_message_with_protocol_policy,
+};
 use crate::model::ModelConfig;
 use crate::request_log::{start_log, LoggerHandleExt, RequestLogHandle};
 use rmcp::model::Tool;
@@ -278,6 +280,95 @@ pub fn stream_responses_compat(
             )?;
             log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
             yield (message, usage);
+        }
+    }))
+}
+
+pub(crate) fn stream_prepared_responses(
+    response: Response,
+    mut log: Option<Box<dyn RequestLogHandle>>,
+    span: tracing::Span,
+    started: std::time::Instant,
+) -> Result<MessageStream, ProviderError> {
+    let network_span = span.clone();
+    let mut network_started = false;
+    let body = response
+        .bytes_stream()
+        .inspect_ok(move |_| {
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            if !network_started {
+                network_started = true;
+                network_span.record("first_network_activity_ms", elapsed);
+            }
+            network_span.record("last_network_activity_ms", elapsed);
+        })
+        .map_err(|_| {
+            // Byte-stream decoding includes truncated HTTP framing, before JSON parsing.
+            std::io::Error::other(ProviderError::NetworkError(
+                "Responses transport was interrupted".into(),
+            ))
+        });
+    Ok(Box::pin(try_stream! {
+        let reader = StreamReader::new(body);
+        let mut terminal = false;
+        let mut progressed = false;
+        let frames = FramedRead::new(reader, LinesCodec::new()).map(move |line| {
+            let line = line.map_err(|error| {
+                let failure = match &error {
+                    LinesCodecError::Io(error) => {
+                        error.get_ref().and_then(|inner| inner.downcast_ref::<ProviderError>()).cloned()
+                            .unwrap_or_else(|| if error.kind() == std::io::ErrorKind::InvalidData {
+                                ProviderError::ProtocolError("Malformed Responses encoding".into())
+                            } else {
+                                ProviderError::NetworkError("Responses transport was interrupted".into())
+                            })
+                    }
+                    _ => ProviderError::ProtocolError("Malformed Responses framing".into()),
+                };
+                Error::new(failure)
+            })?;
+            let data = line.strip_prefix("data:").or_else(|| line.starts_with('{').then_some(line.as_str()));
+            if let Some(data) = data {
+                if let Ok(event) = serde_json::from_str::<Value>(data.trim()) {
+                    let kind = event.get("type").and_then(Value::as_str).unwrap_or_default();
+                    if matches!(kind, "response.completed" | "response.incomplete") {
+                        terminal = true;
+                    }
+                    let delta_progress = matches!(kind,
+                        "response.output_text.delta" | "response.function_call_arguments.delta"
+                        | "response.reasoning_summary_text.delta" | "response.reasoning_text.delta"
+                        | "response.refusal.delta")
+                        && event.get("delta").and_then(Value::as_str).is_some_and(|delta| !delta.is_empty());
+                    let completed_progress = matches!(kind,
+                        "response.output_item.done" | "response.completed" | "response.incomplete");
+                    if !progressed && (delta_progress || completed_progress) {
+                        progressed = true;
+                        span.record("first_provider_progress_ms", started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+            }
+            Ok((line, terminal))
+        });
+        let terminal_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = terminal_seen.clone();
+        let frames = frames.map(move |line| {
+            line.map(|(line, terminal)| {
+                observed.store(terminal, std::sync::atomic::Ordering::Relaxed);
+                line
+            })
+        });
+        let messages = responses_api_to_streaming_message_with_protocol_policy(frames, true);
+        pin!(messages);
+        while let Some(item) = messages.next().await {
+            let (message, usage) = item.map_err(|error| {
+                error.chain().find_map(|cause| cause.downcast_ref::<ProviderError>()).cloned()
+                    .unwrap_or_else(|| ProviderError::ProtocolError("Malformed Responses output".into()))
+            })?;
+            log.write(&message, usage.as_ref().map(|usage| usage.usage).as_ref())?;
+            yield (message, usage);
+        }
+        if !terminal_seen.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(ProviderError::NetworkError("Responses stream ended before completion".into()))?;
         }
     }))
 }

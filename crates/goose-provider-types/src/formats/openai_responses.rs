@@ -307,15 +307,25 @@ fn is_known_responses_stream_event_type(event_type: &str) -> bool {
     )
 }
 
-fn parse_responses_stream_event(data_line: &str) -> anyhow::Result<Option<ResponsesStreamEvent>> {
+fn parse_responses_stream_event(
+    data_line: &str,
+    strict_protocol: bool,
+) -> anyhow::Result<Option<ResponsesStreamEvent>> {
     let raw_event: Value = serde_json::from_str(data_line).map_err(|e| {
-        ProviderError::stream_decode_error(format!(
-            "Failed to parse Responses stream event: {}: {:?}",
-            e, data_line
-        ))
+        if strict_protocol {
+            ProviderError::ProtocolError("Malformed Responses stream event".into())
+        } else {
+            ProviderError::stream_decode_error(format!(
+                "Failed to parse Responses stream event: {}: {:?}",
+                e, data_line
+            ))
+        }
     })?;
 
     let Some(event_type) = raw_event.get("type").and_then(Value::as_str) else {
+        if strict_protocol {
+            return Err(ProviderError::ProtocolError("Responses event has no type".into()).into());
+        }
         return Ok(None);
     };
 
@@ -324,10 +334,14 @@ fn parse_responses_stream_event(data_line: &str) -> anyhow::Result<Option<Respon
     }
 
     let event = serde_json::from_value(raw_event).map_err(|e| {
-        ProviderError::stream_decode_error(format!(
-            "Failed to parse Responses stream event: {}: {:?}",
-            e, data_line
-        ))
+        if strict_protocol {
+            ProviderError::ProtocolError("Malformed Responses stream event".into())
+        } else {
+            ProviderError::stream_decode_error(format!(
+                "Failed to parse Responses stream event: {}: {:?}",
+                e, data_line
+            ))
+        }
     })?;
     Ok(Some(event))
 }
@@ -1002,7 +1016,17 @@ fn sse_field_name(line: &str) -> Option<&str> {
 }
 
 pub fn responses_api_to_streaming_message<S>(
+    stream: S,
+) -> impl Stream<Item = anyhow::Result<(Option<Message>, Option<ProviderUsage>)>> + 'static
+where
+    S: Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
+{
+    responses_api_to_streaming_message_with_protocol_policy(stream, false)
+}
+
+pub fn responses_api_to_streaming_message_with_protocol_policy<S>(
     mut stream: S,
+    strict_protocol: bool,
 ) -> impl Stream<Item = anyhow::Result<(Option<Message>, Option<ProviderUsage>)>> + 'static
 where
     S: Stream<Item = anyhow::Result<String>> + Unpin + Send + 'static,
@@ -1050,7 +1074,7 @@ where
                 break 'outer;
             }
 
-            let Some(event) = parse_responses_stream_event(data_line)? else {
+            let Some(event) = parse_responses_stream_event(data_line, strict_protocol)? else {
                 continue;
             };
 
@@ -1111,6 +1135,13 @@ where
                 }
 
                 ResponsesStreamEvent::ResponseIncomplete { response, .. } => {
+                    if strict_protocol && response.incomplete_details.as_ref()
+                        .and_then(|details| details.reason.as_deref()) == Some("content_filter") {
+                        Err(ProviderError::Refusal {
+                            details: "Azure filtered the response".into(),
+                            category: Some("content_filter".into()),
+                        })?;
+                    }
                     let model = model_name.as_ref().unwrap_or(&response.model);
                     let usage = response.usage.as_ref().map_or_else(
                         Usage::default,

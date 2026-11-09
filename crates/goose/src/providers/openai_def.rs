@@ -93,6 +93,18 @@ pub async fn from_env(
             .unwrap_or_else(|_| default_bp())
     };
 
+    let prepared_request_max_attempts = config
+        .get_param::<String>("OPENAI_PREPARED_REQUEST_MAX_ATTEMPTS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?;
+    if let Some(attempts) = prepared_request_max_attempts {
+        anyhow::ensure!(
+            (1..=2).contains(&attempts),
+            "OPENAI_PREPARED_REQUEST_MAX_ATTEMPTS must be 1 or 2"
+        );
+    }
+
     let is_openai = is_direct_openai_host(&parsed.host);
     let secrets = config
         .get_secrets("OPENAI_API_KEY", &["OPENAI_CUSTOM_HEADERS"])
@@ -168,6 +180,7 @@ pub async fn from_env(
     }
 
     let provider = OpenAiProviderBuilder::new(api_client)
+        .prepared_request_max_attempts(prepared_request_max_attempts)
         .base_path(base_path)
         .organization(organization)
         .project(project)
