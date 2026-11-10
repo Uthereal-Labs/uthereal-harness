@@ -1957,6 +1957,14 @@ fn prompt_error_from_message_content(
             )
         }
         MessageContent::Error(error)
+            if error.kind == crate::conversation::message::MessageErrorKind::ContentFiltered =>
+        {
+            Some(
+                agent_client_protocol::Error::new(-32603, error.message.clone())
+                    .data(serde_json::json!({ "reason": crate::acp::CONTENT_FILTERED_REASON })),
+            )
+        }
+        MessageContent::Error(error)
             if error.kind == crate::conversation::message::MessageErrorKind::Other =>
         {
             Some(
@@ -4672,6 +4680,25 @@ print(\"hello, world\")
                     "reason": "credits_exhausted",
                     "url": "https://router.tetrate.ai/billing"
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn test_content_filtered_message_maps_to_prompt_error() {
+        let content = MessageContent::error(
+            crate::conversation::message::MessageErrorKind::ContentFiltered,
+            "The provider's content filter blocked this request.",
+        );
+
+        let error = prompt_error_from_message_content(&content).expect("expected prompt error");
+
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::json!({
+                "code": -32603,
+                "message": "The provider's content filter blocked this request.",
+                "data": { "reason": "content_filtered" }
             })
         );
     }

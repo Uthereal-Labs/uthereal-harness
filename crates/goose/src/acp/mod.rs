@@ -21,6 +21,10 @@ pub use provider::{
 /// prompt the agent could not accept.
 pub(crate) const CREDITS_EXHAUSTED_REASON: &str = "credits_exhausted";
 
+/// `data.reason` on a prompt error raised because the provider's content filter blocked
+/// the request or its completion. Clients use it to tell the user why, without the text.
+pub(crate) const CONTENT_FILTERED_REASON: &str = "content_filtered";
+
 pub(crate) fn configured_model_for_provider(
     config: &crate::config::Config,
     provider_name: &str,

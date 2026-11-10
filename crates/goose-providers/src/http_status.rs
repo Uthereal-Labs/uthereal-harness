@@ -6,7 +6,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::errors::ProviderError;
+use crate::errors::{ProviderError, CONTENT_FILTER_CATEGORY};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use futures::TryStreamExt;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
@@ -237,6 +237,17 @@ fn is_context_length_exceeded_message(text: &str) -> bool {
     mentions_prompt_input_tokens && mentions_limit && mentions_overflow
 }
 
+/// Azure reports a content-filter block as a 400 with structured codes; the
+/// message text is never inspected.
+fn is_content_filtered(payload: Option<&Value>) -> bool {
+    let Some(error) = payload.and_then(|p| p.get("error")) else {
+        return false;
+    };
+    let code = |value: &Value| value.get("code").and_then(Value::as_str).map(str::to_owned);
+    code(error).as_deref() == Some("content_filter")
+        || error.get("innererror").and_then(code).as_deref() == Some("ResponsibleAIPolicyViolation")
+}
+
 pub fn map_http_error_to_provider_error(
     status: StatusCode,
     payload: Option<Value>,
@@ -275,6 +286,11 @@ pub fn map_http_error_to_provider_error(
             let payload_str = extract_message();
             if is_context_length_exceeded(payload.as_ref(), &payload_str) {
                 ProviderError::ContextLengthExceeded(payload_str)
+            } else if is_content_filtered(payload.as_ref()) {
+                ProviderError::Refusal {
+                    details: payload_str,
+                    category: Some(CONTENT_FILTER_CATEGORY.into()),
+                }
             } else {
                 ProviderError::RequestFailed(format!("Bad request (400): {}", payload_str))
             }
@@ -826,6 +842,51 @@ mod tests {
                 expected_context_overflow,
                 "unexpected classification for {case}: {error:?}"
             );
+        }
+    }
+
+    #[test]
+    fn bad_request_maps_azure_content_filter_codes_to_typed_refusal() {
+        let cases = [
+            (
+                "azure error code",
+                json!({ "error": { "code": "content_filter", "param": "prompt", "message": "filtered" } }),
+                true,
+            ),
+            (
+                "azure inner error code",
+                json!({ "error": { "code": "400", "message": "filtered", "innererror": { "code": "ResponsibleAIPolicyViolation" } } }),
+                true,
+            ),
+            (
+                "message text alone",
+                json!({ "error": { "code": "invalid_request", "message": "content filter wording in prose" } }),
+                false,
+            ),
+            (
+                "unrelated bad request",
+                json!({ "error": { "message": "invalid request" } }),
+                false,
+            ),
+        ];
+
+        for (case, payload, expected_content_filter) in cases {
+            let error = map_http_error_to_provider_error(
+                StatusCode::BAD_REQUEST,
+                Some(payload),
+                "http://test/endpoint",
+            );
+            assert_eq!(
+                error.is_content_filter(),
+                expected_content_filter,
+                "unexpected classification for {case}: {error:?}"
+            );
+            if !expected_content_filter {
+                assert!(
+                    matches!(error, ProviderError::RequestFailed(_)),
+                    "{case}: {error:?}"
+                );
+            }
         }
     }
 }
