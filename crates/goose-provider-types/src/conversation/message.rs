@@ -263,8 +263,19 @@ pub enum MessageErrorKind {
     Authentication,
     ContextLengthExceeded,
     CreditsExhausted,
+    ContentFiltered,
     #[serde(other)]
     Other,
+}
+
+/// User-facing text for a provider refusal, shared by both agent loops.
+pub fn refusal_text(details: &str, category: Option<&str>) -> String {
+    let category = category
+        .map(|c| format!("\n\nCategory: {c}"))
+        .unwrap_or_default();
+    format!(
+        "The provider refused this request.\n\n{details}{category}\n\nPlease start a new session to continue — resending this conversation is likely to be refused again."
+    )
 }
 
 impl From<&crate::errors::ProviderError> for MessageErrorKind {
@@ -274,6 +285,7 @@ impl From<&crate::errors::ProviderError> for MessageErrorKind {
             ProviderError::Authentication(_) => MessageErrorKind::Authentication,
             ProviderError::ContextLengthExceeded(_) => MessageErrorKind::ContextLengthExceeded,
             ProviderError::CreditsExhausted { .. } => MessageErrorKind::CreditsExhausted,
+            _ if err.is_content_filter() => MessageErrorKind::ContentFiltered,
             _ => MessageErrorKind::Other,
         }
     }
@@ -1274,6 +1286,12 @@ impl Message {
             }
             ProviderError::ContextLengthExceeded(_) => {
                 format!("{err}\n\nThe conversation is too long for the model's context window.")
+            }
+            _ if err.is_content_filter() => {
+                "The provider's content filter blocked this request.".to_string()
+            }
+            ProviderError::Refusal { details, category } => {
+                refusal_text(details, category.as_deref())
             }
             _ => format!(
                 "Ran into this error: {err}.\n\n\

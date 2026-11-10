@@ -3707,16 +3707,33 @@ impl Agent {
                             );
                             break;
                         }
+                        Err(ref provider_err) if provider_err.is_content_filter() => {
+                            provider_errored = true;
+                            #[cfg(feature = "telemetry")]
+                            crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
+                            error!("Error: {}", provider_err);
+                            // A typed error, not refusal prose, so clients can tell a content
+                            // filter block apart from other failures. Terminal like any refusal.
+                            let message = persist_and_push_message_with_id(
+                                &session_manager,
+                                &session_config.id,
+                                &mut conversation,
+                                Message::from_provider_error(provider_err),
+                            )
+                            .await?;
+                            yield AgentEvent::Message(message);
+                            exit_chat = true;
+                            break;
+                        }
                         Err(ref provider_err @ ProviderError::Refusal { ref details, ref category }) => {
                             provider_errored = true;
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
 
-                            let category = category.as_deref().map(|c| format!("\n\nCategory: {c}")).unwrap_or_default();
-                            yield AgentEvent::Message(Message::assistant().with_text(format!(
-                                "The provider refused this request.\n\n{details}{category}\n\nPlease start a new session to continue — resending this conversation is likely to be refused again."
-                            )));
+                            yield AgentEvent::Message(Message::assistant().with_text(
+                                crate::conversation::message::refusal_text(details, category.as_deref()),
+                            ));
                             // A refusal is terminal: skip goal/grind nudges and
                             // recipe retry_config, which would resend the same
                             // refused conversation.
@@ -6328,6 +6345,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
 
     struct RefusingProvider {
         call_count: AtomicUsize,
+        category: &'static str,
     }
 
     #[async_trait::async_trait]
@@ -6340,10 +6358,11 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             _tools: &[Tool],
         ) -> Result<MessageStream, ProviderError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::pin(futures::stream::once(async {
+            let category = self.category.to_string();
+            Ok(Box::pin(futures::stream::once(async move {
                 Err(ProviderError::Refusal {
                     details: "This request was declined.".to_string(),
-                    category: Some("cyber".to_string()),
+                    category: Some(category),
                 })
             })))
         }
@@ -6358,6 +6377,7 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         let temp_dir = tempfile::tempdir()?;
         let provider = Arc::new(RefusingProvider {
             call_count: AtomicUsize::new(0),
+            category: "cyber",
         });
         let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![]);
         let (agent, session_id) =
@@ -6390,7 +6410,14 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         let mut emitted_refusal_id = None;
         while let Some(event) = reply_stream.next().await {
             if let AgentEvent::Message(message) = event? {
-                if message.as_concat_text().contains("provider refused") {
+                // The legacy loop emits refusal text; the state machine emits an error block.
+                let refused = message.content.iter().any(|content| {
+                    content
+                        .as_text()
+                        .or(content.as_error().map(|error| error.message.as_str()))
+                        .is_some_and(|text| text.contains("provider refused"))
+                });
+                if refused {
                     emitted_refusal_id = message.id;
                 }
             }
@@ -6404,6 +6431,47 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         let emitted_refusal_id =
             emitted_refusal_id.expect("refusal message should be emitted with an ID");
         assert!(emitted_refusal_id.starts_with("msg_"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn content_filter_refusal_emits_typed_error_without_resending() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let provider = Arc::new(RefusingProvider {
+            call_count: AtomicUsize::new(0),
+            category: goose_providers::errors::CONTENT_FILTER_CATEGORY,
+        });
+        let hook_manager = crate::hooks::HookManager::from_plugins_for_test(vec![]);
+        let (agent, session_id) =
+            create_test_agent(temp_dir.path().join("data"), hook_manager, provider.clone()).await?;
+        let session_config = SessionConfig {
+            id: session_id,
+            schedule_id: None,
+            max_turns: Some(10),
+            retry_config: None,
+        };
+
+        let reply_stream = agent
+            .reply(
+                Message::user().with_text("hi"),
+                session_config,
+                crate::agents::state_machine::enabled(),
+                None,
+            )
+            .await?;
+        tokio::pin!(reply_stream);
+        let mut error_kinds = Vec::new();
+        while let Some(event) = reply_stream.next().await {
+            if let AgentEvent::Message(message) = event? {
+                error_kinds.extend(message.error_kind());
+            }
+        }
+
+        assert_eq!(
+            error_kinds,
+            vec![crate::conversation::message::MessageErrorKind::ContentFiltered]
+        );
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

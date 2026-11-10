@@ -1139,7 +1139,7 @@ where
                         .and_then(|details| details.reason.as_deref()) == Some("content_filter") {
                         Err(ProviderError::Refusal {
                             details: "Azure filtered the response".into(),
-                            category: Some("content_filter".into()),
+                            category: Some(crate::errors::CONTENT_FILTER_CATEGORY.into()),
                         })?;
                     }
                     let model = model_name.as_ref().unwrap_or(&response.model);

@@ -63,7 +63,14 @@ pub enum ProviderError {
     },
 }
 
+/// `Refusal::category` for a block by the provider's content filter (e.g. Azure).
+pub const CONTENT_FILTER_CATEGORY: &str = "content_filter";
+
 impl ProviderError {
+    pub fn is_content_filter(&self) -> bool {
+        matches!(self, ProviderError::Refusal { category: Some(category), .. } if category == CONTENT_FILTER_CATEGORY)
+    }
+
     pub fn stream_decode_error(error: impl std::fmt::Display) -> Self {
         ProviderError::NetworkError(format!("Stream decode error: {error}"))
     }
